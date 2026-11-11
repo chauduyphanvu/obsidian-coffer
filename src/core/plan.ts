@@ -13,25 +13,39 @@ export interface Plan {
   pulls: string[];
   pullDeletes: string[];
   conflicts: string[];
+  /** Paths left alone because this device's or the remote copy is over the size limit. */
+  tooLarge: string[];
 }
 
 /**
  * Compares every path's local and remote state with the version both sides last agreed on.
  * Where nothing needs doing it brings that agreed version up to date in `st`.
+ * `tooLargeHere` holds paths whose local file is over the size limit: they are missing from
+ * `local`, but must not be mistaken for local deletions.
  */
-export function planChanges(local: Map<string, Local>, st: LocalState, excluded: (path: string) => boolean, maxSize: number): Plan {
+export function planChanges(
+  local: Map<string, Local>,
+  st: LocalState,
+  excluded: (path: string) => boolean,
+  maxSize: number,
+  tooLargeHere: Set<string> = new Set(),
+): Plan {
   const pushes: Local[] = [];
   const pushDeletes: string[] = [];
   const pulls: string[] = [];
   const pullDeletes: string[] = [];
   const conflicts: string[] = [];
+  const tooLarge: string[] = [];
 
   const plan = (key: string) => {
     if (excluded(key)) return;
     const l = local.get(key);
     const s = st.synced.get(key);
     const r = st.remote.get(key);
-    if (r && r.size > maxSize) return;
+    if (tooLargeHere.has(key) || (r && r.size > maxSize)) {
+      tooLarge.push(key);
+      return;
+    }
     const base = s?.entry;
     const localTouched = l ? !s || s.lsize !== l.size || s.lmtime !== l.mtime : !!s;
     const remoteChanged = base ? !r || !sameContent(r, base) : !!r;
@@ -51,7 +65,8 @@ export function planChanges(local: Map<string, Local>, st: LocalState, excluded:
   for (const key of local.keys()) plan(key);
   for (const key of st.synced.keys()) if (!local.has(key)) plan(key);
   for (const key of st.remote.keys()) if (!local.has(key) && !st.synced.has(key)) plan(key);
-  return { pushes, pushDeletes, pulls, pullDeletes, conflicts };
+  for (const key of tooLargeHere) if (!st.synced.has(key) && !st.remote.has(key)) plan(key);
+  return { pushes, pushDeletes, pulls, pullDeletes, conflicts, tooLarge };
 }
 
 export const nothingToDo = (p: Plan) => !p.pushes.length && !p.pushDeletes.length && !p.pulls.length && !p.pullDeletes.length && !p.conflicts.length;

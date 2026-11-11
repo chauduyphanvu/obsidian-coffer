@@ -81,6 +81,7 @@ async function main(): Promise<number> {
     const r = await engine.sync({ force: flags.has('force') });
     console.log(`sent ${r.pushed}, received ${r.pulled}, deleted ${r.deletedLocal} here and ${r.deletedRemote} remotely, merged ${r.merged}`);
     for (const copy of r.conflictCopies) console.log(`both versions kept: ${copy}`);
+    for (const path of r.tooLarge) console.error(`not synced, over the size limit: ${path}`);
     for (const e of r.errors) console.error(`failed: ${e.path}: ${e.message}`);
     return r.errors.length ? 1 : 0;
   }

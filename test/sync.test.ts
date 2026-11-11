@@ -535,3 +535,28 @@ test('download progress never counts past its total', async () => {
   assert.ok(seen.length > 0);
   for (const p of seen) assert.ok(p.done <= p.total, `${p.done} of ${p.total}`);
 });
+
+test('a file that grows past the size limit is reported, not deleted from other devices', async () => {
+  const { devices: [a, b] } = setup(['A', 'B'], { maxFileSizeMB: 1 });
+  a.fs.put('video.bin', random(500_000, 1));
+  await a.sync();
+  await b.sync();
+  a.fs.put('video.bin', random(2 << 20, 2));
+  const r = await a.sync();
+  assert.deepEqual(r.tooLarge, ['video.bin']);
+  assert.equal(r.deletedRemote, 0);
+  await b.sync();
+  assert.ok(b.fs.files.has('video.bin'), 'the other device keeps its copy');
+});
+
+test('a remote file over this device\'s size limit is reported as not synced here', async () => {
+  const { devices: [a], net, clock } = setup(['A'], { maxFileSizeMB: 0 });
+  a.fs.put('big.bin', random(2 << 20, 3));
+  a.fs.put('note.md', 'hi\n');
+  await a.sync();
+  const b = new Device('B', net, clock, { maxFileSizeMB: 1 });
+  const r = await b.sync();
+  assert.deepEqual(r.tooLarge, ['big.bin']);
+  assert.ok(!b.fs.files.has('big.bin'));
+  assert.ok(b.fs.files.has('note.md'));
+});

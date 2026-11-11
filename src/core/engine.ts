@@ -29,6 +29,8 @@ export interface SyncResult {
   merged: number;
   conflictCopies: string[];
   skipped: number;
+  /** Files not synced on this device because they are over the size limit. */
+  tooLarge: string[];
   errors: { path: string; message: string }[];
   commits: number;
   rounds: number;
@@ -174,21 +176,23 @@ export class SyncEngine {
     return this.cfg.maxFileSizeMB * (1 << 20) || Infinity;
   }
 
-  private async scan(): Promise<Map<string, Local>> {
+  private async scan(): Promise<{ local: Map<string, Local>; tooLarge: Set<string> }> {
     const maxSize = this.maxSize();
     const local = new Map<string, Local>();
+    const tooLarge = new Set<string>();
     for (const f of await this.o.fs.list()) {
       const key = vaultKey(f.path);
-      if (this.excluded(key) || f.size > maxSize || local.has(key)) continue;
-      local.set(key, { ...f, key });
+      if (this.excluded(key) || local.has(key)) continue;
+      if (f.size > maxSize) tooLarge.add(key);
+      else local.set(key, { ...f, key });
     }
-    return local;
+    return { local, tooLarge };
   }
 
   async sync(opts: { force?: boolean } = {}): Promise<SyncResult> {
     const res: SyncResult = {
       pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0,
-      conflictCopies: [], skipped: 0, errors: [], commits: 0, rounds: 0,
+      conflictCopies: [], skipped: 0, tooLarge: [], errors: [], commits: 0, rounds: 0,
     };
     await this.open();
     this.dedup = undefined;
@@ -207,15 +211,16 @@ export class SyncEngine {
   private async round(res: SyncResult, force: boolean, first: boolean): Promise<boolean> {
     const { repo, st } = await this.open();
     const maxSize = this.maxSize();
-    const local = await this.scan();
+    const { local, tooLarge } = await this.scan();
 
-    let p = planChanges(local, st, this.excluded, maxSize);
+    let p = planChanges(local, st, this.excluded, maxSize, tooLarge);
     // A small local edit is committed without first asking whether the remote moved: the commit
     // itself fails if it did, and the next pass sorts it out. Saves a round trip on the common case.
     const optimistic =
       first && st.lastSeq > 0 && p.pushes.length + p.pushDeletes.length > 0 && !p.pulls.length && !p.pullDeletes.length && !p.conflicts.length &&
       p.pushes.reduce((n, f) => n + f.size, 0) <= OPTIMISTIC_BYTES;
-    if (!optimistic && (await this.fetchRemote()).size) p = planChanges(local, st, this.excluded, maxSize);
+    if (!optimistic && (await this.fetchRemote()).size) p = planChanges(local, st, this.excluded, maxSize, tooLarge);
+    res.tooLarge = p.tooLarge.sort();
 
     if (nothingToDo(p)) return false;
     this.checkDeletes(p, st, force);
