@@ -14,3 +14,4 @@ await build({
   logLevel: 'info',
 });
 await copyFile('manifest.json', 'dist/manifest.json');
+await copyFile('styles.css', 'dist/styles.css');

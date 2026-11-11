@@ -1,0 +1,173 @@
+/* Self Sync. Built from Obsidian's own variables so it follows every theme, light and dark. */
+
+.self-sync-card {
+  background: var(--background-secondary);
+  border-radius: var(--radius-l);
+  padding: var(--size-4-4);
+  margin-bottom: var(--size-4-4);
+}
+
+.self-sync-status-line {
+  display: flex;
+  align-items: center;
+  gap: var(--size-4-2);
+  font-size: var(--font-ui-medium);
+  font-weight: var(--font-semibold);
+}
+
+.self-sync-dot {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+.self-sync-status-line.is-ok .self-sync-dot { background: var(--color-green); }
+.self-sync-status-line.is-busy .self-sync-dot { background: var(--interactive-accent); animation: self-sync-pulse 1.2s ease-in-out infinite; }
+.self-sync-status-line.is-warning .self-sync-dot { background: var(--color-orange); }
+.self-sync-status-line.is-critical .self-sync-dot { background: var(--color-red); }
+.self-sync-status-line.is-critical { color: var(--text-error); }
+
+@keyframes self-sync-pulse {
+  50% { opacity: 0.3; }
+}
+
+.self-sync-sub {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  margin: var(--size-2-2) 0 0 calc(10px + var(--size-4-2));
+  overflow-wrap: anywhere;
+}
+
+.self-sync-intro {
+  color: var(--text-muted);
+  margin: var(--size-4-2) 0 var(--size-4-3);
+  line-height: var(--line-height-normal);
+}
+
+.self-sync-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-4-2);
+  margin-top: var(--size-4-3);
+}
+.self-sync-buttons:empty { display: none; }
+.self-sync-buttons > button { flex: 1 1 auto; }
+
+/* Collapsible settings sections */
+details.self-sync-section {
+  border-top: 1px solid var(--background-modifier-border);
+}
+details.self-sync-section > summary {
+  display: grid;
+  grid-template-columns: 1.2em 1fr;
+  column-gap: var(--size-4-1);
+  row-gap: var(--size-2-1);
+  align-items: baseline;
+  padding: var(--size-4-3) 0;
+  cursor: pointer;
+  list-style: none;
+}
+details.self-sync-section > summary::-webkit-details-marker { display: none; }
+details.self-sync-section > summary::before {
+  content: "›";
+  grid-row: 1 / span 2;
+  color: var(--text-muted);
+  transition: transform 120ms ease;
+}
+details.self-sync-section[open] > summary::before { transform: rotate(90deg); }
+.self-sync-section-title { grid-column: 2; font-weight: var(--font-semibold); }
+.self-sync-section-summary { grid-column: 2; color: var(--text-muted); font-size: var(--font-ui-small); overflow-wrap: anywhere; }
+details.self-sync-section[open] { padding-bottom: var(--size-4-3); }
+
+/* Setup and other dialogs */
+.self-sync-modal .modal-content { display: flex; flex-direction: column; }
+
+.self-sync-choice {
+  display: block;
+  width: 100%;
+  height: auto;
+  text-align: start;
+  white-space: normal;
+  padding: var(--size-4-3) var(--size-4-4);
+  margin-bottom: var(--size-4-2);
+  border-radius: var(--radius-m);
+}
+.self-sync-choice-title { font-weight: var(--font-semibold); color: var(--text-normal); }
+.self-sync-choice-hint { color: var(--text-muted); font-size: var(--font-ui-small); margin-top: var(--size-2-1); }
+
+.self-sync-field { margin-bottom: var(--size-4-3); }
+.self-sync-field > label {
+  display: block;
+  font-weight: var(--font-medium);
+  margin-bottom: var(--size-2-2);
+}
+.self-sync-field > input,
+.self-sync-field > textarea {
+  width: 100%;
+  font-size: var(--font-ui-medium);
+}
+.self-sync-field > textarea.self-sync-code {
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  min-height: 6em;
+  resize: vertical;
+  word-break: break-all;
+}
+.self-sync-hint { color: var(--text-muted); font-size: var(--font-ui-small); margin-top: var(--size-2-2); }
+.self-sync-check { display: block; margin-bottom: var(--size-4-3); color: var(--text-muted); }
+
+.self-sync-error {
+  color: var(--text-error);
+  background: rgba(var(--color-red-rgb), 0.1);
+  border-radius: var(--radius-s);
+  padding: var(--size-4-2) var(--size-4-3);
+  margin: var(--size-4-2) 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.self-sync-progress { font-size: var(--font-ui-medium); font-variant-numeric: tabular-nums; }
+
+/* Problems */
+.self-sync-problem {
+  border-radius: var(--radius-m);
+  padding: var(--size-4-3);
+  margin-top: var(--size-4-3);
+  background: var(--background-secondary);
+  border-inline-start: 4px solid var(--color-orange);
+}
+.self-sync-problem.is-critical { border-inline-start-color: var(--color-red); background: rgba(var(--color-red-rgb), 0.08); }
+.self-sync-problem-title { font-weight: var(--font-semibold); }
+.self-sync-problem-detail {
+  color: var(--text-muted);
+  margin-top: var(--size-2-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: var(--font-ui-small);
+}
+.self-sync-files { margin-top: var(--size-4-2); font-size: var(--font-ui-small); }
+.self-sync-file {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-2-2) var(--size-4-2);
+  padding: var(--size-2-2) 0;
+  border-top: 1px solid var(--background-modifier-border);
+  overflow-wrap: anywhere;
+}
+.self-sync-file > span { flex: 1 1 12em; }
+.self-sync-open { white-space: nowrap; }
+
+/* Loud notices: they stay until tapped. */
+.notice.self-sync-notice { cursor: pointer; }
+.notice.self-sync-notice.is-critical {
+  background: var(--color-red);
+  color: var(--text-on-accent);
+}
+.notice.self-sync-notice.is-warning { border-inline-start: 4px solid var(--color-orange); }
+.self-sync-notice-title { font-weight: var(--font-semibold); font-size: var(--font-ui-medium); }
+.self-sync-notice-detail { margin-top: var(--size-2-1); opacity: 0.9; font-size: var(--font-ui-small); white-space: pre-line; }
+
+.status-bar-item.self-sync-status.is-critical { color: var(--text-error); font-weight: var(--font-semibold); }
+.status-bar-item.self-sync-status.is-warning { color: var(--color-orange); }
+.self-sync-alert { color: var(--color-red); }

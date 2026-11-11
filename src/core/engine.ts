@@ -587,6 +587,24 @@ export class SyncEngine {
   }
 
   /** True when another device has committed since this one last synced. One tiny request, no local scan. */
+  /**
+   * The safe answer to a paused mass delete: every file present on only one side is copied back to
+   * the other on the next sync, instead of being deleted. Returns how many files that covers.
+   */
+  async keepAllFiles(): Promise<number> {
+    const { st } = await this.open();
+    await this.fetchRemote();
+    const { local, tooLarge } = await this.scan();
+    let kept = 0;
+    for (const key of [...st.synced.keys()]) {
+      if (this.excluded(key) || tooLarge.has(key) || local.has(key) === st.remote.has(key)) continue;
+      st.synced.delete(key);
+      kept++;
+    }
+    await this.save();
+    return kept;
+  }
+
   async remoteChanged(): Promise<boolean> {
     const { repo, st } = await this.open();
     return repo.hasCommit(st.lastSeq + 1);

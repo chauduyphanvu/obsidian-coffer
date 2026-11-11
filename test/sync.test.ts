@@ -560,3 +560,25 @@ test('a remote file over this device\'s size limit is reported as not synced her
   assert.ok(!b.fs.files.has('big.bin'));
   assert.ok(b.fs.files.has('note.md'));
 });
+
+test('after a paused mass delete, keeping all files brings them back on both sides', async () => {
+  const { devices: [a, b] } = setup();
+  for (let i = 0; i < 30; i++) a.fs.put(`n${i}.md`, `${i}\n`);
+  await a.sync();
+  await b.sync();
+
+  a.fs.files.clear(); // deleted here by mistake
+  await assert.rejects(a.sync(), SafetyError);
+  assert.equal(await a.engine.keepAllFiles(), 30);
+  await a.sync();
+  assert.equal(a.fs.files.size, 30);
+
+  a.fs.files.clear();
+  await a.sync(true); // deleted on purpose there, but this device wants to keep them
+  await assert.rejects(b.sync(), SafetyError);
+  assert.equal(await b.engine.keepAllFiles(), 30);
+  await b.sync();
+  assert.equal(b.fs.files.size, 30);
+  await a.sync();
+  assert.equal(a.fs.files.size, 30);
+});

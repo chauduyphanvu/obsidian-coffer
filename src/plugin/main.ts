@@ -1,4 +1,4 @@
-import { Notice, Platform, Plugin, TFile, debounce } from 'obsidian';
+import { Notice, Platform, Plugin, TFile, debounce, setIcon } from 'obsidian';
 import { SafetyError, SyncEngine, type SyncResult } from '../core/engine.ts';
 import { vaultKey } from '../core/paths.ts';
 import type { Version } from '../core/types.ts';
@@ -13,34 +13,41 @@ import {
   hasStorageAddress,
   isConfigured,
   remoteSpec,
+  setupLink,
   statePath,
   syncConfig,
   type Settings,
 } from './settings.ts';
-import { HistoryModal, SettingsTab } from './views.ts';
+import { SetupModal } from './setup.ts';
+import { describeFailure, plural, resultProblems, staleProblem, summarize, type Problem } from './status.ts';
+import { HistoryModal, ProblemsModal, SettingsTab } from './views.ts';
 
 const DEFAULTS = defaultSettings(Platform.isMobile);
 
-const summarize = (r: SyncResult) => {
-  const parts = [
-    r.pushed && `${r.pushed} sent`,
-    r.pulled && `${r.pulled} received`,
-    r.deletedLocal + r.deletedRemote && `${r.deletedLocal + r.deletedRemote} deleted`,
-    r.merged && `${r.merged} merged`,
-    r.conflictCopies.length && `${r.conflictCopies.length} conflict copies`,
-    r.errors.length && `${r.errors.length} failed`,
-  ].filter(Boolean);
-  return parts.length ? parts.join(', ') : 'up to date';
-};
+/** What a sync run ended with, for screens that show it inline. */
+export interface SyncOutcome {
+  result?: SyncResult;
+  problem?: Problem;
+}
 
 export default class SelfSyncPlugin extends Plugin {
   settings: Settings = DEFAULTS;
+  /** "Receiving 40 of 249" while a sync moves files, otherwise empty. */
+  progress = '';
+  running = false;
   private engine?: SyncEngine;
   private fs?: ObsidianFS;
-  private running = false;
   private changedWhileRunning = false;
   private statusEl?: HTMLElement;
-  private lastError = '';
+  private ribbonEl?: HTMLElement;
+  /** Why the last sync stopped; cleared by the next one that finishes. */
+  private failure?: Problem;
+  /** What the last finished sync left to look at: failed, conflicting or oversized files. */
+  private found: Problem[] = [];
+  /** Problems already announced, so a sync that finds the same ones stays quiet. */
+  private alerted = new Set<string>();
+  private alertNotice?: { notice: Notice; ids: string[] };
+  private listeners = new Set<() => void>();
   private timer?: number;
   private pollTimer?: number;
   private dirty = false;
@@ -55,14 +62,16 @@ export default class SelfSyncPlugin extends Plugin {
     }
     this.addSettingTab(new SettingsTab(this.app, this));
     this.statusEl = this.addStatusBarItem();
-    this.statusEl.onClickEvent(() => {
-      if (this.lastError) new Notice(this.lastError, 10_000);
-      else void this.sync(true);
+    this.statusEl.addClass('self-sync-status', 'mod-clickable');
+    this.statusEl.onClickEvent(() => this.openStatus());
+    this.ribbonEl = this.addRibbonIcon('refresh-cw', 'Sync now', () => (this.problems().length ? this.openStatus() : void this.sync(true)));
+    this.registerObsidianProtocolHandler('self-sync', (params) => {
+      if (params.setup) new SetupModal(this.app, this, 'join', params.setup).open();
     });
-    this.setStatus(this.configured() ? 'Sync: idle' : 'Sync: not set up');
-    this.addRibbonIcon('refresh-cw', 'Sync now', () => void this.sync(true));
 
     this.addCommand({ id: 'sync', name: 'Sync now', callback: () => void this.sync(true) });
+    this.addCommand({ id: 'status', name: 'Show sync status and problems', callback: () => this.openStatus() });
+    this.addCommand({ id: 'setup', name: 'Set up sync', callback: () => new SetupModal(this.app, this, 'start').open() });
     this.addCommand({ id: 'force-sync', name: 'Sync now, allowing large deletions', callback: () => void this.sync(true, true) });
     this.addCommand({ id: 'check-storage', name: 'Check storage connection', callback: () => void this.checkStorage() });
     this.addCommand({ id: 'clean-up', name: 'Delete expired versions from storage', callback: () => void this.cleanUp() });
@@ -95,7 +104,11 @@ export default class SelfSyncPlugin extends Plugin {
         }
       });
       this.applySchedule();
-      if (this.settings.syncOnStart) void this.sync();
+      this.updateStatus();
+      if (!this.configured()) {
+        const n = new Notice(this.fragment('Self Sync is not set up yet', 'Tap to set up encrypted sync for this vault.'), 15_000);
+        n.containerEl.addEventListener('click', () => new SetupModal(this.app, this, 'start').open());
+      } else if (this.settings.syncOnStart) void this.sync();
     });
   }
 
@@ -103,7 +116,7 @@ export default class SelfSyncPlugin extends Plugin {
     await this.saveData(this.settings);
     this.engine = undefined;
     this.applySchedule();
-    this.setStatus(this.configured() ? 'Sync: idle' : 'Sync: not set up');
+    this.updateStatus();
   }
 
   private applySchedule(): void {
@@ -132,7 +145,7 @@ export default class SelfSyncPlugin extends Plugin {
     }
   }
 
-  private secret(name: string): string {
+  secret(name: string): string {
     return (name && this.app.secretStorage.getSecret(name)) || '';
   }
 
@@ -162,74 +175,176 @@ export default class SelfSyncPlugin extends Plugin {
     return this.engine;
   }
 
-  private setStatus(text: string): void {
-    this.statusEl?.setText(text);
+  /** Called whenever the status, progress or problem list changes; returns an unsubscribe function. */
+  onChange(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
   }
 
   private showProgress(text: string, total: number): void {
-    this.setStatus(text);
+    this.progress = text;
+    this.updateStatus();
     // Phones have no status bar; a long first sync should not look like nothing is happening.
-    if (!Platform.isMobile || total < 50) return;
+    // A screen that shows progress itself (setup, settings) is listening and makes this unnecessary.
+    if (!Platform.isMobile || total < 50 || this.listeners.size) return;
     if (this.progressNotice) this.progressNotice.setMessage(`Sync: ${text}`);
     else this.progressNotice = new Notice(`Sync: ${text}`, 0);
   }
 
-  async sync(manual = false, force = false): Promise<void> {
+  /** Everything the user should know about, worst first. */
+  problems(): Problem[] {
+    const out: Problem[] = [];
+    // A temporary failure (offline) only counts once it has gone on for a day.
+    if (this.failure && this.failure.id !== 'offline') out.push(this.failure);
+    if (this.failure) {
+      const stale = staleProblem(this.settings.lastSuccess, Date.now());
+      if (stale) out.push(stale);
+    }
+    out.push(...this.found);
+    return out.sort((a, b) => (a.severity === b.severity ? 0 : a.severity === 'critical' ? -1 : 1));
+  }
+
+  /** One line for the status bar and the settings screen. */
+  statusLine(): { text: string; tone: 'ok' | 'busy' | 'warning' | 'critical' | 'off' } {
+    if (!this.configured()) return { text: 'Not set up', tone: 'off' };
+    if (this.running) return { text: this.progress || 'Syncing…', tone: 'busy' };
+    const problems = this.problems();
+    const critical = problems.filter((p) => p.severity === 'critical');
+    if (critical.length) return { text: critical.length === 1 ? critical[0].title : `${plural(critical.length, 'problem')} need attention`, tone: 'critical' };
+    const last = this.settings.lastSuccess;
+    const when = last ? `Synced ${new Date(last).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : 'Not synced yet';
+    if (problems.length) return { text: `${when} · ${plural(problems.length, 'thing', 'things')} to review`, tone: 'warning' };
+    if (this.failure?.id === 'offline') return { text: `${when} · offline`, tone: 'ok' };
+    return { text: when, tone: 'ok' };
+  }
+
+  private updateStatus(): void {
+    const { text, tone } = this.statusLine();
+    if (this.statusEl) {
+      this.statusEl.setText(tone === 'critical' ? `⚠ ${text}` : `Sync: ${text}`);
+      this.statusEl.toggleClass('is-critical', tone === 'critical');
+      this.statusEl.toggleClass('is-warning', tone === 'warning');
+    }
+    if (this.ribbonEl) {
+      setIcon(this.ribbonEl, tone === 'critical' || tone === 'warning' ? 'alert-triangle' : 'refresh-cw');
+      this.ribbonEl.setAttribute('aria-label', tone === 'critical' || tone === 'warning' ? `Sync: ${text}` : 'Sync now');
+      this.ribbonEl.toggleClass('self-sync-alert', tone === 'critical');
+    }
+    for (const l of this.listeners) l();
+  }
+
+  fragment(title: string, detail: string): DocumentFragment {
+    return createFragment((f) => {
+      f.createDiv({ cls: 'self-sync-notice-title', text: title });
+      if (detail) f.createDiv({ cls: 'self-sync-notice-detail', text: detail });
+    });
+  }
+
+  /**
+   * Announces new problems in one notice: a critical one stays until tapped, warnings fade but stay
+   * on the status. The notice goes away by itself once its problems are gone. Tapping opens the details.
+   */
+  private report(): void {
+    const problems = this.problems();
+    const ids = new Set(problems.map((p) => p.id));
+    for (const id of [...this.alerted]) if (!ids.has(id)) this.alerted.delete(id);
+    if (this.alertNotice && !this.alertNotice.ids.some((id) => ids.has(id))) {
+      this.alertNotice.notice.hide();
+      this.alertNotice = undefined;
+    }
+    const fresh = problems.filter((p) => !this.alerted.has(p.id));
+    if (fresh.length) {
+      for (const p of fresh) this.alerted.add(p.id);
+      this.alertNotice?.notice.hide();
+      const critical = fresh.some((p) => p.severity === 'critical');
+      const [title, detail] =
+        fresh.length === 1
+          ? [fresh[0].title, `${fresh[0].detail.split(/(?<=\.)\s|\n/)[0]} Tap for details.`]
+          : [critical ? 'Sync needs your attention' : `${fresh.length} things to review`, `${fresh.map((p) => p.title).join('\n')}\nTap for details.`];
+      const notice = new Notice(this.fragment(title, detail), critical ? 0 : 30_000);
+      notice.containerEl.addClass('self-sync-notice', critical ? 'is-critical' : 'is-warning');
+      notice.containerEl.addEventListener('click', () => this.openStatus());
+      this.alertNotice = { notice, ids: fresh.map((p) => p.id) };
+    }
+    this.updateStatus();
+  }
+
+  openStatus(): void {
+    new ProblemsModal(this.app, this).open();
+  }
+
+  /** Conflict copies stay on the list until the user deletes or renames them. */
+  private pruneConflictCopies(): void {
+    this.settings.conflictCopies = this.settings.conflictCopies.filter((p) => this.app.vault.getAbstractFileByPath(p));
+  }
+
+  async sync(manual = false, force = false, inline = false): Promise<SyncOutcome> {
     if (!this.configured()) {
-      if (manual) new Notice('Self Sync is not set up yet. Open its settings.');
-      return;
+      if (manual && !inline) new SetupModal(this.app, this, 'start').open();
+      return {};
     }
     if (this.running) {
       this.changedWhileRunning = true;
-      return;
+      return {};
     }
     this.running = true;
     this.changedWhileRunning = false;
     this.dirty = false;
-    this.setStatus('Syncing…');
+    this.updateStatus();
     try {
       const r = await this.getEngine().sync({ force });
       if (r.pulled || r.deletedLocal) this.fs?.forgetConfigListing();
-      this.lastError = r.errors.length ? r.errors.map((e) => `${e.path}: ${e.message}`).join('\n') : '';
-      const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      this.setStatus(r.errors.length ? `Sync: ${r.errors.length} files failed` : `Synced ${time}`);
-      if (manual || r.conflictCopies.length) new Notice(`Sync: ${summarize(r)}`);
-      for (const copy of r.conflictCopies) new Notice(`Both versions kept: ${copy}`, 15_000);
       const s = this.settings;
+      this.failure = undefined;
+      s.lastSuccess = Date.now();
+      s.conflictCopies = [...new Set([...s.conflictCopies, ...r.conflictCopies])];
+      this.pruneConflictCopies();
+      this.found = resultProblems(r, s.conflictCopies, s.maxFileSizeMB);
+      if (manual && !inline) new Notice(`Sync: ${summarize(r)}`);
       if (!r.errors.length && cleanupDue(s, Date.now())) {
         await this.getEngine().gc();
         s.lastCleanup = Date.now();
-        await this.saveData(s);
       }
+      await this.saveData(s);
+      return { result: r };
     } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      // An automatic sync that keeps failing the same way (offline, say) should not nag.
-      if (e instanceof SafetyError) {
-        new Notice(
-          `Sync paused: it would delete ${e.localDeletes} files here and ${e.remoteDeletes} from storage. ` +
-            'If that is what you want, run the command "Sync now, allowing large deletions".',
-          0,
-        );
-      } else if (manual || message !== this.lastError) new Notice(`Sync failed: ${message}`, 10_000);
-      this.lastError = message;
-      this.setStatus(e instanceof SafetyError ? 'Sync: needs confirmation' : 'Sync failed');
+      this.failure = describeFailure(e);
       if (!(e instanceof SafetyError)) this.engine = undefined;
+      if (manual && !inline && this.failure.id === 'offline') new Notice(this.fragment(this.failure.title, this.failure.detail), 10_000);
+      return { problem: this.failure };
     } finally {
       this.running = false;
+      this.progress = '';
       this.progressNotice?.hide();
       this.progressNotice = undefined;
+      this.report();
       if (this.changedWhileRunning) this.schedule();
     }
   }
 
-  exportSetupCode(): Promise<string> {
-    return encodeSetupCode(this.settings, (name) => this.secret(name));
+  /** The safe answer to a paused mass delete: copy every file back to the side that lost it. */
+  async keepAllFiles(): Promise<void> {
+    const kept = await this.getEngine().keepAllFiles();
+    new Notice(`Keeping all files: ${plural(kept, 'file')} will be copied back.`);
+    await this.sync(true);
+  }
+
+  async setupLink(): Promise<string> {
+    return setupLink(await encodeSetupCode(this.settings, (name) => this.secret(name)));
   }
 
   async importSetupCode(code: string, passphrase: string): Promise<void> {
     const { settings, secrets } = await decodeSetupCode(code, passphrase);
     for (const [id, value] of secrets) this.app.secretStorage.setSecret(id, value);
     Object.assign(this.settings, settings);
+    await this.saveSettings();
+  }
+
+  /** Stores a secret under `id` and points the setting at it. */
+  async setSecret(key: 'accessKeySecret' | 'secretKeySecret' | 'passphraseSecret' | 'webdavPasswordSecret', id: string, value: string): Promise<void> {
+    const name = this.settings[key] || id;
+    this.app.secretStorage.setSecret(name, value);
+    this.settings[key] = name;
     await this.saveSettings();
   }
 
@@ -246,11 +361,12 @@ export default class SelfSyncPlugin extends Plugin {
       return;
     }
     const report = await checkStore(this.store());
-    const bad = report.checks.filter((c) => !c.ok);
-    new Notice(
-      report.ok ? 'Storage works: all checks passed.' : `Storage problem:\n${bad.map((c) => `${c.name}: ${c.detail}`).join('\n')}`,
-      report.ok ? 5000 : 20_000,
-    );
+    const bad = report.checks.find((c) => !c.ok);
+    if (!bad) new Notice('Storage works: all checks passed.', 5000);
+    else {
+      const p = describeFailure(new Error(bad.detail ?? bad.name));
+      new Notice(this.fragment(p.id.startsWith('failed') ? `Storage check failed: ${bad.name}` : p.title, p.detail), 20_000);
+    }
   }
 
   private async cleanUp(): Promise<void> {
@@ -258,7 +374,7 @@ export default class SelfSyncPlugin extends Plugin {
     this.running = true;
     try {
       const r = await this.getEngine().gc();
-      new Notice(`Removed ${r.packsDeleted} storage objects (${(r.bytesFreed / 1e6).toFixed(1)} MB).`);
+      new Notice(`Removed ${plural(r.packsDeleted, 'storage object')} (${(r.bytesFreed / 1e6).toFixed(1)} MB).`);
     } catch (e) {
       new Notice(`Clean-up failed: ${e instanceof Error ? e.message : e}`, 10_000);
     } finally {

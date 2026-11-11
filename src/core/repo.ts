@@ -57,6 +57,11 @@ export class Repo {
     this.keys = keys;
   }
 
+  /** True when the storage already holds a vault, so setup asks for its passphrase rather than a new one. */
+  static async exists(store: RemoteStore): Promise<boolean> {
+    return (await store.get(HEADER_KEY)) !== null;
+  }
+
   static async open(store: RemoteStore, passphrase: string, create: { kdfIterations: number; chunk: ChunkParams }): Promise<Repo> {
     let raw = await store.get(HEADER_KEY);
     if (!raw) {

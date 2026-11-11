@@ -4,7 +4,7 @@ import { cutPoints } from '../src/core/chunker.ts';
 import { compileExcludes } from '../src/core/config.ts';
 import { chunkId, createKeys, open, seal, unlockKeys, WrongPassphraseError } from '../src/core/crypto.ts';
 import { merge3 } from '../src/core/merge.ts';
-import { conflictCopyName, ext, vaultKey } from '../src/core/paths.ts';
+import { conflictCopyName, conflictOriginal, ext, vaultKey } from '../src/core/paths.ts';
 import { checkStore } from '../src/stores/doctor.ts';
 import { uncachedHeaders } from '../src/stores/http.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
@@ -178,4 +178,13 @@ test('reads ask the HTTP client not to cache, so a later delete is not made cond
   assert.deepEqual(uncachedHeaders({ method: 'GET', url: 'https://s3/k', headers: { range: 'bytes=0-1' } }), { range: 'bytes=0-1', 'cache-control': 'no-store' });
   assert.deepEqual(uncachedHeaders({ method: 'DELETE', url: 'https://s3/k', headers: { a: '1' } }), { a: '1' });
   assert.deepEqual(uncachedHeaders({ method: 'PUT', url: 'https://s3/k', headers: {} }), {});
+});
+
+test('a conflict copy leads back to the file it was made from', () => {
+  const at = new Date(2026, 10, 11, 9, 5, 7);
+  for (const key of ['a/b.md', 'Notes/no extension', 'x.y/z.tar.gz', 'Photo 02.png']) {
+    assert.equal(conflictOriginal(conflictCopyName(key, 'my phone', at)), key);
+    assert.equal(conflictOriginal(conflictCopyName(key, 'mobile-103c', at, 3)), key);
+  }
+  assert.equal(conflictOriginal('plain.md'), 'plain.md');
 });

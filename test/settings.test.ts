@@ -6,13 +6,21 @@ import {
   cleanupDue,
   decodeSetupCode,
   defaultSettings,
+  describeStorage,
   encodeSetupCode,
+  folderFor,
   hasStorageAddress,
   isConfigured,
   parseNumberSetting,
+  providerOf,
+  regionFromEndpoint,
   remoteSpec,
+  setupCodeFrom,
+  setupLink,
+  storageSettings,
   syncConfig,
   type Settings,
+  type StorageForm,
 } from '../src/plugin/settings.ts';
 
 const secrets: Record<string, string> = { ak: 'AKID', sk: 'SECRET', dp: 'dav pw', pp: 'vault pass' };
@@ -104,4 +112,46 @@ test('settings: a cleared or invalid number field changes nothing', () => {
   assert.equal(parseNumberSetting('1', 2), null);
   assert.equal(parseNumberSetting('0', 0), 0);
   assert.equal(parseNumberSetting('15', 1), 15);
+});
+
+test('setup form: each provider gets the endpoint, region and addressing it needs', () => {
+  const form = (over: Partial<StorageForm>): StorageForm => ({ location: '', bucket: 'notes', prefix: 'My-Vault', user: '', region: '', pathStyle: true, ...over });
+  assert.deepEqual(storageSettings('r2', form({ location: ' 0123abcd ' })), {
+    storageType: 's3', bucket: 'notes', prefix: 'My-Vault', endpoint: 'https://0123abcd.r2.cloudflarestorage.com', region: 'auto', pathStyle: true,
+  });
+  assert.equal(storageSettings('r2', form({ location: 'https://0123abcd.r2.cloudflarestorage.com/' })).endpoint, 'https://0123abcd.r2.cloudflarestorage.com');
+  assert.deepEqual(storageSettings('aws', form({ location: 'EU-West-2' })), {
+    storageType: 's3', bucket: 'notes', prefix: 'My-Vault', endpoint: 'https://s3.eu-west-2.amazonaws.com', region: 'eu-west-2', pathStyle: false,
+  });
+  assert.deepEqual(storageSettings('b2', form({ location: 's3.us-west-004.backblazeb2.com' })), {
+    storageType: 's3', bucket: 'notes', prefix: 'My-Vault', endpoint: 'https://s3.us-west-004.backblazeb2.com', region: 'us-west-004', pathStyle: true,
+  });
+  assert.equal(storageSettings('s3', form({ location: 'http://nas.local:9000', pathStyle: true })).region, 'us-east-1');
+  assert.equal(storageSettings('s3', form({ location: 's3.eu-central-2.wasabisys.com' })).region, 'eu-central-2');
+  assert.deepEqual(storageSettings('webdav', form({ location: 'cloud.example.com/remote.php/dav/files/me/vault/', user: ' me ' })), {
+    storageType: 'webdav', webdavUrl: 'https://cloud.example.com/remote.php/dav/files/me/vault', webdavUser: 'me',
+  });
+  assert.throws(() => storageSettings('aws', form({ location: 'Virginia' })), /region shown for the bucket/);
+  assert.throws(() => storageSettings('b2', form({ location: 'example.com' })), /endpoint shown on the bucket/);
+  assert.throws(() => storageSettings('r2', form({ location: 'abc', bucket: ' ' })), /bucket name/);
+  assert.throws(() => storageSettings('webdav', form({ location: 'x' })), /user name/);
+});
+
+test('storage is named the way the user knows it', () => {
+  assert.equal(regionFromEndpoint('https://s3.ap-southeast-1.amazonaws.com'), 'ap-southeast-1');
+  assert.equal(regionFromEndpoint('https://minio.local'), undefined);
+  const r2 = s3({ endpoint: 'https://abc.r2.cloudflarestorage.com', bucket: 'notes', prefix: 'vault' });
+  assert.equal(providerOf(r2), 'r2');
+  assert.equal(describeStorage(r2), 'Cloudflare R2 · notes · vault');
+  assert.equal(describeStorage(s3({ endpoint: 'https://minio.local:9000', bucket: 'b', prefix: '' })), 'minio.local:9000 · b');
+  assert.equal(describeStorage(dav()), 'WebDAV · dav.example.com');
+  assert.equal(folderFor(' My Vault (2026) '), 'My-Vault-2026');
+  assert.equal(folderFor('日本'), 'vault');
+});
+
+test('a setup link carries the setup code, and either can be pasted', () => {
+  const code = 'selfsync1.abc+/=def';
+  assert.equal(setupCodeFrom(setupLink(code)), code);
+  assert.equal(setupCodeFrom(`  ${code}\n`), code);
+  assert.match(setupLink(code), /^obsidian:\/\/self-sync\?setup=selfsync1\.abc%2B%2F%3Ddef$/);
 });

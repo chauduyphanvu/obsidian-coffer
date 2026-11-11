@@ -1,7 +1,11 @@
-import { Modal, Notice, PluginSettingTab, SecretComponent, Setting, SuggestModal, type App } from 'obsidian';
+import { Modal, Notice, PluginSettingTab, Setting, SuggestModal, TFile, type App } from 'obsidian';
+import { conflictOriginal } from '../core/paths.ts';
 import type { Version } from '../core/types.ts';
 import type SelfSyncPlugin from './main.ts';
-import { parseNumberSetting, type Settings } from './settings.ts';
+import { describeStorage, hasStorageAddress, parseNumberSetting, type Settings } from './settings.ts';
+import { SetupModal } from './setup.ts';
+import type { Problem } from './status.ts';
+import { button, buttonRow, field, message, statusLine } from './ui.ts';
 
 export class HistoryModal extends SuggestModal<Version> {
   private plugin: SelfSyncPlugin;
@@ -32,37 +36,88 @@ export class HistoryModal extends SuggestModal<Version> {
   }
 }
 
+type SecretKey = 'accessKeySecret' | 'secretKeySecret' | 'passphraseSecret' | 'webdavPasswordSecret';
+
 export class SettingsTab extends PluginSettingTab {
   private plugin: SelfSyncPlugin;
+  private unsubscribe?: () => void;
+  private openSections = new Set<string>();
 
   constructor(app: App, plugin: SelfSyncPlugin) {
     super(app, plugin);
     this.plugin = plugin;
   }
 
+  hide(): void {
+    this.unsubscribe?.();
+    this.unsubscribe = undefined;
+  }
+
   display(): void {
     const { containerEl } = this;
-    const s = this.plugin.settings;
-    const save = () => void this.plugin.saveSettings();
+    const plugin = this.plugin;
+    const s = plugin.settings;
+    const save = () => void plugin.saveSettings();
+    this.hide();
     containerEl.empty();
+    containerEl.addClass('self-sync-settings');
 
-    const text = (name: string, desc: string, key: 'endpoint' | 'region' | 'bucket' | 'prefix' | 'deviceName' | 'webdavUrl' | 'webdavUser', placeholder = '') =>
-      new Setting(containerEl).setName(name).setDesc(desc).addText((t) =>
+    const card = containerEl.createDiv({ cls: 'self-sync-card' });
+    const renderCard = () => {
+      card.empty();
+      const configured = plugin.configured();
+      const { text, tone } = plugin.statusLine();
+      statusLine(card, text, tone);
+      if (configured) card.createDiv({ cls: 'self-sync-sub', text: describeStorage(s) });
+      if (!configured) {
+        card.createEl('p', {
+          cls: 'self-sync-intro',
+          text: 'Sync this vault across your devices through storage you own. Files are encrypted on this device before they leave it.',
+        });
+        const setup = buttonRow(card);
+        button(setup, 'This is my first device', () => new SetupModal(this.app, plugin, 'new').open(), 'cta');
+        button(setup, 'I already sync another device', () => new SetupModal(this.app, plugin, 'join').open());
+        return;
+      }
+      const row = buttonRow(card);
+      button(row, plugin.running ? 'Syncing…' : 'Sync now', () => plugin.sync(true), 'cta').setDisabled(plugin.running);
+      const problems = plugin.problems();
+      if (problems.length) {
+        const critical = problems.some((p) => p.severity === 'critical');
+        button(row, critical ? (problems.length === 1 ? 'See the problem' : `See ${problems.length} problems`) : 'Review', () => plugin.openStatus(), critical ? 'warning' : 'plain');
+      }
+    };
+    renderCard();
+    this.unsubscribe = plugin.onChange(renderCard);
+
+    const section = (id: string, title: string, summary = '') => {
+      const d = containerEl.createEl('details', { cls: 'self-sync-section' });
+      d.open = this.openSections.has(id);
+      d.addEventListener('toggle', () => (d.open ? this.openSections.add(id) : this.openSections.delete(id)));
+      const sum = d.createEl('summary');
+      sum.createSpan({ cls: 'self-sync-section-title', text: title });
+      if (summary) sum.createSpan({ cls: 'self-sync-section-summary', text: summary });
+      return d;
+    };
+    const text = (el: HTMLElement, name: string, desc: string, key: 'endpoint' | 'region' | 'bucket' | 'prefix' | 'deviceName' | 'webdavUrl' | 'webdavUser', placeholder = '') =>
+      new Setting(el).setName(name).setDesc(desc).addText((t) =>
         t.setPlaceholder(placeholder).setValue(s[key]).onChange((v) => {
           s[key] = v.trim();
           save();
         }),
       );
-    const secret = (name: string, desc: string, key: 'accessKeySecret' | 'secretKeySecret' | 'passphraseSecret' | 'webdavPasswordSecret') =>
-      new Setting(containerEl).setName(name).setDesc(desc).addComponent((el) =>
-        new SecretComponent(this.app, el).setValue(s[key]).onChange((v) => {
-          s[key] = v ?? '';
-          save();
-        }),
-      );
-    const number = (name: string, desc: string, key: 'intervalMinutes' | 'changeDelaySeconds' | 'pollSeconds' | 'autoCleanDays' | 'retentionDays' | 'maxFileSizeMB' | 'concurrency', min: number) =>
-      new Setting(containerEl).setName(name).setDesc(desc).addText((t) => {
+    // A plain password box: typing replaces the stored secret; the value itself is never shown.
+    const secret = (el: HTMLElement, name: string, desc: string, key: SecretKey, id: string) =>
+      new Setting(el).setName(name).setDesc(desc).addText((t) => {
+        t.inputEl.type = 'password';
+        t.inputEl.setAttrs({ autocapitalize: 'off', autocorrect: 'off', autocomplete: 'off', spellcheck: 'false' });
+        t.setPlaceholder(plugin.secret(s[key]) ? 'Saved on this device' : 'Not set');
+        t.onChange((v) => v && void plugin.setSecret(key, id, v));
+      });
+    const number = (el: HTMLElement, name: string, desc: string, key: 'intervalMinutes' | 'changeDelaySeconds' | 'pollSeconds' | 'autoCleanDays' | 'retentionDays' | 'maxFileSizeMB' | 'concurrency', min: number) =>
+      new Setting(el).setName(name).setDesc(desc).addText((t) => {
         t.inputEl.type = 'number';
+        t.inputEl.inputMode = 'numeric';
         t.setValue(String(s[key])).onChange((v) => {
           const n = parseNumberSetting(v, min);
           if (n === null) return;
@@ -70,37 +125,38 @@ export class SettingsTab extends PluginSettingTab {
           save();
         });
       });
-    const toggle = (name: string, desc: string, key: 'pathStyle' | 'syncOnStart' | 'syncConfigDir' | 'compression') =>
-      new Setting(containerEl).setName(name).setDesc(desc).addToggle((t) =>
+    const toggle = (el: HTMLElement, name: string, desc: string, key: 'pathStyle' | 'syncOnStart' | 'syncConfigDir' | 'compression') =>
+      new Setting(el).setName(name).setDesc(desc).addToggle((t) =>
         t.setValue(s[key]).onChange((v) => {
           s[key] = v;
           save();
         }),
       );
 
-    new Setting(containerEl)
-      .setName('Set up from another device')
-      .setDesc('On a device that already syncs, copy its setup code. Here, paste it and type the passphrase: storage address and keys are filled in for you.')
-      .addButton((b) =>
-        b.setButtonText('Copy setup code').setDisabled(!this.plugin.configured()).onClick(async () => {
-          try {
-            // Settings can be their own window, and only the focused window may write to the clipboard.
-            await activeWindow.navigator.clipboard.writeText(await this.plugin.exportSetupCode());
-            new Notice('Setup code copied. It is encrypted with your passphrase.');
-          } catch (e) {
-            new Notice(`Could not copy the setup code: ${e instanceof Error ? e.message : e}`, 8000);
-          }
-        }),
-      )
-      .addButton((b) => b.setButtonText('Use a setup code').setCta().onClick(() => new SetupCodeModal(this.app, this.plugin, () => this.display()).open()));
+    if (plugin.configured()) {
+      new Setting(containerEl)
+        .setName('Add another device')
+        .setDesc('Install Self Sync there, choose "I already sync another device", and paste this link. It is encrypted with your passphrase.')
+        .addButton((b) =>
+          b.setButtonText('Copy setup link').onClick(async () => {
+            try {
+              // Settings can be their own window, and only the focused window may write to the clipboard.
+              await activeWindow.navigator.clipboard.writeText(await plugin.setupLink());
+              new Notice('Setup link copied.');
+            } catch (e) {
+              new Notice(`Could not copy the setup link: ${e instanceof Error ? e.message : e}`, 8000);
+            }
+          }),
+        );
+    }
 
-    new Setting(containerEl).setName('Storage').setHeading();
-    new Setting(containerEl)
+    const storage = section('storage', 'Storage and passphrase', hasStorageAddress(s) ? describeStorage(s) : 'Not set up');
+    new Setting(storage)
       .setName('Storage type')
       .addDropdown((d) =>
         d
-          .addOption('s3', 'S3-compatible bucket (R2, B2, AWS, MinIO)')
-          .addOption('webdav', 'WebDAV (Nextcloud, NAS)')
+          .addOption('s3', 'S3-compatible bucket')
+          .addOption('webdav', 'WebDAV folder')
           .setValue(s.storageType)
           .onChange((v) => {
             s.storageType = v as Settings['storageType'];
@@ -109,44 +165,43 @@ export class SettingsTab extends PluginSettingTab {
           }),
       );
     if (s.storageType === 'webdav') {
-      text('Folder address', 'A folder on the server that will hold this vault. It is created if missing.', 'webdavUrl', 'https://cloud.example.com/remote.php/dav/files/me/obsidian');
-      text('User name', '', 'webdavUser');
-      secret('Password', 'Stored in Obsidian\'s secret storage on this device, not in the vault.', 'webdavPasswordSecret');
+      text(storage, 'Folder address', 'Created if missing.', 'webdavUrl', 'https://cloud.example.com/remote.php/dav/files/me/obsidian');
+      text(storage, 'User name', '', 'webdavUser');
+      secret(storage, 'Password', '', 'webdavPasswordSecret', 'self-sync-webdav-password');
     } else {
-      text('Endpoint', 'The S3 API address of your storage provider.', 'endpoint', 'https://<account>.r2.cloudflarestorage.com');
-      text('Region', 'Use "auto" for Cloudflare R2.', 'region', 'auto');
-      text('Bucket', 'Must already exist.', 'bucket');
-      text('Folder in bucket', 'Lets one bucket hold several vaults. Every device syncing this vault must use the same folder.', 'prefix');
-      secret('Access key ID', 'Stored in Obsidian\'s secret storage on this device, not in the vault.', 'accessKeySecret');
-      secret('Secret access key', 'Stored in Obsidian\'s secret storage on this device, not in the vault.', 'secretKeySecret');
-      toggle('Path-style addresses', 'On for R2, Backblaze B2, MinIO and most others. Off for AWS S3 buckets that require bucket-name hostnames.', 'pathStyle');
+      text(storage, 'Endpoint', '', 'endpoint', 'https://<account>.r2.cloudflarestorage.com');
+      text(storage, 'Region', '"auto" for Cloudflare R2.', 'region', 'auto');
+      text(storage, 'Bucket', '', 'bucket');
+      text(storage, 'Folder in bucket', 'Every device syncing this vault must use the same folder.', 'prefix');
+      secret(storage, 'Access key ID', '', 'accessKeySecret', 'self-sync-access-key');
+      secret(storage, 'Secret access key', '', 'secretKeySecret', 'self-sync-secret-key');
+      toggle(storage, 'Path-style addresses', 'On for R2, B2, MinIO and most others; off for Amazon S3.', 'pathStyle');
     }
-    new Setting(containerEl)
-      .setName('Check connection')
-      .setDesc('Writes, reads and deletes a small test object, and verifies the storage can prevent two devices from overwriting each other.')
-      .addButton((b) => b.setButtonText('Check').onClick(() => void this.plugin.checkStorage()));
+    secret(storage, 'Passphrase', 'The one every device uses. Typing here only changes it on this device.', 'passphraseSecret', 'self-sync-passphrase');
+    new Setting(storage)
+      .setName('Check the connection')
+      .setDesc('Writes, reads and deletes a small test object.')
+      .addButton((b) => b.setButtonText('Check').onClick(() => void plugin.checkStorage()));
+    new Setting(storage)
+      .setName('Change the passphrase on all devices')
+      .setDesc('Nothing is re-uploaded. Other devices ask for the new one.')
+      .addButton((b) => b.setButtonText('Change').setDisabled(!plugin.configured()).onClick(() => new PassphraseModal(this.app, plugin).open()));
+    new Setting(storage)
+      .setName('Set up again')
+      .setDesc('Walks through connecting storage, or joining with a setup link.')
+      .addButton((b) => b.setButtonText('Start').onClick(() => new SetupModal(this.app, plugin, 'start').open()));
 
-    new Setting(containerEl).setName('Encryption').setHeading();
-    secret(
-      'Passphrase',
-      'Encrypts file contents and names before they leave this device. Use the same passphrase on every device. If it is lost, the remote copy cannot be read.',
-      'passphraseSecret',
-    );
-    new Setting(containerEl)
-      .setName('Change passphrase')
-      .setDesc('Nothing is re-uploaded. Other devices need the new passphrase the next time they start.')
-      .addButton((b) => b.setButtonText('Change').setDisabled(!this.plugin.configured()).onClick(() => new PassphraseModal(this.app, this.plugin).open()));
+    const when = section('when', 'When to sync', s.intervalMinutes ? `on changes, every ${s.intervalMinutes} min` : 'on changes');
+    toggle(when, 'When Obsidian starts', '', 'syncOnStart');
+    number(when, 'After an edit (seconds)', 'Waits this long after the last edit.', 'changeDelaySeconds', 2);
+    number(when, 'Every (minutes)', '0 turns the timer off.', 'intervalMinutes', 0);
+    number(when, 'Look for other devices\' changes every (seconds)', 'One tiny request, only while Obsidian is on screen. 0 turns it off.', 'pollSeconds', 0);
 
-    new Setting(containerEl).setName('When to sync').setHeading();
-    toggle('Sync when Obsidian starts', '', 'syncOnStart');
-    number('Sync every (minutes)', '0 turns the timer off.', 'intervalMinutes', 0);
-    number('Sync after changes (seconds)', 'How long to wait after the last edit before syncing.', 'changeDelaySeconds', 2);
-    number('Check for changes from other devices every (seconds)', 'One very small request each time, only while Obsidian is on screen. 0 turns it off.', 'pollSeconds', 0);
-
-    new Setting(containerEl).setName('What to sync').setHeading();
-    toggle('Sync settings, themes and plugins', `Includes the ${this.app.vault.configDir} folder, except workspace layout.`, 'syncConfigDir');
-    new Setting(containerEl)
-      .setName('Excluded files')
+    const what = section('what', 'What to sync', `files up to ${s.maxFileSizeMB || 'any'} MB`);
+    toggle(what, 'Settings, themes and plugins', `The ${this.app.vault.configDir} folder, except the workspace layout.`, 'syncConfigDir');
+    number(what, 'Largest file (MB)', 'Larger files stay on this device and are listed as problems. 0 means no limit.', 'maxFileSizeMB', 0);
+    new Setting(what)
+      .setName('Leave out')
       .setDesc('One pattern per line. * matches within a folder, ** across folders, a trailing / a whole folder.')
       .addTextArea((t) =>
         t.setPlaceholder('Private/\n*.tmp').setValue(s.exclude).onChange((v) => {
@@ -154,63 +209,156 @@ export class SettingsTab extends PluginSettingTab {
           save();
         }),
       );
-    number('Largest file to sync (MB)', '0 means no limit. Large files are held in memory while syncing.', 'maxFileSizeMB', 0);
 
-    new Setting(containerEl).setName('Conflicts and history').setHeading();
-    new Setting(containerEl)
-      .setName('When a note was edited on two devices')
-      .setDesc('Merging combines edits to different parts of a note; overlapping edits and non-text files always keep both versions.')
+    const history = section('history', 'Conflicts and history', `versions kept ${s.retentionDays} days`);
+    new Setting(history)
+      .setName('A note edited on two devices')
+      .setDesc('Overlapping edits and non-text files always keep both versions.')
       .addDropdown((d) =>
         d
-          .addOption('merge', 'Merge, keep both if edits overlap')
-          .addOption('copy', 'Always keep both versions')
+          .addOption('merge', 'Merge the edits')
+          .addOption('copy', 'Keep both versions')
           .setValue(s.conflictStrategy)
           .onChange((v) => {
             s.conflictStrategy = v as Settings['conflictStrategy'];
             save();
           }),
       );
-    number('Keep old versions for (days)', 'Every synced version of a file can be restored for this long.', 'retentionDays', 1);
-    number('Remove expired versions every (days)', '0 leaves it to the "Delete expired versions from storage" command.', 'autoCleanDays', 0);
+    number(history, 'Keep old versions (days)', 'Any synced version can be restored for this long.', 'retentionDays', 1);
+    number(history, 'Remove expired versions every (days)', '0 leaves it to the command.', 'autoCleanDays', 0);
 
-    new Setting(containerEl).setName('Advanced').setHeading();
-    text('Device name', 'Shown in version history and conflict file names.', 'deviceName');
-    number('Parallel transfers', '', 'concurrency', 1);
-    toggle('Compress text before encrypting', '', 'compression');
+    const advanced = section('advanced', 'Advanced');
+    text(advanced, 'Device name', 'Shown in version history and conflict copies.', 'deviceName');
+    number(advanced, 'Parallel transfers', '', 'concurrency', 1);
+    toggle(advanced, 'Compress text before encrypting', '', 'compression');
   }
 }
 
-class SetupCodeModal extends Modal {
+/** Every open problem with what can be done about it, or "all good". */
+export class ProblemsModal extends Modal {
   private plugin: SelfSyncPlugin;
-  private done: () => void;
+  private unsubscribe?: () => void;
 
-  constructor(app: App, plugin: SelfSyncPlugin, done: () => void) {
+  constructor(app: App, plugin: SelfSyncPlugin) {
     super(app);
     this.plugin = plugin;
-    this.done = done;
   }
 
   onOpen(): void {
-    let code = '';
-    let passphrase = '';
-    this.setTitle('Set up from another device');
-    new Setting(this.contentEl).setName('Setup code').addTextArea((t) => t.setPlaceholder('selfsync1.…').onChange((v) => (code = v)));
-    new Setting(this.contentEl).setName('Passphrase').addText((t) => {
-      t.inputEl.type = 'password';
-      t.onChange((v) => (passphrase = v));
-    });
-    new Setting(this.contentEl).addButton((b) =>
-      b.setButtonText('Set up and sync').setCta().onClick(async () => {
-        try {
-          await this.plugin.importSetupCode(code, passphrase);
+    this.modalEl.addClass('self-sync-modal');
+    this.unsubscribe = this.plugin.onChange(() => this.render());
+    this.render();
+  }
+
+  onClose(): void {
+    this.unsubscribe?.();
+    this.contentEl.empty();
+  }
+
+  private render(): void {
+    const c = this.contentEl;
+    const plugin = this.plugin;
+    c.empty();
+    const problems = plugin.problems();
+    this.setTitle(problems.some((p) => p.severity === 'critical') ? 'Sync needs your attention' : 'Sync');
+    const { text, tone } = plugin.statusLine();
+    statusLine(c, text, tone);
+    if (!plugin.configured()) {
+      button(buttonRow(c), 'Set up sync', () => {
+        this.close();
+        new SetupModal(this.app, plugin, 'start').open();
+      }, 'cta');
+      return;
+    }
+    if (!problems.length) c.createEl('p', { cls: 'self-sync-intro', text: 'Everything is in sync.' });
+    for (const p of problems) this.problem(c, p);
+    button(buttonRow(c), plugin.running ? 'Syncing…' : 'Sync now', () => plugin.sync(true), problems.length ? 'plain' : 'cta').setDisabled(plugin.running);
+  }
+
+  private problem(parent: HTMLElement, p: Problem): void {
+    const plugin = this.plugin;
+    const card = parent.createDiv({ cls: `self-sync-problem is-${p.severity}` });
+    card.createDiv({ cls: 'self-sync-problem-title', text: p.title });
+    card.createDiv({ cls: 'self-sync-problem-detail', text: p.detail });
+    if (p.files?.length) {
+      const list = card.createDiv({ cls: 'self-sync-files' });
+      for (const path of p.files.slice(0, 20)) {
+        const row = list.createDiv({ cls: 'self-sync-file' });
+        row.createSpan({ text: path });
+        if (p.id.startsWith('conflicts')) {
+          this.openLink(row, 'Original', conflictOriginal(path));
+          this.openLink(row, 'Copy', path);
+        } else this.openLink(row, 'Open', path);
+      }
+      if (p.files.length > 20) list.createDiv({ cls: 'self-sync-hint', text: `…and ${p.files.length - 20} more` });
+    }
+    const row = buttonRow(card);
+    switch (p.action) {
+      case 'settings':
+        button(row, 'Open settings', () => {
           this.close();
-          this.done();
-          void this.plugin.sync(true);
-        } catch (e) {
-          new Notice(e instanceof Error ? e.message : String(e), 8000);
-        }
-      }),
-    );
+          const setting = (this.app as unknown as { setting: { open(): void; openTabById(id: string): void } }).setting;
+          setting.open();
+          setting.openTabById(plugin.manifest.id);
+        });
+        break;
+      case 'passphrase':
+        button(row, 'Enter the passphrase', () => new EnterPassphraseModal(this.app, plugin).open(), 'cta');
+        break;
+      case 'resolve-deletes':
+        button(row, 'Keep all files', () => plugin.keepAllFiles(), 'cta');
+        button(row, 'Delete them everywhere', () => plugin.sync(true, true), 'warning');
+        break;
+      case 'retry':
+        button(row, 'Try again', () => plugin.sync(true));
+        break;
+    }
+  }
+
+  private openLink(parent: HTMLElement, label: string, path: string): void {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) return;
+    const a = parent.createEl('a', { cls: 'self-sync-open', text: label, href: '#' });
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      this.close();
+      void this.app.workspace.getLeaf(true).openFile(file);
+    });
+  }
+}
+
+/** After "wrong passphrase": the one this device should use. */
+class EnterPassphraseModal extends Modal {
+  private plugin: SelfSyncPlugin;
+  private value = '';
+  private error = '';
+
+  constructor(app: App, plugin: SelfSyncPlugin) {
+    super(app);
+    this.plugin = plugin;
+  }
+
+  onOpen(): void {
+    this.modalEl.addClass('self-sync-modal');
+    this.render();
+  }
+
+  private render(): void {
+    const c = this.contentEl;
+    c.empty();
+    this.setTitle('Enter the passphrase');
+    c.createEl('p', { cls: 'self-sync-intro', text: 'Use the passphrase your other devices use now. If it was changed elsewhere, that is the new one.' });
+    field(c, 'Passphrase', { value: this.value, password: true }, (v) => (this.value = v));
+    message(c, this.error);
+    button(buttonRow(c), 'Save and sync', async () => {
+      if (!this.value) return;
+      await this.plugin.setSecret('passphraseSecret', 'self-sync-passphrase', this.value);
+      const out = await this.plugin.sync(true, false, true);
+      if (out.problem?.id === 'passphrase') {
+        this.error = 'That is not it either.';
+        this.render();
+      } else this.close();
+    }, 'cta');
   }
 
   onClose(): void {
@@ -229,28 +377,25 @@ class PassphraseModal extends Modal {
   onOpen(): void {
     let first = '';
     let second = '';
-    this.setTitle('Change passphrase');
-    for (const [name, set] of [['New passphrase', (v: string) => (first = v)], ['Repeat it', (v: string) => (second = v)]] as const) {
-      new Setting(this.contentEl).setName(name).addText((t) => {
-        t.inputEl.type = 'password';
-        t.onChange(set);
-      });
-    }
-    new Setting(this.contentEl).addButton((b) =>
-      b.setButtonText('Change passphrase').setCta().onClick(async () => {
-        if (!first || first !== second) {
-          new Notice('The two entries do not match.');
-          return;
-        }
-        try {
-          await this.plugin.changePassphrase(first);
-          this.close();
-          new Notice('Passphrase changed. Enter the new one on your other devices.');
-        } catch (e) {
-          new Notice(`Could not change the passphrase: ${e instanceof Error ? e.message : e}`, 10_000);
-        }
-      }),
-    );
+    const c = this.contentEl;
+    this.modalEl.addClass('self-sync-modal');
+    this.setTitle('Change the passphrase');
+    c.createEl('p', { cls: 'self-sync-intro', text: 'Nothing is re-uploaded. Each other device asks for the new passphrase once.' });
+    field(c, 'New passphrase', { password: true }, (v) => (first = v));
+    field(c, 'Repeat it', { password: true }, (v) => (second = v));
+    button(buttonRow(c), 'Change passphrase', async () => {
+      if (!first || first !== second) {
+        new Notice('The two entries do not match.');
+        return;
+      }
+      try {
+        await this.plugin.changePassphrase(first);
+        this.close();
+        new Notice('Passphrase changed. Enter the new one on your other devices.');
+      } catch (e) {
+        new Notice(`Could not change the passphrase: ${e instanceof Error ? e.message : e}`, 10_000);
+      }
+    }, 'cta');
   }
 
   onClose(): void {

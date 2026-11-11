@@ -21,3 +21,6 @@ export function conflictCopyName(key: string, device: string, time: Date, n = 1)
   const dot = extensionDot(key);
   return `${key.slice(0, dot)} (conflict ${device.replace(/[^\w-]+/g, '_')} ${stamp}${n > 1 ? ` ${n}` : ''})${key.slice(dot)}`;
 }
+
+/** The file a conflict copy was made from: the inverse of `conflictCopyName`. */
+export const conflictOriginal = (copy: string) => copy.replace(/ \(conflict [\w-]+ \d{8}-\d{6}(?: \d+)?\)(?=(\.[^./]*)?$)/, '');
