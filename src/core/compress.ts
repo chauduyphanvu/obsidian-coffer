@@ -1,9 +1,20 @@
+import { concat } from './bytes.ts';
 import { ext } from './paths.ts';
 
-const bp = (u: Uint8Array) => u as unknown as BlobPart;
-
+// Fed and drained directly: wrapping the data in a Blob and a Response costs more than compressing a small note.
 async function pipe(data: Uint8Array, stream: CompressionStream | DecompressionStream): Promise<Uint8Array> {
-  return new Uint8Array(await new Response(new Blob([bp(data)]).stream().pipeThrough(stream)).arrayBuffer());
+  const writer = stream.writable.getWriter();
+  // A failure shows up on the reading side too; these only keep it from also being reported as unhandled.
+  writer.write(data as unknown as BufferSource).catch(() => {});
+  writer.close().catch(() => {});
+  const reader = stream.readable.getReader();
+  const parts: Uint8Array[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    parts.push(value);
+  }
+  return parts.length ? concat(parts) : new Uint8Array(0);
 }
 
 export const deflate = (data: Uint8Array) => pipe(data, new CompressionStream('deflate-raw'));
