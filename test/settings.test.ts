@@ -15,6 +15,7 @@ import {
   providerOf,
   regionFromEndpoint,
   remoteSpec,
+  secretName,
   setupCodeFrom,
   setupLink,
   storageSettings,
@@ -95,14 +96,31 @@ test('setup codes carry storage settings and keys under the passphrase', async (
     '{"storageType":"s3","endpoint":" https://s3.example.com ","region":" ","bucket":"bkt ","prefix":"my vault","pathStyle":true,' +
       '"webdavUrl":"","webdavUser":"","accessKey":"AKID","secretKey":"SECRET","webdavPassword":""}',
   );
-  const { settings, secrets: stored } = await decodeSetupCode(`  ${code}\n`, 'vault pass');
+  const { settings, secrets: stored } = await decodeSetupCode(`  ${code}\n`, 'vault pass', 'My Notes');
+  const id = (base: string) => secretName(base, 'My Notes');
   assert.deepEqual(settings, {
     storageType: 's3', endpoint: ' https://s3.example.com ', region: ' ', bucket: 'bkt ', prefix: 'my vault', pathStyle: true,
     webdavUrl: '', webdavUser: '',
-    accessKeySecret: 'self-sync-access-key', secretKeySecret: 'self-sync-secret-key', webdavPasswordSecret: '', passphraseSecret: 'self-sync-passphrase',
+    accessKeySecret: id('self-sync-access-key'), secretKeySecret: id('self-sync-secret-key'), webdavPasswordSecret: '', passphraseSecret: id('self-sync-passphrase'),
   });
-  assert.deepEqual(stored, [['self-sync-access-key', 'AKID'], ['self-sync-secret-key', 'SECRET'], ['self-sync-passphrase', 'vault pass']]);
-  await assert.rejects(decodeSetupCode(code, 'wrong'), /Wrong passphrase/);
+  assert.deepEqual(stored, [[id('self-sync-access-key'), 'AKID'], [id('self-sync-secret-key'), 'SECRET'], [id('self-sync-passphrase'), 'vault pass']]);
+  await assert.rejects(decodeSetupCode(code, 'wrong', 'My Notes'), /Wrong passphrase/);
+});
+
+test('each vault gets its own secret names, because a phone keeps one keychain for every vault', async () => {
+  const secret = (name: string) => ({ k: 'AKID', s: 'SECRET', p: 'vault pass' })[name] ?? '';
+  const code = await encodeSetupCode({ ...defaultSettings(true), endpoint: 'https://s3.example.com', bucket: 'b', accessKeySecret: 'k', secretKeySecret: 's', passphraseSecret: 'p' }, secret);
+  const vaults = ['Self Sync Test', 'Self Sync Test 2', '日記', 'メモ', 'self sync test', 'A'.repeat(200)];
+  const ids = [];
+  for (const vault of vaults) {
+    const { settings, secrets } = await decodeSetupCode(code, 'vault pass', vault);
+    assert.deepEqual(secrets.map(([name]) => name), [settings.accessKeySecret, settings.secretKeySecret, settings.passphraseSecret]);
+    for (const [name] of secrets) assert.match(name, /^[a-z0-9-]{1,64}$/, `${vault}: ${name}`);
+    ids.push(...secrets.map(([name]) => name));
+  }
+  assert.equal(new Set(ids).size, ids.length);
+  assert.match(secretName('self-sync-passphrase', 'Self Sync Test'), /^self-sync-passphrase-self-sync-test-[a-z0-9]+$/);
+  assert.equal(secretName('self-sync-passphrase', 'Self Sync Test'), secretName('self-sync-passphrase', 'Self Sync Test'));
 });
 
 test('settings: a cleared or invalid number field changes nothing', () => {

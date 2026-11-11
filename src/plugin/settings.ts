@@ -154,14 +154,34 @@ export async function encodeSetupCode(s: Settings, secret: SecretLookup): Promis
   return `selfsync1.${await sealWithPassphrase(JSON.stringify(payload), secret(s.passphraseSecret))}`;
 }
 
-/** The settings a setup code fills in, and the secrets to store first, in order. */
-export async function decodeSetupCode(code: string, passphrase: string): Promise<{ settings: Partial<Settings>; secrets: [string, string][] }> {
+/**
+ * The name a vault keeps one of its secrets under. A phone has one keychain for every vault, so a fixed name would let
+ * setting up a second vault replace the first one's keys and passphrase. Names may hold a-z, 0-9 and -, up to 64.
+ */
+export function secretName(base: string, vault: string): string {
+  let h = 0x811c9dc5;
+  for (const ch of vault) h = Math.imul(h ^ ch.codePointAt(0)!, 0x01000193);
+  const tag = (h >>> 0).toString(36);
+  const slug = vault
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+/, '')
+    .slice(0, 64 - base.length - tag.length - 2)
+    .replace(/-+$/, '');
+  return [base, slug, tag].filter(Boolean).join('-');
+}
+
+/** The settings a setup code fills in, and the secrets to store first, in order, named for `vault`. */
+export async function decodeSetupCode(code: string, passphrase: string, vault: string): Promise<{ settings: Partial<Settings>; secrets: [string, string][] }> {
   const body = code.trim().replace(/^selfsync1\./, '');
   const p = JSON.parse(await openWithPassphrase(body, passphrase)) as Record<string, string | boolean>;
   const settings: Record<string, unknown> = { storageType: p.storageType === 'webdav' ? 'webdav' : 's3' };
   for (const f of SETUP_FIELDS) if (f !== 'storageType') settings[f] = p[f];
   const secrets: [string, string][] = [];
-  const keep = (id: string, value: string | boolean) => {
+  const keep = (base: string, value: string | boolean) => {
+    const id = secretName(base, vault);
     if (value) secrets.push([id, String(value)]);
     return value ? id : '';
   };

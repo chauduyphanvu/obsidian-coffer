@@ -13,6 +13,7 @@ import {
   hasStorageAddress,
   isConfigured,
   remoteSpec,
+  secretName,
   setupLink,
   statePath,
   syncConfig,
@@ -336,15 +337,19 @@ export default class SelfSyncPlugin extends Plugin {
   }
 
   async importSetupCode(code: string, passphrase: string): Promise<void> {
-    const { settings, secrets } = await decodeSetupCode(code, passphrase);
+    const { settings, secrets } = await decodeSetupCode(code, passphrase, this.app.vault.getName());
     for (const [id, value] of secrets) this.app.secretStorage.setSecret(id, value);
     Object.assign(this.settings, settings);
     await this.saveSettings();
   }
 
-  /** Stores a secret under `id` and points the setting at it. */
-  async setSecret(key: 'accessKeySecret' | 'secretKeySecret' | 'passphraseSecret' | 'webdavPasswordSecret', id: string, value: string): Promise<void> {
-    const name = this.settings[key] || id;
+  /**
+   * Stores a secret and points the setting at it. A setting still on the bare name `base`, which older versions shared
+   * between every vault on a phone, moves to this vault's own name, so fixing one vault cannot break another.
+   */
+  async setSecret(key: 'accessKeySecret' | 'secretKeySecret' | 'passphraseSecret' | 'webdavPasswordSecret', base: string, value: string): Promise<void> {
+    const current = this.settings[key];
+    const name = current && current !== base ? current : secretName(base, this.app.vault.getName());
     this.app.secretStorage.setSecret(name, value);
     this.settings[key] = name;
     await this.saveSettings();

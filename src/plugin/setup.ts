@@ -7,13 +7,13 @@ import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
 import type SelfSyncPlugin from './main.ts';
 import { obsidianHttp } from './obsidianfs.ts';
-import { PROVIDERS, folderFor, remoteSpec, setupCodeFrom, storageSettings, type Provider, type Settings, type StorageForm } from './settings.ts';
+import { PROVIDERS, folderFor, remoteSpec, secretName, setupCodeFrom, storageSettings, type Provider, type Settings, type StorageForm } from './settings.ts';
 import { describeFailure, summarize } from './status.ts';
 import { button, buttonRow, choice, field, message } from './ui.ts';
 
 type Step = 'start' | 'provider' | 'storage' | 'passphrase' | 'join' | 'syncing' | 'done';
 
-/** Secret names used for what setup stores, the same ones a setup code fills in. */
+/** What setup stores, the same secrets a setup code fills in; `secretName` makes each name this vault's own. */
 const IDS = { access: 'self-sync-access-key', secret: 'self-sync-secret-key', password: 'self-sync-webdav-password', passphrase: 'self-sync-passphrase' };
 
 const MIN_PASSPHRASE = 8;
@@ -225,17 +225,18 @@ export class SetupModal extends Modal {
     }
     const secrets = this.app.secretStorage;
     const k = this.keys;
-    if (this.provider === 'webdav') secrets.setSecret(IDS.password, k.password);
+    const name = (base: string) => secretName(base, this.app.vault.getName());
+    if (this.provider === 'webdav') secrets.setSecret(name(IDS.password), k.password);
     else {
-      secrets.setSecret(IDS.access, k.access.trim());
-      secrets.setSecret(IDS.secret, k.secret.trim());
+      secrets.setSecret(name(IDS.access), k.access.trim());
+      secrets.setSecret(name(IDS.secret), k.secret.trim());
     }
-    secrets.setSecret(IDS.passphrase, this.passphrase);
+    secrets.setSecret(name(IDS.passphrase), this.passphrase);
     Object.assign(this.plugin.settings, this.storage, {
-      accessKeySecret: this.provider === 'webdav' ? this.plugin.settings.accessKeySecret : IDS.access,
-      secretKeySecret: this.provider === 'webdav' ? this.plugin.settings.secretKeySecret : IDS.secret,
-      webdavPasswordSecret: this.provider === 'webdav' ? IDS.password : this.plugin.settings.webdavPasswordSecret,
-      passphraseSecret: IDS.passphrase,
+      accessKeySecret: this.provider === 'webdav' ? this.plugin.settings.accessKeySecret : name(IDS.access),
+      secretKeySecret: this.provider === 'webdav' ? this.plugin.settings.secretKeySecret : name(IDS.secret),
+      webdavPasswordSecret: this.provider === 'webdav' ? name(IDS.password) : this.plugin.settings.webdavPasswordSecret,
+      passphraseSecret: name(IDS.passphrase),
     });
     await this.plugin.saveSettings();
     await this.firstSync('passphrase');
