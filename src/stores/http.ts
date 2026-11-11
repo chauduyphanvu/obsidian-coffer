@@ -20,10 +20,12 @@ export const fetchHttp: Http = async (req) => {
 
 /**
  * iOS keeps GET responses in its URL cache and then adds `If-Modified-Since` to a later DELETE of the same URL,
- * which S3 rejects with 501. Reads that are never stored leave nothing to make a delete conditional on.
+ * which S3 rejects with 501; `no-store` keeps responses out of it. Desktop Obsidian answers a GET from Chromium's
+ * cache whenever a stored copy still looks fresh, whatever the credentials, and `no-store` does not stop that;
+ * `no-cache` makes Chromium go to the server, so a passphrase changed elsewhere is seen at once.
  */
 export const uncachedHeaders = (req: HttpRequest): Record<string, string> =>
-  req.method === 'GET' ? { ...req.headers, 'cache-control': 'no-store' } : req.headers;
+  req.method === 'GET' ? { ...req.headers, 'cache-control': 'no-store, no-cache' } : req.headers;
 
 export const unescapeXml = (s: string) => s.replace(/&(amp|lt|gt|quot|apos);/g, (_, e) => ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" })[e as string]!);
 

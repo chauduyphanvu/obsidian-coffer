@@ -174,8 +174,8 @@ test('path rules: extensions, conflict copy names, Unicode forms', () => {
   assert.equal(vaultKey('Cafe\u0301.md'), 'Caf\u00e9.md');
 });
 
-test('reads ask the HTTP client not to cache, so a later delete is not made conditional', () => {
-  assert.deepEqual(uncachedHeaders({ method: 'GET', url: 'https://s3/k', headers: { range: 'bytes=0-1' } }), { range: 'bytes=0-1', 'cache-control': 'no-store' });
+test('reads neither store a response (iOS conditional deletes) nor answer from a stored one (desktop stale key header)', () => {
+  assert.deepEqual(uncachedHeaders({ method: 'GET', url: 'https://s3/k', headers: { range: 'bytes=0-1' } }), { range: 'bytes=0-1', 'cache-control': 'no-store, no-cache' });
   assert.deepEqual(uncachedHeaders({ method: 'DELETE', url: 'https://s3/k', headers: { a: '1' } }), { a: '1' });
   assert.deepEqual(uncachedHeaders({ method: 'PUT', url: 'https://s3/k', headers: {} }), {});
 });
