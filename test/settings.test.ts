@@ -78,6 +78,7 @@ test('settings: storage address and sync config', () => {
   ]);
   assert.equal(c.deviceName, 'laptop');
   assert.equal(c.retentionDays, 1);
+  assert.equal(c.configDir, '.config');
 });
 
 test('settings: automatic cleanup is due after its interval', () => {

@@ -6,6 +6,8 @@ export interface SyncConfig {
   exclude: string[];
   /** Files larger than this are left alone. 0 means no limit. */
   maxFileSizeMB: number;
+  /** The app's settings folder. Its files are merged when two devices change them, never copied. */
+  configDir: string;
   /** `merge`: three-way text merge, conflict copy when edits overlap. `copy`: always keep both. */
   conflictStrategy: 'merge' | 'copy';
   mergeExtensions: string[];
@@ -33,6 +35,7 @@ export interface SyncConfig {
 export const DEFAULT_CONFIG: SyncConfig = {
   deviceName: 'device',
   exclude: ['.self-sync/**', '.obsidian/workspace*.json', '.trash/**', '.git/**', '.DS_Store'],
+  configDir: '.obsidian',
   maxFileSizeMB: 500,
   conflictStrategy: 'merge',
   mergeExtensions: ['md', 'markdown', 'txt'],

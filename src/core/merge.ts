@@ -112,3 +112,65 @@ export function merge3(base: string, ours: string, theirs: string): string | nul
   }
   return out.join('');
 }
+
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+const isList = (v: unknown): v is (string | number | boolean | null)[] => Array.isArray(v) && v.every((x) => x === null || typeof x !== 'object');
+/** Own keys only, so a key named `__proto__` or `constructor` reads as plain data. */
+const get = (o: Record<string, unknown>, k: string) => (Object.hasOwn(o, k) ? o[k] : undefined);
+
+function equal(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => equal(x, b[i]));
+  if (!isObject(a) || !isObject(b)) return false;
+  const keys = Object.keys(a);
+  return keys.length === Object.keys(b).length && keys.every((k) => Object.hasOwn(b, k) && equal(a[k], b[k]));
+}
+
+/** `undefined` is an absent key. A value both sides changed differently goes to `theirs`. */
+function mergeValue(base: unknown, ours: unknown, theirs: unknown): unknown {
+  if (equal(ours, theirs) || equal(base, ours)) return theirs;
+  if (equal(base, theirs)) return ours;
+  if (isObject(ours) && isObject(theirs)) {
+    const b = isObject(base) ? base : {};
+    const out: Record<string, unknown> = Object.create(null);
+    for (const k of new Set([...Object.keys(theirs), ...Object.keys(ours)])) {
+      const v = mergeValue(get(b, k), get(ours, k), get(theirs, k));
+      if (v !== undefined) out[k] = v;
+    }
+    return out;
+  }
+  // Lists of plain values (enabled plugins, snippets) are sets: keep both sides' additions and removals.
+  if (isList(ours) && isList(theirs) && (base === undefined || isList(base))) {
+    const b = base ?? [];
+    const out = theirs.filter((x) => ours.includes(x) || !b.includes(x));
+    for (const x of ours) if (!out.includes(x) && !b.includes(x)) out.push(x);
+    return out;
+  }
+  return theirs;
+}
+
+/**
+ * Three-way merge of a JSON settings file, key by key. `base` is the last version both sides had, if known.
+ * Returns null when either side is not valid JSON.
+ */
+export function mergeJson(base: string | undefined, ours: string, theirs: string): string | null {
+  let o: unknown;
+  let t: unknown;
+  try {
+    o = JSON.parse(ours);
+    t = JSON.parse(theirs);
+  } catch {
+    return null;
+  }
+  let b: unknown;
+  try {
+    b = base === undefined ? undefined : JSON.parse(base);
+  } catch {
+    b = undefined;
+  }
+  const merged = mergeValue(b, o, t);
+  if (equal(merged, t)) return theirs;
+  if (equal(merged, o)) return ours;
+  // Obsidian writes its settings with two-space indentation.
+  return JSON.stringify(merged, null, 2);
+}

@@ -198,7 +198,12 @@ export class SettingsTab extends PluginSettingTab {
     number(when, 'Look for other devices\' changes every (seconds)', 'One tiny request, only while Obsidian is on screen. 0 turns it off.', 'pollSeconds', 0);
 
     const what = section('what', 'What to sync', `files up to ${s.maxFileSizeMB || 'any'} MB`);
-    toggle(what, 'Settings, themes and plugins', `The ${this.app.vault.configDir} folder, except the workspace layout.`, 'syncConfigDir');
+    toggle(
+      what,
+      'Settings, themes and plugins',
+      `The ${this.app.vault.configDir} folder, except the workspace layout. Settings changed on two devices are combined; where both changed the same one, the device that synced first wins.`,
+      'syncConfigDir',
+    );
     number(what, 'Largest file (MB)', 'Larger files stay on this device and are listed as problems. 0 means no limit.', 'maxFileSizeMB', 0);
     new Setting(what)
       .setName('Leave out')

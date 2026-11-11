@@ -123,6 +123,50 @@ test('binary files and the copy strategy never merge', async () => {
   assert.equal(Object.keys(a.snapshot()).length, 4);
 });
 
+for (const conflictStrategy of ['merge', 'copy'] as const) {
+  test(`settings changed on two devices are combined, never copied (${conflictStrategy})`, async () => {
+    const { devices: [a, b] } = setup(['A', 'B'], { conflictStrategy });
+    const j = (v: unknown) => JSON.stringify(v, null, 2);
+    const json = (d: typeof a, p: string) => JSON.parse(d.fs.text(p) ?? "null");
+    // Joining: both devices already have settings of their own.
+    a.fs.put('.obsidian/app.json', j({ spellcheck: true, theme: 'dark' }));
+    a.fs.put('.obsidian/community-plugins.json', j(['calendar']));
+    a.fs.put('.obsidian/snippets/x.css', 'a {}\n');
+    a.fs.put('.obsidian/plugins/p/main.js', 'console.log("A")');
+    b.fs.put('.obsidian/app.json', j({ theme: 'light', vimMode: true }));
+    b.fs.put('.obsidian/community-plugins.json', j(['dataview']));
+    b.fs.put('.obsidian/snippets/x.css', 'b {}\n');
+    b.fs.put('.obsidian/plugins/p/main.js', 'console.log("B")');
+    await a.sync();
+    let r = await b.sync();
+    assert.deepEqual(r.conflictCopies, []);
+    assert.deepEqual(json(b, '.obsidian/app.json'), { spellcheck: true, theme: 'dark', vimMode: true });
+    assert.deepEqual(json(b, '.obsidian/community-plugins.json'), ['calendar', 'dataview']);
+    assert.equal(b.fs.text('.obsidian/snippets/x.css'), 'a {}\n');
+    assert.equal(b.fs.text('.obsidian/plugins/p/main.js'), 'console.log("A")');
+    await a.sync();
+    assert.deepEqual(b.snapshot(), a.snapshot());
+
+    // Later: each device changes something, and both change the theme.
+    a.fs.put('.obsidian/app.json', j({ spellcheck: false, theme: 'moonstone', vimMode: true }));
+    a.fs.put('.obsidian/community-plugins.json', j(['calendar', 'dataview', 'tasks']));
+    a.fs.put('.obsidian/snippets/x.css', 'a {}\n\nfrom A {}\n');
+    b.fs.put('.obsidian/app.json', j({ spellcheck: true, theme: 'obsidian', vimMode: false, foldHeading: true }));
+    b.fs.put('.obsidian/community-plugins.json', j(['dataview']));
+    b.fs.put('.obsidian/snippets/x.css', 'from B {}\n\na {}\n');
+    await a.sync();
+    r = await b.sync();
+    assert.deepEqual(r.conflictCopies, []);
+    assert.equal(r.merged, 3);
+    await a.sync();
+    assert.deepEqual(b.snapshot(), a.snapshot());
+    assert.deepEqual(json(a, '.obsidian/app.json'), { spellcheck: false, theme: 'moonstone', vimMode: false, foldHeading: true });
+    assert.deepEqual(json(a, '.obsidian/community-plugins.json'), ['dataview', 'tasks']);
+    assert.equal(a.fs.text('.obsidian/snippets/x.css'), 'from B {}\n\na {}\n\nfrom A {}\n');
+    assert.ok(![...a.fs.files.keys()].some((p) => p.includes('conflict')));
+  });
+}
+
 test('an edit beats a delete, in both directions', async () => {
   const { devices: [a, b] } = setup();
   a.fs.put('x.md', 'x\n');

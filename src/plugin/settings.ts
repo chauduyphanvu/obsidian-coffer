@@ -112,6 +112,7 @@ export const statePath = (pluginDir: string) => `${pluginDir}/state.json`;
 export function syncConfig(s: Settings, configDir: string, pluginDir: string): SyncConfig {
   return resolveConfig({
     deviceName: s.deviceName,
+    configDir,
     exclude: [
       ...DEFAULT_CONFIG.exclude.map((p) => p.replace(/^\.obsidian\//, `${configDir}/`)),
       // Device-specific. The plugin's code itself does sync, so an update reaches every device.

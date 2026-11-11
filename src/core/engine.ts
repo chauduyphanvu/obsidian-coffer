@@ -1,7 +1,7 @@
 import { pool } from './bytes.ts';
 import { worthCompressing } from './compress.ts';
 import { compileExcludes, type SyncConfig } from './config.ts';
-import { merge3 } from './merge.ts';
+import { merge3, mergeJson } from './merge.ts';
 import { Packer } from './packer.ts';
 import { conflictCopyName, ext, vaultKey } from './paths.ts';
 import { nothingToDo, planChanges, type Local, type Plan } from './plan.ts';
@@ -398,20 +398,29 @@ export class SyncEngine {
       return;
     }
 
-    if (this.cfg.conflictStrategy === 'merge' && base && this.cfg.mergeExtensions.includes(ext(key))) {
-      const merged = await this.tryMerge(base, mine, r);
-      if (merged) {
-        // Fetching the other versions took a moment; do not write over an edit made meanwhile.
-        if (!unchanged(await fs.stat(l.path), l)) {
-          res.skipped++;
-          return;
-        }
-        const stat = await fs.write(l.path, merged);
-        // Recorded as "agrees with remote, then edited", so the merge result is pushed like any local edit.
-        st.synced.set(key, { entry: r, lsize: -1, lmtime: -1 });
-        res.merged++;
-        return { key, path: l.path, ...stat };
+    // A copy in the settings folder would never be read or shown, so settings are always combined.
+    const settings = key.startsWith(`${this.cfg.configDir}/`);
+    const merged = settings
+      ? await this.mergeSettings(key, base, mine, r)
+      : this.cfg.conflictStrategy === 'merge' && base && this.cfg.mergeExtensions.includes(ext(key))
+        ? await this.tryMerge(base, mine, r)
+        : null;
+    if (merged) {
+      // Fetching the other versions took a moment; do not write over an edit made meanwhile.
+      if (!unchanged(await fs.stat(l.path), l)) {
+        res.skipped++;
+        return;
       }
+      const stat = await fs.write(l.path, merged);
+      // Recorded as "agrees with remote, then edited", so the merge result is pushed like any local edit.
+      st.synced.set(key, { entry: r, lsize: -1, lmtime: -1 });
+      res.merged++;
+      return { key, path: l.path, ...stat };
+    }
+    if (settings) {
+      // Not mergeable (plugin code, a theme, unreadable JSON): the version synced first stays, like any setting both changed.
+      await this.writeRemote(pass, key, r, await this.readVersion(r));
+      return;
     }
 
     // Keep both: this device's version moves aside, the remote version takes the original name.
@@ -422,6 +431,21 @@ export class SyncEngine {
     await this.writeRemote(pass, key, r, await this.readVersion(r));
     res.conflictCopies.push(copy);
     return { key: copy, path: copy, ...copyStat };
+  }
+
+  /** JSON settings merge key by key, even with no common version (two devices set up apart); other text line by line. */
+  private async mergeSettings(key: string, base: Entry | undefined, mine: Uint8Array, remote: Entry): Promise<Uint8Array | null> {
+    if (ext(key) !== 'json') return base ? this.tryMerge(base, mine, remote) : null;
+    try {
+      const text = (data: Uint8Array) => new TextDecoder('utf-8', { fatal: true }).decode(data);
+      const theirs = text(await this.readVersion(remote));
+      // A common version past the retention window only loses the three-way view, not the merge.
+      const ancestor = base ? await this.readVersion(base).then(text, () => undefined) : undefined;
+      const merged = mergeJson(ancestor, text(mine), theirs);
+      return merged === null ? null : new TextEncoder().encode(merged);
+    } catch {
+      return null;
+    }
   }
 
   private async tryMerge(base: Entry, mine: Uint8Array, remote: Entry): Promise<Uint8Array | null> {

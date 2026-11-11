@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { cutPoints } from '../src/core/chunker.ts';
 import { compileExcludes } from '../src/core/config.ts';
 import { chunkId, createKeys, open, seal, unlockKeys, WrongPassphraseError } from '../src/core/crypto.ts';
-import { merge3 } from '../src/core/merge.ts';
+import { merge3, mergeJson } from '../src/core/merge.ts';
 import { conflictCopyName, conflictOriginal, ext, vaultKey } from '../src/core/paths.ts';
 import { checkStore } from '../src/stores/doctor.ts';
 import { uncachedHeaders } from '../src/stores/http.ts';
@@ -78,6 +78,32 @@ test('merge3: independent edits combine, overlapping edits conflict', () => {
   assert.equal(merge3('', 'x\n', 'y\n'), null);
   assert.equal(merge3('a\n', '', 'a\nb\n'), null);
   assert.equal(merge3('one\ntwo', 'one\ntwo\nthree', 'zero\none\ntwo'), 'zero\none\ntwo\nthree');
+});
+
+test('mergeJson: settings changed on two devices combine key by key; where both changed one, theirs wins', () => {
+  const j = (v: unknown) => JSON.stringify(v, null, 2);
+  const base = j({ theme: 'dark', spellcheck: true, hotkeys: { a: 1, b: 2 }, plugins: ['x', 'y'], gone: 1 });
+  const ours = j({ theme: 'light', spellcheck: false, hotkeys: { a: 1, b: 3 }, plugins: ['x', 'y', 'mine'] });
+  const theirs = j({ theme: 'moonstone', spellcheck: true, hotkeys: { a: 9, b: 2 }, plugins: ['y', 'theirs'], gone: 1, added: true });
+  assert.deepEqual(JSON.parse(mergeJson(base, ours, theirs)!), {
+    theme: 'moonstone', spellcheck: false, hotkeys: { a: 9, b: 3 }, plugins: ['y', 'theirs', 'mine'], added: true,
+  });
+  // No common version (two devices that set up their settings separately): every key from both, theirs where they differ.
+  assert.deepEqual(JSON.parse(mergeJson(undefined, j({ a: 1, list: ['p'], same: 0 }), j({ a: 2, b: 3, list: ['q'], same: 0 }))!), { a: 2, b: 3, list: ['q', 'p'], same: 0 });
+  // When the result equals one side, that side's bytes are kept as they are.
+  assert.equal(mergeJson(base, base, '{"theme":"dark"}'), '{"theme":"dark"}');
+  assert.equal(mergeJson(undefined, '{"x": 1}', '{ "x" : 1 }'), '{ "x" : 1 }');
+  // Lists of objects are one value; a value type change is one value.
+  assert.deepEqual(JSON.parse(mergeJson(j({ l: [{ k: 1 }] }), j({ l: [{ k: 2 }] }), j({ l: [{ k: 3 }] }))!), { l: [{ k: 3 }] });
+  assert.deepEqual(JSON.parse(mergeJson(j({ v: 1 }), j({ v: { n: 1 } }), j({ v: 2 }))!), { v: 2 });
+  // Unreadable JSON on either side is not merged; a damaged common version only loses the three-way view.
+  assert.equal(mergeJson(base, '{', theirs), null);
+  assert.equal(mergeJson(base, ours, 'not json'), null);
+  assert.deepEqual(JSON.parse(mergeJson('{', j({ a: 1 }), j({ b: 2 }))!), { b: 2, a: 1 });
+  // A key named like an object internal stays plain data.
+  const proto = JSON.parse(mergeJson('{}', '{"__proto__": {"polluted": true}}', '{"x": 1}')!);
+  assert.deepEqual(Object.keys(proto).sort(), ['__proto__', 'x']);
+  assert.equal(({} as Record<string, unknown>).polluted, undefined);
 });
 
 test('merge3: fuzz against an independent oracle', () => {
