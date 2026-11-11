@@ -1,20 +1,7 @@
 import type { ObjectInfo, RemoteStore } from '../core/types.ts';
+import { fetchHttp, rangeHeader, unescapeXml, type Http, type HttpResponse } from './http.ts';
+import { permanentError } from './retry.ts';
 import { sha256Hex, sign, uriEncode } from './sigv4.ts';
-
-export interface HttpRequest {
-  method: string;
-  url: string;
-  headers: Record<string, string>;
-  body?: Uint8Array;
-}
-
-export interface HttpResponse {
-  status: number;
-  body: Uint8Array;
-}
-
-/** Injected so the same store runs on `fetch` (Node, desktop) and on Obsidian's `requestUrl` (mobile, no CORS). */
-export type Http = (req: HttpRequest) => Promise<HttpResponse>;
 
 export interface S3Config {
   /** e.g. https://<account>.r2.cloudflarestorage.com or https://s3.us-east-1.amazonaws.com */
@@ -29,13 +16,7 @@ export interface S3Config {
   pathStyle: boolean;
 }
 
-export const fetchHttp: Http = async (req) => {
-  const r = await fetch(req.url, { method: req.method, headers: req.headers, body: req.body as unknown as BodyInit });
-  return { status: r.status, body: new Uint8Array(await r.arrayBuffer()) };
-};
-
 const EMPTY_HASH = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
-const unescapeXml = (s: string) => s.replace(/&(amp|lt|gt|quot|apos);/g, (_, e) => ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" })[e as string]!);
 
 export class S3Store implements RemoteStore {
   private cfg: S3Config;
@@ -81,14 +62,12 @@ export class S3Store implements RemoteStore {
   private fail(res: HttpResponse, what: string): never {
     const text = new TextDecoder().decode(res.body.subarray(0, 600));
     const code = /<Code>([^<]+)<\/Code>/.exec(text)?.[1];
-    const err = new Error(`S3 ${what} failed with HTTP ${res.status}${code ? ` (${code})` : ''}`) as Error & { permanent: boolean };
-    err.permanent = true;
-    throw err;
+    throw permanentError(`S3 ${what} failed with HTTP ${res.status}${code ? ` (${code})` : ''}`);
   }
 
   async get(key: string, range?: { start: number; end: number }): Promise<Uint8Array | null> {
     if (range && range.end <= range.start) return new Uint8Array(0);
-    const headers: Record<string, string> = range ? { range: `bytes=${range.start}-${range.end - 1}` } : {};
+    const headers = range ? rangeHeader(range) : {};
     const res = await this.request('GET', key, {}, headers);
     if (res.status === 404) return null;
     if (res.status !== 200 && res.status !== 206) this.fail(res, `GET ${key}`);

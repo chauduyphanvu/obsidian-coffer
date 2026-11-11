@@ -10,7 +10,8 @@ import { SyncEngine } from '../src/core/engine.ts';
 import { FileState, NodeFS } from '../src/node/nodefs.ts';
 import { checkStore } from '../src/stores/doctor.ts';
 import { withRetry } from '../src/stores/retry.ts';
-import { S3Store, fetchHttp } from '../src/stores/s3.ts';
+import { fetchHttp } from '../src/stores/http.ts';
+import { S3Store } from '../src/stores/s3.ts';
 import { sha256Hex, sign } from '../src/stores/sigv4.ts';
 import { WebDavStore } from '../src/stores/webdav.ts';
 

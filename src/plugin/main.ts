@@ -3,9 +3,7 @@ import { DEFAULT_CONFIG, resolveConfig } from '../core/config.ts';
 import { openWithPassphrase, sealWithPassphrase } from '../core/crypto.ts';
 import { SafetyError, SyncEngine, type SyncResult, type Version } from '../core/engine.ts';
 import { checkStore } from '../stores/doctor.ts';
-import { withRetry } from '../stores/retry.ts';
-import { S3Store } from '../stores/s3.ts';
-import { WebDavStore } from '../stores/webdav.ts';
+import { openRemote } from '../stores/open.ts';
 import { ObsidianFS, PluginState, obsidianHttp } from './obsidianfs.ts';
 
 interface Settings {
@@ -196,21 +194,20 @@ export default class SelfSyncPlugin extends Plugin {
   private store() {
     const s = this.settings;
     if (s.storageType === 'webdav') {
-      return withRetry(new WebDavStore({ url: s.webdavUrl.trim(), username: s.webdavUser, password: this.secret(s.webdavPasswordSecret) }, obsidianHttp));
+      return openRemote({ type: 'webdav', url: s.webdavUrl.trim(), username: s.webdavUser, password: this.secret(s.webdavPasswordSecret) }, obsidianHttp);
     }
-    return withRetry(
-      new S3Store(
-        {
-          endpoint: s.endpoint.trim(),
-          region: s.region.trim() || 'auto',
-          bucket: s.bucket.trim(),
-          prefix: s.prefix,
-          pathStyle: s.pathStyle,
-          accessKey: this.secret(s.accessKeySecret),
-          secretKey: this.secret(s.secretKeySecret),
-        },
-        obsidianHttp,
-      ),
+    return openRemote(
+      {
+        type: 's3',
+        endpoint: s.endpoint.trim(),
+        region: s.region.trim() || 'auto',
+        bucket: s.bucket.trim(),
+        prefix: s.prefix,
+        pathStyle: s.pathStyle,
+        accessKey: this.secret(s.accessKeySecret),
+        secretKey: this.secret(s.secretKeySecret),
+      },
+      obsidianHttp,
     );
   }
 

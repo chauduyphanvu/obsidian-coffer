@@ -1,5 +1,6 @@
 import type { ObjectInfo, RemoteStore } from '../core/types.ts';
-import { fetchHttp, type Http, type HttpResponse } from './s3.ts';
+import { fetchHttp, rangeHeader, unescapeXml, type Http, type HttpResponse } from './http.ts';
+import { permanentError } from './retry.ts';
 
 export interface WebDavConfig {
   /** Folder URL that will hold the vault data, e.g. https://cloud.example.com/remote.php/dav/files/me/obsidian */
@@ -7,8 +8,6 @@ export interface WebDavConfig {
   username: string;
   password: string;
 }
-
-const xmlText = (s: string) => s.replace(/&(amp|lt|gt|quot|apos);/g, (_, e) => ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" })[e as string]!);
 
 /**
  * WebDAV (Nextcloud, a NAS, many hosting providers). The server must honour `If-None-Match: *`
@@ -38,9 +37,7 @@ export class WebDavStore implements RemoteStore {
 
   private fail(res: HttpResponse, what: string): never {
     const denied = res.status === 401 || res.status === 403;
-    const err = new Error(denied ? `WebDAV refused the login or the folder (HTTP ${res.status})` : `WebDAV ${what} failed with HTTP ${res.status}`) as Error & { permanent: boolean };
-    err.permanent = true;
-    throw err;
+    throw permanentError(denied ? `WebDAV refused the login or the folder (HTTP ${res.status})` : `WebDAV ${what} failed with HTTP ${res.status}`);
   }
 
   private async mkcol(url: string): Promise<void> {
@@ -73,7 +70,7 @@ export class WebDavStore implements RemoteStore {
 
   async get(key: string, range?: { start: number; end: number }): Promise<Uint8Array | null> {
     if (range && range.end <= range.start) return new Uint8Array(0);
-    const res = await this.request('GET', this.url(key), range ? { range: `bytes=${range.start}-${range.end - 1}` } : {});
+    const res = await this.request('GET', this.url(key), range ? rangeHeader(range) : {});
     if (res.status === 404) return null;
     if (res.status === 206 || (res.status === 200 && !range)) return res.body;
     // Past the end of the object, or a server without range support that sent everything.
@@ -114,7 +111,7 @@ export class WebDavStore implements RemoteStore {
     for (const m of xml.matchAll(/<(?:\w+:)?response[\s>][\s\S]*?<\/(?:\w+:)?response>/g)) {
       const field = (name: string) => new RegExp(`<(?:\\w+:)?${name}[^>]*>([^<]*)</(?:\\w+:)?${name}>`).exec(m[0])?.[1] ?? '';
       if (/<(?:\w+:)?collection[\s/>]/.test(m[0])) continue;
-      const href = decodeURIComponent(xmlText(field('href')));
+      const href = decodeURIComponent(unescapeXml(field('href')));
       const key = `${dir}/${href.slice(href.lastIndexOf('/') + 1)}`;
       if (key > startAfter) out.push({ key, size: Number(field('getcontentlength')), modified: Date.parse(field('getlastmodified')) || 0 });
     }

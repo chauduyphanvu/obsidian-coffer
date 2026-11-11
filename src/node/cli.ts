@@ -5,9 +5,8 @@ import { resolveConfig, type SyncConfig } from '../core/config.ts';
 import { SyncEngine } from '../core/engine.ts';
 import type { RemoteStore } from '../core/types.ts';
 import { checkStore } from '../stores/doctor.ts';
-import { withRetry } from '../stores/retry.ts';
-import { S3Store, type S3Config } from '../stores/s3.ts';
-import { WebDavStore } from '../stores/webdav.ts';
+import { openRemote } from '../stores/open.ts';
+import type { S3Config } from '../stores/s3.ts';
 import { FileState, FolderStore, NodeFS } from './nodefs.ts';
 
 interface CliConfig {
@@ -39,8 +38,8 @@ const env = (name: string) => {
 
 function makeStore(remote: CliConfig['remote']): RemoteStore {
   if (remote.type === 'folder') return new FolderStore(resolve(remote.path));
-  if (remote.type === 'webdav') return withRetry(new WebDavStore({ url: remote.url, username: remote.username, password: env('SELFSYNC_WEBDAV_PASSWORD') }));
-  return withRetry(new S3Store({ ...remote, pathStyle: remote.pathStyle ?? true, prefix: remote.prefix ?? '', accessKey: env('SELFSYNC_ACCESS_KEY'), secretKey: env('SELFSYNC_SECRET_KEY') }));
+  if (remote.type === 'webdav') return openRemote({ type: 'webdav', url: remote.url, username: remote.username, password: env('SELFSYNC_WEBDAV_PASSWORD') });
+  return openRemote({ ...remote, pathStyle: remote.pathStyle ?? true, prefix: remote.prefix ?? '', accessKey: env('SELFSYNC_ACCESS_KEY'), secretKey: env('SELFSYNC_SECRET_KEY') });
 }
 
 async function main(): Promise<number> {

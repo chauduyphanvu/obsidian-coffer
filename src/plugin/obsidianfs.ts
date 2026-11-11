@@ -1,6 +1,6 @@
 import { requestUrl, type App } from 'obsidian';
 import type { FileStat, LocalFS, LocalFile, StateStore } from '../core/types.ts';
-import type { Http } from '../stores/s3.ts';
+import type { Http } from '../stores/http.ts';
 
 const CONFIG_RESCAN_MS = 5 * 60_000;
 

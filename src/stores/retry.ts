@@ -1,5 +1,12 @@
 import type { RemoteStore } from '../core/types.ts';
 
+/** A failure that trying again cannot fix, such as refused credentials: `withRetry` gives up at once. */
+export function permanentError(message: string): Error {
+  const err = new Error(message) as Error & { permanent: boolean };
+  err.permanent = true;
+  return err;
+}
+
 /** Retries failed requests with exponential backoff and jitter. */
 export function withRetry(store: RemoteStore, attempts = 5, baseMs = 300): RemoteStore {
   const run = async <T>(fn: () => Promise<T>): Promise<T> => {
