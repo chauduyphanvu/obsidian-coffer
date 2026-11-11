@@ -291,6 +291,8 @@ export default class SelfSyncPlugin extends Plugin {
     this.changedWhileRunning = false;
     this.dirty = false;
     this.updateStatus();
+    // Settings changes fire no vault event; asked to sync, look at them now rather than at a listing up to 5 minutes old.
+    if (manual) this.fs?.forgetConfigListing();
     try {
       const r = await this.getEngine().sync({ force });
       if (r.pulled || r.deletedLocal) this.fs?.forgetConfigListing();
