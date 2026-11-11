@@ -6,6 +6,7 @@ import { chunkId, createKeys, open, seal, unlockKeys, WrongPassphraseError } fro
 import { merge3 } from '../src/core/merge.ts';
 import { conflictCopyName, ext, vaultKey } from '../src/core/paths.ts';
 import { checkStore } from '../src/stores/doctor.ts';
+import { uncachedHeaders } from '../src/stores/http.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
 import { sign } from '../src/stores/sigv4.ts';
 import { rng } from '../src/testing/netsim.ts';
@@ -171,4 +172,10 @@ test('path rules: extensions, conflict copy names, Unicode forms', () => {
   assert.equal(conflictCopyName('notes/a.md', 'B', at, 2), 'notes/a (conflict B 20260102-150405 2).md');
   assert.equal(conflictCopyName('dir.v2/README', 'B', at), 'dir.v2/README (conflict B 20260102-150405)');
   assert.equal(vaultKey('Cafe\u0301.md'), 'Caf\u00e9.md');
+});
+
+test('reads ask the HTTP client not to cache, so a later delete is not made conditional', () => {
+  assert.deepEqual(uncachedHeaders({ method: 'GET', url: 'https://s3/k', headers: { range: 'bytes=0-1' } }), { range: 'bytes=0-1', 'cache-control': 'no-store' });
+  assert.deepEqual(uncachedHeaders({ method: 'DELETE', url: 'https://s3/k', headers: { a: '1' } }), { a: '1' });
+  assert.deepEqual(uncachedHeaders({ method: 'PUT', url: 'https://s3/k', headers: {} }), {});
 });

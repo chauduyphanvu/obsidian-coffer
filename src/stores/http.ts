@@ -18,6 +18,13 @@ export const fetchHttp: Http = async (req) => {
   return { status: r.status, body: new Uint8Array(await r.arrayBuffer()) };
 };
 
+/**
+ * iOS keeps GET responses in its URL cache and then adds `If-Modified-Since` to a later DELETE of the same URL,
+ * which S3 rejects with 501. Reads that are never stored leave nothing to make a delete conditional on.
+ */
+export const uncachedHeaders = (req: HttpRequest): Record<string, string> =>
+  req.method === 'GET' ? { ...req.headers, 'cache-control': 'no-store' } : req.headers;
+
 export const unescapeXml = (s: string) => s.replace(/&(amp|lt|gt|quot|apos);/g, (_, e) => ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" })[e as string]!);
 
 /** Store ranges end before `end`; an HTTP range names its last byte. */

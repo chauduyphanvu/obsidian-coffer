@@ -1,6 +1,6 @@
 import { requestUrl, type App } from 'obsidian';
 import type { FileStat, LocalFS, LocalFile, StateStore } from '../core/types.ts';
-import type { Http } from '../stores/http.ts';
+import { uncachedHeaders, type Http } from '../stores/http.ts';
 
 const CONFIG_RESCAN_MS = 5 * 60_000;
 
@@ -12,7 +12,7 @@ export const obsidianHttp: Http = async (req) => {
   const r = await requestUrl({
     url: req.url,
     method: req.method,
-    headers: req.headers,
+    headers: uncachedHeaders(req),
     body: req.body && toBuffer(req.body),
     contentType: 'application/octet-stream',
     throw: false,
