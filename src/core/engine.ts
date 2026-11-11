@@ -4,23 +4,11 @@ import { compileExcludes, type SyncConfig } from './config.ts';
 import { merge3 } from './merge.ts';
 import { Packer } from './packer.ts';
 import { conflictCopyName, ext, vaultKey } from './paths.ts';
+import { nothingToDo, planChanges, type Local, type Plan } from './plan.ts';
 import { Repo } from './repo.ts';
 import { collectGarbage, listVersions } from './retention.ts';
 import { LocalState } from './state.ts';
-import {
-  hasChunks,
-  sameContent,
-  type Change,
-  type ChunkRef,
-  type Commit,
-  type Entry,
-  type FileStat,
-  type LocalFS,
-  type LocalFile,
-  type RemoteStore,
-  type StateStore,
-  type Version,
-} from './types.ts';
+import { hasChunks, type Change, type ChunkRef, type Commit, type Entry, type FileStat, type LocalFS, type RemoteStore, type StateStore, type Version } from './types.ts';
 
 export interface EngineOptions {
   fs: LocalFS;
@@ -60,10 +48,6 @@ export class SafetyError extends Error {
   }
 }
 
-interface Local extends LocalFile {
-  key: string;
-}
-
 interface Prepared {
   file: Local;
   entry: Entry;
@@ -76,6 +60,25 @@ const MOVE_CACHE = 64 << 20;
 const OPTIMISTIC_BYTES = 256 << 10;
 
 const contentKey = (e: Entry) => e.chunks.map((c) => c.id).join(',');
+
+/** The file still has the size and time the scan saw, or is still absent. */
+const unchanged = (cur: FileStat | null, l: Local | undefined) => (l ? !!cur && cur.size === l.size && cur.mtime === l.mtime : !cur);
+
+const recordError = (res: SyncResult, path: string, e: unknown) => {
+  res.errors.push({ path, message: e instanceof Error ? e.message : String(e) });
+};
+
+/** What one pass works with, shared by its steps. */
+interface Pass {
+  repo: Repo;
+  st: LocalState;
+  local: Map<string, Local>;
+  /** Local keys by lower-case name, so a pull cannot create a second file that differs only by case. */
+  byLower: Map<string, string>;
+  res: SyncResult;
+  /** Planned pulls, the total that download progress counts toward. */
+  pulls: number;
+}
 
 export class SyncEngine {
   private o: EngineOptions;
@@ -162,8 +165,12 @@ export class SyncEngine {
     return touched;
   }
 
+  private maxSize(): number {
+    return this.cfg.maxFileSizeMB * (1 << 20) || Infinity;
+  }
+
   private async scan(): Promise<Map<string, Local>> {
-    const maxSize = this.cfg.maxFileSizeMB * (1 << 20) || Infinity;
+    const maxSize = this.maxSize();
     const local = new Map<string, Local>();
     for (const f of await this.o.fs.list()) {
       const key = vaultKey(f.path);
@@ -194,77 +201,67 @@ export class SyncEngine {
   /** One pass of scan, plan, apply. Returns true when another pass is needed. */
   private async round(res: SyncResult, force: boolean, first: boolean): Promise<boolean> {
     const { repo, st } = await this.open();
-    const fs = this.o.fs;
-    const maxSize = this.cfg.maxFileSizeMB * (1 << 20) || Infinity;
+    const maxSize = this.maxSize();
     const local = await this.scan();
 
-    const pushes: Local[] = [];
-    const pushDeletes: string[] = [];
-    const pulls: string[] = [];
-    const pullDeletes: string[] = [];
-    const conflicts: string[] = [];
-
-    const plan = (key: string) => {
-      if (this.excluded(key)) return;
-      const l = local.get(key);
-      const s = st.synced.get(key);
-      const r = st.remote.get(key);
-      if (r && r.size > maxSize) return;
-      const base = s?.entry;
-      const localTouched = l ? !s || s.lsize !== l.size || s.lmtime !== l.mtime : !!s;
-      const remoteChanged = base ? !r || !sameContent(r, base) : !!r;
-      if (!remoteChanged) {
-        if (s && r) s.entry = r;
-        if (!localTouched) return;
-        if (l) pushes.push(l);
-        else pushDeletes.push(key);
-      } else if (!localTouched) {
-        if (r) pulls.push(key);
-        else pullDeletes.push(key);
-      } else if (!l && !r) st.synced.delete(key);
-      else if (!l) pulls.push(key); // deleted here, edited elsewhere: the edit wins
-      else if (!r) pushes.push(l); // edited here, deleted elsewhere: the edit wins
-      else conflicts.push(key);
-    };
-    const planAll = () => {
-      pushes.length = pushDeletes.length = pulls.length = pullDeletes.length = conflicts.length = 0;
-      for (const key of local.keys()) plan(key);
-      for (const key of st.synced.keys()) if (!local.has(key)) plan(key);
-      for (const key of st.remote.keys()) if (!local.has(key) && !st.synced.has(key)) plan(key);
-    };
-    planAll();
+    let p = planChanges(local, st, this.excluded, maxSize);
     // A small local edit is committed without first asking whether the remote moved: the commit
     // itself fails if it did, and the next pass sorts it out. Saves a round trip on the common case.
     const optimistic =
-      first && st.lastSeq > 0 && pushes.length + pushDeletes.length > 0 && !pulls.length && !pullDeletes.length && !conflicts.length &&
-      pushes.reduce((n, f) => n + f.size, 0) <= OPTIMISTIC_BYTES;
-    if (!optimistic && (await this.fetchRemote()).size) planAll();
+      first && st.lastSeq > 0 && p.pushes.length + p.pushDeletes.length > 0 && !p.pulls.length && !p.pullDeletes.length && !p.conflicts.length &&
+      p.pushes.reduce((n, f) => n + f.size, 0) <= OPTIMISTIC_BYTES;
+    if (!optimistic && (await this.fetchRemote()).size) p = planChanges(local, st, this.excluded, maxSize);
 
-    if (!pushes.length && !pushDeletes.length && !pulls.length && !pullDeletes.length && !conflicts.length) return false;
+    if (nothingToDo(p)) return false;
+    this.checkDeletes(p, st, force);
 
-    // Guards against a vault that looks empty for the wrong reason (unmounted folder, wrong path,
-    // files evicted by another tool). Moves delete and re-create, so net shrinkage is what counts.
+    const pass: Pass = { repo, st, local, byLower: new Map(), res, pulls: p.pulls.length };
+    for (const key of local.keys()) pass.byLower.set(key.toLowerCase(), key);
+    const moved = await this.deleteLocal(pass, p);
+    await this.pull(pass, p.pulls, moved);
+    if (res.pulled || res.deletedLocal) await this.save();
+
+    for (const key of p.conflicts) {
+      try {
+        const extra = await this.resolve(pass, key, local.get(key)!);
+        if (extra) p.pushes.push(extra);
+      } catch (e) {
+        recordError(res, key, e);
+      }
+    }
+
+    const commitsBefore = res.commits;
+    let again = false;
+    if (p.pushes.length || p.pushDeletes.length) again = await this.push(p.pushes, p.pushDeletes, res);
+    await this.save();
+    // An optimistic pass that ended up committing nothing has not looked at the remote at all yet.
+    return again || (optimistic && res.commits === commitsBefore);
+  }
+
+  /**
+   * Guards against a vault that looks empty for the wrong reason (unmounted folder, wrong path,
+   * files evicted by another tool). Moves delete and re-create, so net shrinkage is what counts.
+   */
+  private checkDeletes(p: Plan, st: LocalState, force: boolean): void {
     const limit = Math.max(this.cfg.maxDeleteCount, st.synced.size * this.cfg.maxDeleteFraction);
-    const localShrink = pullDeletes.length - pulls.length;
-    const remoteShrink = pushDeletes.length - pushes.length;
-    if (!force && (localShrink > limit || remoteShrink > limit)) throw new SafetyError(pullDeletes.length, pushDeletes.length);
+    const localShrink = p.pullDeletes.length - p.pulls.length;
+    const remoteShrink = p.pushDeletes.length - p.pushes.length;
+    if (!force && (localShrink > limit || remoteShrink > limit)) throw new SafetyError(p.pullDeletes.length, p.pushDeletes.length);
+  }
 
-    const fail = (path: string, e: unknown) => {
-      res.errors.push({ path, message: e instanceof Error ? e.message : String(e) });
-    };
-    const unchanged = (cur: FileStat | null, l: Local | undefined) =>
-      l ? !!cur && cur.size === l.size && cur.mtime === l.mtime : !cur;
-    const byLower = new Map<string, string>();
-    for (const key of local.keys()) byLower.set(key.toLowerCase(), key);
-
-    // A file moved on another device arrives as a delete plus a create with the same content.
-    // Keep the bytes of files about to be deleted that a pull wants, so a move downloads nothing.
+  /**
+   * Removes local files deleted elsewhere. A file moved on another device arrives as a delete plus
+   * a create with the same content, so the bytes a pull wants are kept: a move downloads nothing.
+   */
+  private async deleteLocal(pass: Pass, p: Plan): Promise<Map<string, Uint8Array>> {
+    const { st, local, byLower, res } = pass;
+    const fs = this.o.fs;
     const wanted = new Set<string>();
-    if (pullDeletes.length) for (const key of pulls) wanted.add(contentKey(st.remote.get(key)!));
+    if (p.pullDeletes.length) for (const key of p.pulls) wanted.add(contentKey(st.remote.get(key)!));
     const moved = new Map<string, Uint8Array>();
     let movedBytes = 0;
 
-    for (const key of pullDeletes) {
+    for (const key of p.pullDeletes) {
       const l = local.get(key)!;
       try {
         if (!unchanged(await fs.stat(l.path), l)) {
@@ -282,26 +279,35 @@ export class SyncEngine {
         byLower.delete(key.toLowerCase());
         res.deletedLocal++;
       } catch (e) {
-        fail(key, e);
+        recordError(res, key, e);
       }
     }
+    return moved;
+  }
 
-    const writeRemote = async (key: string, entry: Entry, data: Uint8Array) => {
-      const l = local.get(key);
-      const other = byLower.get(key.toLowerCase());
-      if (!l && other && other !== key) throw new Error(`Name differs only by case from "${other}"`);
-      const path = l?.path ?? key;
-      if (!unchanged(await fs.stat(path), l)) {
-        res.skipped++;
-        return;
-      }
-      const stat = await fs.write(path, data, entry.mtime);
-      st.synced.set(key, { entry, lsize: stat.size, lmtime: stat.mtime });
-      byLower.set(key.toLowerCase(), key);
-      res.pulled++;
-      this.o.onProgress?.({ phase: 'download', done: res.pulled, total: pulls.length });
-    };
+  /** Writes a remote version into the vault, unless the local file changed since the scan. */
+  private async writeRemote(pass: Pass, key: string, entry: Entry, data: Uint8Array): Promise<void> {
+    const { st, local, byLower, res } = pass;
+    const fs = this.o.fs;
+    const l = local.get(key);
+    const other = byLower.get(key.toLowerCase());
+    if (!l && other && other !== key) throw new Error(`Name differs only by case from "${other}"`);
+    const path = l?.path ?? key;
+    if (!unchanged(await fs.stat(path), l)) {
+      res.skipped++;
+      return;
+    }
+    const stat = await fs.write(path, data, entry.mtime);
+    st.synced.set(key, { entry, lsize: stat.size, lmtime: stat.mtime });
+    byLower.set(key.toLowerCase(), key);
+    res.pulled++;
+    this.o.onProgress?.({ phase: 'download', done: res.pulled, total: pass.pulls });
+  }
 
+  /** Downloads remote changes in batches. `moved` holds the bytes of files a move already has here. */
+  private async pull(pass: Pass, pulls: string[], moved: Map<string, Uint8Array>): Promise<void> {
+    const { repo, st, local, res } = pass;
+    const fs = this.o.fs;
     for (let i = 0; i < pulls.length; ) {
       const batch: string[] = [];
       for (let bytes = 0; i < pulls.length && (bytes < PULL_BATCH || !batch.length); i++) {
@@ -357,45 +363,22 @@ export class SyncEngine {
       });
       await pool(batch, this.cfg.concurrency, async (key) => {
         try {
-          await writeRemote(key, st.remote.get(key)!, files.get(key)!);
+          await this.writeRemote(pass, key, st.remote.get(key)!, files.get(key)!);
         } catch (err) {
-          fail(key, err);
+          recordError(res, key, err);
         }
       });
     }
-    if (res.pulled || res.deletedLocal) await this.save();
-
-    for (const key of conflicts) {
-      try {
-        const extra = await this.resolve(key, local.get(key)!, res, writeRemote);
-        if (extra) pushes.push(extra);
-      } catch (e) {
-        fail(key, e);
-      }
-    }
-
-    const commitsBefore = res.commits;
-    let again = false;
-    if (pushes.length || pushDeletes.length) again = await this.push(pushes, pushDeletes, res);
-    await this.save();
-    // An optimistic pass that ended up committing nothing has not looked at the remote at all yet.
-    return again || (optimistic && res.commits === commitsBefore);
   }
 
   /** Both sides changed the same file. Returns a local file that now needs pushing, if any. */
-  private async resolve(
-    key: string,
-    l: Local,
-    res: SyncResult,
-    writeRemote: (key: string, entry: Entry, data: Uint8Array) => Promise<void>,
-  ): Promise<Local | undefined> {
-    const { repo, st } = await this.open();
+  private async resolve(pass: Pass, key: string, l: Local): Promise<Local | undefined> {
+    const { repo, st, res } = pass;
     const fs = this.o.fs;
     const r = st.remote.get(key)!;
     const base = st.synced.get(key)?.entry;
     const mine = await fs.read(l.path);
-    const cur = await fs.stat(l.path);
-    if (!cur || cur.size !== l.size || cur.mtime !== l.mtime) {
+    if (!unchanged(await fs.stat(l.path), l)) {
       res.skipped++;
       return;
     }
@@ -409,8 +392,7 @@ export class SyncEngine {
       const merged = await this.tryMerge(base, mine, r);
       if (merged) {
         // Fetching the other versions took a moment; do not write over an edit made meanwhile.
-        const now = await fs.stat(l.path);
-        if (!now || now.size !== l.size || now.mtime !== l.mtime) {
+        if (!unchanged(await fs.stat(l.path), l)) {
           res.skipped++;
           return;
         }
@@ -427,7 +409,7 @@ export class SyncEngine {
     let copy = conflictCopyName(key, this.cfg.deviceName, at);
     for (let n = 2; await fs.stat(copy); n++) copy = conflictCopyName(key, this.cfg.deviceName, at, n);
     const copyStat = await fs.write(copy, mine, l.mtime);
-    await writeRemote(key, r, await this.readVersion(r));
+    await this.writeRemote(pass, key, r, await this.readVersion(r));
     res.conflictCopies.push(copy);
     return { key: copy, path: copy, ...copyStat };
   }
@@ -490,8 +472,7 @@ export class SyncEngine {
 
     const prepare = async (f: Local): Promise<Prepared | undefined> => {
       const data = await this.o.fs.read(f.path);
-      const cur = await this.o.fs.stat(f.path);
-      if (!cur || cur.size !== f.size || cur.mtime !== f.mtime || data.length !== f.size) {
+      if (!unchanged(await this.o.fs.stat(f.path), f) || data.length !== f.size) {
         res.skipped++; // being written right now; the next sync picks it up
         return;
       }
@@ -534,7 +515,7 @@ export class SyncEngine {
           if (p) prepared.push(p);
           this.o.onProgress?.({ phase: 'upload', done: ++done, total: files.length });
         } catch (e) {
-          res.errors.push({ path: f.key, message: e instanceof Error ? e.message : String(e) });
+          recordError(res, f.key, e);
         }
       });
       await packer.flush();
