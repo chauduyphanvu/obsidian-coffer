@@ -1,7 +1,8 @@
 import { randomBytes, toB64, toHex, utf8 } from './bytes.ts';
 import { deflate, inflate } from './compress.ts';
 import { createKeys, open, rewrapKeys, seal, unlockKeys, type KeyHeader, type Keys } from './crypto.ts';
-import type { ChunkParams, ChunkRef, Commit, Entry, ObjectInfo, RemoteStore } from './types.ts';
+import type { ChunkParams, Commit, Entry, ObjectInfo, RemoteStore } from './types.ts';
+import { PackTable, decEntry, encEntry, type WireEntry } from './wire.ts';
 
 const FORMAT = 1;
 const HEADER_KEY = 'vault.json';
@@ -12,38 +13,6 @@ interface Header {
   kdf: KeyHeader;
   chunk: ChunkParams;
 }
-
-type WireEntry = (string | number)[];
-
-class PackTable {
-  list: string[] = [];
-  private index = new Map<string, number>();
-  idx(pack: string): number {
-    let i = this.index.get(pack);
-    if (i === undefined) {
-      i = this.list.length;
-      this.list.push(pack);
-      this.index.set(pack, i);
-    }
-    return i;
-  }
-}
-
-function encEntry(e: Entry, pt: PackTable): WireEntry {
-  const w: WireEntry = [e.size, e.mtime];
-  for (const c of e.chunks) w.push(c.id, pt.idx(c.pack), c.off, c.len, c.size);
-  return w;
-}
-
-function decEntry(w: WireEntry, packs: string[], from = 0): Entry {
-  const chunks: ChunkRef[] = [];
-  for (let i = from + 2; i < w.length; i += 5) {
-    chunks.push({ id: w[i] as string, pack: packs[w[i + 1] as number], off: w[i + 2] as number, len: w[i + 3] as number, size: w[i + 4] as number });
-  }
-  return { size: w[from] as number, mtime: w[from + 1] as number, chunks };
-}
-
-export { PackTable, encEntry, decEntry, type WireEntry };
 
 interface WireCommit {
   d: string;

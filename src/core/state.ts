@@ -1,5 +1,5 @@
-import { PackTable, decEntry, encEntry, type WireEntry } from './repo.ts';
 import { sameContent, type Entry } from './types.ts';
+import { PackTable, decEntry, encEntry, type WireEntry } from './wire.ts';
 
 export interface Synced {
   /** The version local and remote last agreed on: the base of every three-way decision. */
