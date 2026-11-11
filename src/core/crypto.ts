@@ -16,7 +16,7 @@ export interface KeyHeader {
 
 export class WrongPassphraseError extends Error {
   constructor() {
-    super('Wrong passphrase for this remote vault');
+    super('Wrong passphrase');
   }
 }
 
@@ -41,28 +41,60 @@ async function expand(master: Uint8Array): Promise<Keys> {
   };
 }
 
-/** A random master key, wrapped by a passphrase-derived key so the passphrase can change without re-encrypting data. */
-export async function createKeys(passphrase: string, iterations: number): Promise<{ header: KeyHeader; keys: Keys }> {
+async function wrap(master: Uint8Array, passphrase: string, iterations: number): Promise<KeyHeader> {
   const salt = randomBytes(16);
-  const master = randomBytes(32);
   const nonce = randomBytes(12);
   const ct = new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv: bs(nonce) }, await kek(passphrase, salt, iterations), bs(master)));
-  return {
-    header: { iter: iterations, salt: toB64(salt), wrapped: toB64(concat([nonce, ct])) },
-    keys: await expand(master),
-  };
+  return { iter: iterations, salt: toB64(salt), wrapped: toB64(concat([nonce, ct])) };
 }
 
-export async function unlockKeys(header: KeyHeader, passphrase: string): Promise<Keys> {
+async function unwrap(header: KeyHeader, passphrase: string): Promise<Uint8Array> {
   const wrapped = fromB64(header.wrapped);
   const key = await kek(passphrase, fromB64(header.salt), header.iter);
-  let master: ArrayBuffer;
   try {
-    master = await subtle.decrypt({ name: 'AES-GCM', iv: bs(wrapped.subarray(0, 12)) }, key, bs(wrapped.subarray(12)));
+    return new Uint8Array(await subtle.decrypt({ name: 'AES-GCM', iv: bs(wrapped.subarray(0, 12)) }, key, bs(wrapped.subarray(12))));
   } catch {
     throw new WrongPassphraseError();
   }
-  return expand(new Uint8Array(master));
+}
+
+/** A random master key, wrapped by a passphrase-derived key so the passphrase can change without re-encrypting data. */
+export async function createKeys(passphrase: string, iterations: number): Promise<{ header: KeyHeader; keys: Keys }> {
+  const master = randomBytes(32);
+  return { header: await wrap(master, passphrase, iterations), keys: await expand(master) };
+}
+
+export async function unlockKeys(header: KeyHeader, passphrase: string): Promise<Keys> {
+  return expand(await unwrap(header, passphrase));
+}
+
+/** The same master key under a new passphrase: stored data stays valid, only the header changes. */
+export async function rewrapKeys(header: KeyHeader, oldPassphrase: string, newPassphrase: string): Promise<KeyHeader> {
+  return wrap(await unwrap(header, oldPassphrase), newPassphrase, header.iter);
+}
+
+/** Encrypts a small text under a passphrase alone, for moving settings between devices. */
+export async function sealWithPassphrase(text: string, passphrase: string, iterations = 200_000): Promise<string> {
+  const salt = randomBytes(16);
+  const nonce = randomBytes(12);
+  const ct = new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv: bs(nonce) }, await kek(passphrase, salt, iterations), bs(utf8.encode(text))));
+  return toB64(concat([salt, nonce, ct]));
+}
+
+export async function openWithPassphrase(sealed: string, passphrase: string, iterations = 200_000): Promise<string> {
+  let raw: Uint8Array;
+  try {
+    raw = fromB64(sealed);
+  } catch {
+    throw new Error('That is not a valid setup code');
+  }
+  if (raw.length < 45) throw new Error('That is not a valid setup code');
+  try {
+    const key = await kek(passphrase, raw.subarray(0, 16), iterations);
+    return new TextDecoder().decode(await subtle.decrypt({ name: 'AES-GCM', iv: bs(raw.subarray(16, 28)) }, key, bs(raw.subarray(28))));
+  } catch {
+    throw new WrongPassphraseError();
+  }
 }
 
 /** Layout: flag (1) | nonce (12) | ciphertext+tag. The flag is authenticated together with `aad`. */

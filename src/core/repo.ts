@@ -1,6 +1,6 @@
 import { randomBytes, toB64, toHex, utf8 } from './bytes.ts';
 import { deflate, inflate } from './compress.ts';
-import { createKeys, open, seal, unlockKeys, type KeyHeader, type Keys } from './crypto.ts';
+import { createKeys, open, rewrapKeys, seal, unlockKeys, type KeyHeader, type Keys } from './crypto.ts';
 import type { ChunkParams, ChunkRef, Commit, Entry, ObjectInfo, RemoteStore } from './types.ts';
 
 const FORMAT = 1;
@@ -45,6 +45,23 @@ function decEntry(w: WireEntry, packs: string[], from = 0): Entry {
 
 export { PackTable, encEntry, decEntry, type WireEntry };
 
+interface WireCommit {
+  d: string;
+  t: number;
+  p: string[];
+  c: [string, WireEntry | null][];
+}
+
+function encCommit(c: Commit): WireCommit {
+  const pt = new PackTable();
+  const changes = c.changes.map((ch): [string, WireEntry | null] => [ch.path, ch.entry && encEntry(ch.entry, pt)]);
+  return { d: c.device, t: c.time, p: pt.list, c: changes };
+}
+
+function decCommit(seq: number, w: WireCommit): Commit {
+  return { seq, device: w.d, time: w.t, changes: w.c.map(([path, e]) => ({ path, entry: e && decEntry(e, w.p) })) };
+}
+
 const seqKey = (prefix: string, seq: number) => `${prefix}/${String(seq).padStart(12, '0')}`;
 const seqOf = (key: string) => Number(key.slice(key.lastIndexOf('/') + 1));
 
@@ -53,6 +70,7 @@ const seqOf = (key: string) => Number(key.slice(key.lastIndexOf('/') + 1));
  *   vault.json   key-wrapping header (the only plaintext object)
  *   log/<seq>    one commit each, written create-if-absent: the sequence number is the lock
  *   snap/<seq>   full file table at that commit, so new devices skip the log
+ *   idx/<seq>    the commits of one snapshot interval in a single object, for fast history
  *   pack/<id>    encrypted chunks back to back, addressed by (offset, length)
  * Log objects are never deleted: a missing next key must always mean "nothing newer".
  */
@@ -97,22 +115,39 @@ export class Repo {
   }
 
   async readCommit(seq: number): Promise<Commit | null> {
-    const w = await this.openJson<{ d: string; t: number; p: string[]; c: [string, WireEntry | null][] }>(seqKey('log', seq));
-    if (!w) return null;
-    return {
-      seq,
-      device: w.d,
-      time: w.t,
-      changes: w.c.map(([path, e]) => ({ path, entry: e && decEntry(e, w.p) })),
-    };
+    const w = await this.openJson<WireCommit>(seqKey('log', seq));
+    return w && decCommit(seq, w);
+  }
+
+  /** True when another device has committed past `seq - 1`. Costs one tiny request. */
+  async hasCommit(seq: number): Promise<boolean> {
+    return (await this.store.get(seqKey('log', seq), { start: 0, end: 1 })) !== null;
   }
 
   /** False when another device already took this sequence number. */
   async writeCommit(c: Commit): Promise<boolean> {
-    const pt = new PackTable();
-    const changes = c.changes.map((ch) => [ch.path, ch.entry && encEntry(ch.entry, pt)]);
     const key = seqKey('log', c.seq);
-    return this.store.put(key, await this.sealJson(key, { d: c.device, t: c.time, p: pt.list, c: changes }), { ifNoneMatch: true });
+    return this.store.put(key, await this.sealJson(key, encCommit(c)), { ifNoneMatch: true });
+  }
+
+  /** The `count` commits ending at `seq` in one object, so history does not fetch them one by one. */
+  async writeDigest(seq: number, commits: Commit[]): Promise<void> {
+    const key = seqKey('idx', seq);
+    await this.store.put(key, await this.sealJson(key, commits.map(encCommit)));
+  }
+
+  async readDigest(seq: number, count: number): Promise<Commit[] | null> {
+    const w = await this.openJson<WireCommit[]>(seqKey('idx', seq));
+    if (!w || w.length !== count) return null;
+    return w.map((c, i) => decCommit(seq - count + 1 + i, c));
+  }
+
+  async changePassphrase(oldPassphrase: string, newPassphrase: string): Promise<void> {
+    const raw = await this.store.get(HEADER_KEY);
+    if (!raw) throw new Error('Remote vault header is missing');
+    const header = JSON.parse(new TextDecoder().decode(raw)) as Header;
+    header.kdf = await rewrapKeys(header.kdf, oldPassphrase, newPassphrase);
+    await this.store.put(HEADER_KEY, utf8.encode(JSON.stringify(header)));
   }
 
   async commitSeqsAfter(seq: number): Promise<number[]> {

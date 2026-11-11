@@ -410,3 +410,78 @@ test('a file that was only touched does not stop remote changes from arriving', 
   assert.equal(r.pushed, 0);
   assert.equal(b.fs.text('other.md'), 'from A\n');
 });
+
+test('history reaches past thousands of commits using one request per snapshot interval', async () => {
+  const { devices: [a], net, clock } = setup(['A'], { snapshotEvery: 20, retentionDays: 30 });
+  a.fs.put('target.md', 'first\n');
+  await a.sync();
+  for (let i = 0; i < 2500; i++) {
+    clock.now += 60_000;
+    a.fs.put(i === 1200 ? 'target.md' : `other${i % 5}.md`, `rev ${i}\n`);
+    await a.sync();
+  }
+  net.reset();
+  const versions = await a.engine.history('target.md');
+  assert.deepEqual(versions.map((v) => v.seq), [1202, 1]);
+  assert.equal(new TextDecoder().decode(await a.engine.readVersion(versions[1].entry!)), 'first\n');
+  assert.ok(net.stats.get < 200, `${net.stats.get} requests for 2,501 commits`);
+
+  clock.now += 29 * DAY;
+  assert.deepEqual((await a.engine.history('target.md')).map((v) => v.seq), [1202], 'versions older than the retention window are not offered');
+});
+
+test('the passphrase can be changed without re-uploading anything', async () => {
+  const { devices: [a, b], net, clock } = setup();
+  a.fs.put('n.md', 'x\n');
+  await a.sync();
+  await b.sync();
+  net.reset();
+  await a.engine.changePassphrase('new passphrase');
+  assert.equal(net.stats.put, 1);
+  a.fs.put('n.md', 'x\ny\n');
+  await a.sync();
+
+  const { SyncEngine } = await import('../src/core/engine.ts');
+  const fresh = (passphrase: string) => {
+    const d = new Device('C', net, clock);
+    d.engine = new SyncEngine({ fs: d.fs, store: net, stateStore: d.state, passphrase, config: d.config });
+    return d;
+  };
+  await assert.rejects(fresh('test passphrase').sync(), /Wrong passphrase/);
+  const c = fresh('new passphrase');
+  await c.sync();
+  assert.equal(c.fs.text('n.md'), 'x\ny\n');
+  // A device that was already running keeps working with the key it holds.
+  await b.sync();
+  assert.equal(b.fs.text('n.md'), 'x\ny\n');
+});
+
+test('checking for remote changes is one tiny request and no local work', async () => {
+  const { devices: [a, b], net } = setup();
+  a.fs.put('n.md', 'x\n');
+  await a.sync();
+  await b.sync();
+  net.reset();
+  assert.equal(await b.engine.remoteChanged(), false);
+  assert.deepEqual([net.stats.get, net.stats.down], [1, 0]);
+  a.fs.put('n.md', 'x\ny\n');
+  await a.sync();
+  net.reset();
+  assert.equal(await b.engine.remoteChanged(), true);
+  assert.ok(net.stats.down <= 1);
+});
+
+test('progress is reported for uploads and downloads', async () => {
+  const { devices: [a, b], net, clock } = setup();
+  for (let i = 0; i < 25; i++) a.fs.put(`n${i}.md`, `${i}\n`);
+  const seen: string[] = [];
+  const { SyncEngine } = await import('../src/core/engine.ts');
+  for (const d of [a, b]) {
+    d.engine = new SyncEngine({
+      fs: d.fs, store: net, stateStore: d.state, passphrase: 'test passphrase', config: d.config, now: () => clock.now,
+      onProgress: (p) => seen.push(`${p.phase} ${p.done}/${p.total}`),
+    });
+    await d.sync();
+  }
+  assert.ok(seen.includes('upload 25/25') && seen.includes('download 25/25'), seen.slice(-3).join(', '));
+});

@@ -7,11 +7,15 @@ import type { RemoteStore } from '../core/types.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { withRetry } from '../stores/retry.ts';
 import { S3Store, type S3Config } from '../stores/s3.ts';
+import { WebDavStore } from '../stores/webdav.ts';
 import { FileState, FolderStore, NodeFS } from './nodefs.ts';
 
 interface CliConfig {
   vault: string;
-  remote: ({ type: 's3' } & Omit<S3Config, 'accessKey' | 'secretKey'>) | { type: 'folder'; path: string };
+  remote:
+    | ({ type: 's3' } & Omit<S3Config, 'accessKey' | 'secretKey'>)
+    | { type: 'webdav'; url: string; username: string }
+    | { type: 'folder'; path: string };
   sync?: Partial<SyncConfig>;
 }
 
@@ -22,9 +26,10 @@ const USAGE = `Usage: node src/node/cli.ts <command> [--config=selfsync.json]
   history <path>         list stored versions of a file
   restore <path> <seq>   write a stored version back into the vault
   clean                  delete versions older than the retention window from storage
+  change-passphrase      re-protect the vault key with SELFSYNC_NEW_PASSPHRASE
 
 Secrets come from the environment: SELFSYNC_PASSPHRASE, and for S3
-SELFSYNC_ACCESS_KEY and SELFSYNC_SECRET_KEY.`;
+SELFSYNC_ACCESS_KEY and SELFSYNC_SECRET_KEY, for WebDAV SELFSYNC_WEBDAV_PASSWORD.`;
 
 const env = (name: string) => {
   const v = process.env[name];
@@ -34,6 +39,7 @@ const env = (name: string) => {
 
 function makeStore(remote: CliConfig['remote']): RemoteStore {
   if (remote.type === 'folder') return new FolderStore(resolve(remote.path));
+  if (remote.type === 'webdav') return withRetry(new WebDavStore({ url: remote.url, username: remote.username, password: env('SELFSYNC_WEBDAV_PASSWORD') }));
   return withRetry(new S3Store({ ...remote, pathStyle: remote.pathStyle ?? true, prefix: remote.prefix ?? '', accessKey: env('SELFSYNC_ACCESS_KEY'), secretKey: env('SELFSYNC_SECRET_KEY') }));
 }
 
@@ -82,6 +88,11 @@ async function main(): Promise<number> {
     if (!version?.entry) throw new Error(`No restorable version ${rest[1]} of ${rest[0]}`);
     await new NodeFS(vault).write(rest[0], await engine.readVersion(version.entry));
     console.log(`restored ${rest[0]} as of ${new Date(version.time).toISOString()}; run sync to send it to other devices`);
+    return 0;
+  }
+  if (command === 'change-passphrase') {
+    await engine.changePassphrase(env('SELFSYNC_NEW_PASSPHRASE'));
+    console.log('passphrase changed; update it on every device');
     return 0;
   }
   if (command === 'clean') {

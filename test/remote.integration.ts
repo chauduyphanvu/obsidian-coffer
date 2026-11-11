@@ -1,5 +1,6 @@
-// Runs the real S3 client against a real S3 server, with real files on disk.
-//   S3_ENDPOINT=http://127.0.0.1:9100 S3_ACCESS_KEY=... S3_SECRET_KEY=... node test/s3.integration.ts
+// Runs a real storage client against a real server, with real files on disk.
+//   S3_ENDPOINT=http://127.0.0.1:9100 S3_ACCESS_KEY=... S3_SECRET_KEY=... node test/remote.integration.ts
+//   WEBDAV_URL=http://127.0.0.1:9200 WEBDAV_USER=... WEBDAV_PASSWORD=... node test/remote.integration.ts
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, writeFile, mkdir, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -11,28 +12,35 @@ import { checkStore } from '../src/stores/doctor.ts';
 import { withRetry } from '../src/stores/retry.ts';
 import { S3Store, fetchHttp } from '../src/stores/s3.ts';
 import { sha256Hex, sign } from '../src/stores/sigv4.ts';
-
-const endpoint = process.env.S3_ENDPOINT!;
-const accessKey = process.env.S3_ACCESS_KEY!;
-const secretKey = process.env.S3_SECRET_KEY!;
-const region = process.env.S3_REGION ?? 'us-east-1';
-const bucket = process.env.S3_BUCKET ?? `selfsync-test-${Date.now()}`;
-
-if (!process.env.S3_BUCKET) {
-  const headers = await sign({
-    method: 'PUT', host: new URL(endpoint).host, path: `/${bucket}`, query: {}, headers: {},
-    payloadHash: await sha256Hex(new Uint8Array(0)), region, accessKey, secretKey, date: new Date(),
-  });
-  const res = await fetchHttp({ method: 'PUT', url: `${endpoint}/${bucket}`, headers });
-  assert.equal(res.status, 200, `create bucket: ${new TextDecoder().decode(res.body)}`);
-}
+import { WebDavStore } from '../src/stores/webdav.ts';
 
 let requests = 0;
+const http: typeof fetchHttp = (req) => {
+  requests++;
+  return fetchHttp(req);
+};
+
+async function s3Store() {
+  const endpoint = process.env.S3_ENDPOINT!;
+  const accessKey = process.env.S3_ACCESS_KEY!;
+  const secretKey = process.env.S3_SECRET_KEY!;
+  const region = process.env.S3_REGION ?? 'us-east-1';
+  const bucket = process.env.S3_BUCKET ?? `selfsync-test-${Date.now()}`;
+  if (!process.env.S3_BUCKET) {
+    const headers = await sign({
+      method: 'PUT', host: new URL(endpoint).host, path: `/${bucket}`, query: {}, headers: {},
+      payloadHash: await sha256Hex(new Uint8Array(0)), region, accessKey, secretKey, date: new Date(),
+    });
+    const res = await fetchHttp({ method: 'PUT', url: `${endpoint}/${bucket}`, headers });
+    assert.equal(res.status, 200, `create bucket: ${new TextDecoder().decode(res.body)}`);
+  }
+  return new S3Store({ endpoint, region, bucket, prefix: 'my vault/nested', accessKey, secretKey, pathStyle: true }, http);
+}
+
 const store = withRetry(
-  new S3Store({ endpoint, region, bucket, prefix: 'my vault/nested', accessKey, secretKey, pathStyle: true }, (req) => {
-    requests++;
-    return fetchHttp(req);
-  }),
+  process.env.WEBDAV_URL
+    ? new WebDavStore({ url: `${process.env.WEBDAV_URL}/vault ${Date.now()}/nested`, username: process.env.WEBDAV_USER!, password: process.env.WEBDAV_PASSWORD! }, http)
+    : await s3Store(),
 );
 
 const report = await checkStore(store);
@@ -99,4 +107,4 @@ assert.equal(gc.packsDeleted, 0);
 assert.ok((await store.list('pack/')).length > 1000, 'listing pages past 1,000 keys');
 
 await rm(root, { recursive: true });
-console.log('S3 integration: all checks passed');
+console.log('integration: all checks passed');

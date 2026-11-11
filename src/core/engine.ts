@@ -27,6 +27,7 @@ export interface EngineOptions {
   config: SyncConfig;
   now?: () => number;
   log?: (message: string) => void;
+  onProgress?: (progress: { phase: 'upload' | 'download'; done: number; total: number }) => void;
 }
 
 export interface SyncResult {
@@ -384,6 +385,7 @@ export class SyncEngine {
       st.synced.set(key, { entry, lsize: stat.size, lmtime: stat.mtime });
       byLower.set(key.toLowerCase(), key);
       res.pulled++;
+      this.o.onProgress?.({ phase: 'download', done: res.pulled, total: pulls.length });
     };
 
     for (let i = 0; i < pulls.length; ) {
@@ -624,6 +626,7 @@ export class SyncEngine {
       return { file: f, entry: { size: f.size, mtime: f.mtime, chunks } };
     };
 
+    let done = 0;
     let pendingDeletes = deletes;
     for (let i = 0; i < files.length || pendingDeletes.length; ) {
       const batch: Local[] = [];
@@ -636,6 +639,7 @@ export class SyncEngine {
         try {
           const p = await prepare(f);
           if (p) prepared.push(p);
+          this.o.onProgress?.({ phase: 'upload', done: ++done, total: files.length });
         } catch (e) {
           res.errors.push({ path: f.key, message: e instanceof Error ? e.message : String(e) });
         }
@@ -664,7 +668,10 @@ export class SyncEngine {
         res.pushed += prepared.length;
         res.deletedRemote += deletes.length;
         res.commits++;
-        if (seq % this.cfg.snapshotEvery === 0) await repo.writeSnapshot(seq, st.remote);
+        if (seq % this.cfg.snapshotEvery === 0) {
+          await repo.writeSnapshot(seq, st.remote);
+          await this.writeDigest(seq);
+        }
         await this.save();
         return contended;
       }
@@ -678,26 +685,66 @@ export class SyncEngine {
     return contended;
   }
 
-  /** Versions of one file still within the retention window, newest first. */
-  async history(path: string, maxCommits = 2000): Promise<Version[]> {
+  /** Best effort: history works without a digest, only slower. */
+  private async writeDigest(seq: number): Promise<void> {
+    const { repo } = await this.open();
+    const n = this.cfg.snapshotEvery;
+    try {
+      const commits: Commit[] = new Array(n);
+      await pool(commits, this.cfg.concurrency, async (_, i) => {
+        const c = await repo.readCommit(seq - n + 1 + i);
+        if (!c) throw new Error('missing commit');
+        commits[i] = c;
+      });
+      await repo.writeDigest(seq, commits);
+    } catch (e) {
+      this.log(`Could not write the history index for commit ${seq}: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+
+  /** True when another device has committed since this one last synced. One tiny request, no local scan. */
+  async remoteChanged(): Promise<boolean> {
+    const { repo, st } = await this.open();
+    return repo.hasCommit(st.lastSeq + 1);
+  }
+
+  /** Re-encrypts only the key header. Other devices keep working until restarted, then need the new passphrase. */
+  async changePassphrase(newPassphrase: string): Promise<void> {
+    const { repo } = await this.open();
+    await repo.changePassphrase(this.o.passphrase, newPassphrase);
+    this.o.passphrase = newPassphrase;
+  }
+
+  /** Every version of one file still within the retention window, newest first. */
+  async history(path: string): Promise<Version[]> {
     const { repo, st } = await this.open();
     await this.fetchRemote();
     const cutoff = this.now() - this.cfg.retentionDays * DAY;
+    const n = this.cfg.snapshotEvery;
     const out: Version[] = [];
-    const step = this.cfg.concurrency * 4;
-    for (let hi = st.lastSeq; hi > 0 && st.lastSeq - hi < maxCommits; hi -= step) {
-      const seqs = Array.from({ length: Math.min(step, hi) }, (_, i) => hi - i);
-      const found: (Version | undefined)[] = new Array(seqs.length);
+    // Walk back one snapshot interval at a time: a whole interval is one request when its digest exists.
+    for (let hi = st.lastSeq; hi > 0; ) {
+      const lo = hi % n === 0 ? hi - n + 1 : hi - (hi % n) + 1;
+      let commits = hi % n === 0 ? await repo.readDigest(hi, n) : null;
+      if (!commits) {
+        const block: (Commit | null)[] = new Array(hi - lo + 1);
+        await pool(block, this.cfg.concurrency, async (_, i) => {
+          block[i] = await repo.readCommit(lo + i);
+        });
+        commits = block.filter((c): c is Commit => !!c);
+      }
       let expired = false;
-      await pool(seqs, this.cfg.concurrency, async (seq, i) => {
-        const c = await repo.readCommit(seq);
-        if (!c) return;
-        if (c.time < cutoff) expired = true;
+      for (const c of commits.reverse()) {
         const ch = c.changes.find((x) => x.path === path);
-        if (ch) found[i] = { seq, time: c.time, device: c.device, entry: ch.entry };
-      });
-      for (const v of found) if (v) out.push(v);
+        if (ch) out.push({ seq: c.seq, time: c.time, device: c.device, entry: ch.entry });
+        // Versions older than the window may already have been cleaned up, so stop at the first such commit.
+        if (c.time < cutoff) {
+          expired = true;
+          break;
+        }
+      }
       if (expired) break;
+      hi = lo - 1;
     }
     return out;
   }
