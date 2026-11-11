@@ -78,3 +78,8 @@ export function sameContent(a: Entry, b: Entry): boolean {
   for (let i = 0; i < a.chunks.length; i++) if (a.chunks[i].id !== b.chunks[i].id) return false;
   return true;
 }
+
+/** True when `ids` are exactly the chunks of `e`, in order. */
+export function hasChunks(e: Entry, ids: string[]): boolean {
+  return ids.length === e.chunks.length && ids.every((id, i) => id === e.chunks[i].id);
+}

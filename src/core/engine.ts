@@ -1,12 +1,11 @@
 import { concat, pool } from './bytes.ts';
-import { cutPoints } from './chunker.ts';
 import { worthCompressing } from './compress.ts';
 import { compileExcludes, type SyncConfig } from './config.ts';
-import { chunkId } from './crypto.ts';
 import { merge3 } from './merge.ts';
 import { Repo } from './repo.ts';
 import { LocalState } from './state.ts';
 import {
+  hasChunks,
   sameContent,
   type Change,
   type ChunkRef,
@@ -190,23 +189,11 @@ export class SyncEngine {
     await this.o.stateStore.save(this.st!.serialize());
   }
 
-  private apply(c: Commit): Set<string> {
-    const st = this.st!;
-    const touched = new Set<string>();
-    for (const ch of c.changes) {
-      if (ch.entry) st.remote.set(ch.path, ch.entry);
-      else st.remote.delete(ch.path);
-      touched.add(ch.path);
-    }
-    st.lastSeq = c.seq;
-    return touched;
-  }
-
   /** Brings the cached remote file table up to the newest commit. Returns the paths that changed. */
   private async fetchRemote(): Promise<Set<string>> {
     const { repo, st } = await this.open();
     const touched = new Set<string>();
-    const add = (c: Commit) => this.apply(c).forEach((p) => touched.add(p));
+    const add = (c: Commit) => st.apply(c).forEach((p) => touched.add(p));
     const loadSnapshot = async () => {
       const snaps = await repo.snapshots();
       const latest = snaps[snaps.length - 1];
@@ -431,10 +418,7 @@ export class SyncEngine {
         const old = st.synced.get(key)?.entry;
         if (!l || !old || e.chunks.length < 2 || !old.chunks.some((c) => slots.has(c.id))) continue;
         try {
-          const data = await fs.read(l.path);
-          const cuts = cutPoints(data, repo.chunk);
-          const parts = cuts.map((end, n) => data.subarray(n ? cuts[n - 1] : 0, end));
-          const ids = await this.chunkIds(parts);
+          const { parts, ids } = await repo.split(await fs.read(l.path));
           ids.forEach((id, n) => place(id, parts[n]));
         } catch {
           // unreadable: download everything
@@ -488,9 +472,8 @@ export class SyncEngine {
       res.skipped++;
       return;
     }
-    const cuts = cutPoints(mine, repo.chunk);
-    const ids = await this.chunkIds(cuts.map((end, i) => mine.subarray(i ? cuts[i - 1] : 0, end)));
-    if (ids.length === r.chunks.length && ids.every((id, i) => id === r.chunks[i].id)) {
+    const { ids } = await repo.split(mine);
+    if (hasChunks(r, ids)) {
       st.synced.set(key, { entry: r, lsize: l.size, lmtime: l.mtime });
       return;
     }
@@ -538,16 +521,6 @@ export class SyncEngine {
     }
   }
 
-  /** WebCrypto copies its input, so hashing every chunk of a big file at once would double its memory. */
-  private async chunkIds(parts: Uint8Array[]): Promise<string[]> {
-    const keys = this.repo!.chunkKeys();
-    const ids: string[] = new Array(parts.length);
-    await pool(parts, 4, async (part, i) => {
-      ids[i] = await chunkId(keys, part);
-    });
-    return ids;
-  }
-
   /** Downloads and decrypts chunks, fetching neighbours in one pack with one request. `sink` gets each chunk once. */
   private async fetchChunks(refs: ChunkRef[], sink: (ref: ChunkRef, plain: Uint8Array) => void): Promise<void> {
     const { repo } = await this.open();
@@ -590,7 +563,6 @@ export class SyncEngine {
     }
     const dedup = this.dedup;
     const packer = new Packer(repo, this.cfg.packTargetBytes, this.cfg.packMaxBlobBytes, this.cfg.concurrency);
-    const keys = repo.chunkKeys();
     let again = false;
 
     const prepare = async (f: Local): Promise<Prepared | undefined> => {
@@ -600,11 +572,9 @@ export class SyncEngine {
         res.skipped++; // being written right now; the next sync picks it up
         return;
       }
-      const cuts = cutPoints(data, repo.chunk);
-      const parts = cuts.map((end, i) => data.subarray(i ? cuts[i - 1] : 0, end));
-      const ids = await this.chunkIds(parts);
+      const { parts, ids } = await repo.split(data);
       const base = st.synced.get(f.key)?.entry;
-      if (base && st.remote.get(f.key) && ids.length === base.chunks.length && ids.every((id, i) => id === base.chunks[i].id)) {
+      if (base && st.remote.get(f.key) && hasChunks(base, ids)) {
         st.synced.set(f.key, { entry: base, lsize: f.size, lmtime: f.mtime }); // touched, not changed
         return;
       }
@@ -662,7 +632,7 @@ export class SyncEngine {
       ];
       const seq = st.lastSeq + 1;
       if (await repo.writeCommit({ seq, device: this.cfg.deviceName, time: this.now(), changes })) {
-        this.apply({ seq, device: this.cfg.deviceName, time: 0, changes });
+        st.apply({ seq, device: this.cfg.deviceName, time: 0, changes });
         for (const p of prepared) st.synced.set(p.file.key, { entry: p.entry, lsize: p.file.size, lmtime: p.file.mtime });
         for (const path of deletes) st.synced.delete(path);
         res.pushed += prepared.length;
@@ -790,16 +760,16 @@ export class SyncEngine {
     });
 
     const result = { packsDeleted: 0, bytesFreed: 0, snapshotsDeleted: 0 };
-    const dead = (await repo.listPacks()).filter((o) => !live.has(o.key.slice(5)) && o.modified < now - GC_GRACE);
+    const dead = (await repo.listPacks()).filter((o) => !live.has(o.id) && o.modified < now - GC_GRACE);
     await pool(dead, this.cfg.concurrency, async (o) => {
-      await repo.store.delete(o.key);
+      await repo.deletePack(o.id);
       result.packsDeleted++;
       result.bytesFreed += o.size;
     });
     if (floor) {
       for (const s of snaps) {
         if (s.seq >= floor.seq) break;
-        await repo.store.delete(`snap/${String(s.seq).padStart(12, '0')}`);
+        await repo.deleteSnapshot(s.seq);
         result.snapshotsDeleted++;
       }
     }

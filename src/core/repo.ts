@@ -1,7 +1,8 @@
-import { randomBytes, toB64, toHex, utf8 } from './bytes.ts';
+import { pool, randomBytes, toB64, toHex, utf8 } from './bytes.ts';
+import { cutPoints } from './chunker.ts';
 import { deflate, inflate } from './compress.ts';
-import { createKeys, open, rewrapKeys, seal, unlockKeys, type KeyHeader, type Keys } from './crypto.ts';
-import type { ChunkParams, Commit, Entry, ObjectInfo, RemoteStore } from './types.ts';
+import { chunkId, createKeys, open, rewrapKeys, seal, unlockKeys, type KeyHeader, type Keys } from './crypto.ts';
+import type { ChunkParams, Commit, Entry, RemoteStore } from './types.ts';
 import { PackTable, decEntry, encEntry, type WireEntry } from './wire.ts';
 
 const FORMAT = 1;
@@ -44,9 +45,9 @@ const seqOf = (key: string) => Number(key.slice(key.lastIndexOf('/') + 1));
  * Log objects are never deleted: a missing next key must always mean "nothing newer".
  */
 export class Repo {
-  readonly store: RemoteStore;
   readonly id: string;
-  readonly chunk: ChunkParams;
+  private store: RemoteStore;
+  private chunk: ChunkParams;
   private keys: Keys;
 
   private constructor(store: RemoteStore, header: Header, keys: Keys) {
@@ -155,8 +156,28 @@ export class Repo {
     return this.store.get(`pack/${id}`, { start, end });
   }
 
-  listPacks(): Promise<ObjectInfo[]> {
-    return this.store.list('pack/');
+  async listPacks(): Promise<{ id: string; size: number; modified: number }[]> {
+    return (await this.store.list('pack/')).map((o) => ({ id: o.key.slice(5), size: o.size, modified: o.modified }));
+  }
+
+  deletePack(id: string): Promise<void> {
+    return this.store.delete(`pack/${id}`);
+  }
+
+  deleteSnapshot(seq: number): Promise<void> {
+    return this.store.delete(seqKey('snap', seq));
+  }
+
+  /** Cuts content where every device cuts it and names each piece by a hash keyed with the vault key. */
+  async split(data: Uint8Array): Promise<{ parts: Uint8Array[]; ids: string[] }> {
+    const cuts = cutPoints(data, this.chunk);
+    const parts = cuts.map((end, i) => data.subarray(i ? cuts[i - 1] : 0, end));
+    // WebCrypto copies its input, so hashing every chunk of a big file at once would double its memory.
+    const ids: string[] = new Array(parts.length);
+    await pool(parts, 4, async (part, i) => {
+      ids[i] = await chunkId(this.keys, part);
+    });
+    return { parts, ids };
   }
 
   async sealChunk(id: string, data: Uint8Array, compress: boolean): Promise<Uint8Array> {
@@ -171,9 +192,5 @@ export class Repo {
   async openChunk(id: string, sealed: Uint8Array): Promise<Uint8Array> {
     const { plain, flag } = await open(this.keys, sealed, id);
     return flag === 1 ? inflate(plain) : plain;
-  }
-
-  chunkKeys(): Keys {
-    return this.keys;
   }
 }

@@ -1,4 +1,4 @@
-import { sameContent, type Entry } from './types.ts';
+import { sameContent, type Commit, type Entry } from './types.ts';
 import { PackTable, decEntry, encEntry, type WireEntry } from './wire.ts';
 
 export interface Synced {
@@ -28,6 +28,18 @@ export class LocalState {
       if (s) st.synced.set(path, { entry: s[2] ? decEntry(s[2], w.p) : remote!, lsize: s[0], lmtime: s[1] });
     }
     return st;
+  }
+
+  /** Advances the remote file table by one commit. Returns the paths it touched. */
+  apply(c: Commit): Set<string> {
+    const touched = new Set<string>();
+    for (const ch of c.changes) {
+      if (ch.entry) this.remote.set(ch.path, ch.entry);
+      else this.remote.delete(ch.path);
+      touched.add(ch.path);
+    }
+    this.lastSeq = c.seq;
+    return touched;
   }
 
   serialize(): string {
