@@ -60,6 +60,7 @@ const PULL_BATCH = 32 << 20;
 const MAX_RANGE = 8 << 20;
 const MOVE_CACHE = 64 << 20;
 const OPTIMISTIC_BYTES = 256 << 10;
+const OPEN_PARALLEL = 4;
 
 const contentKey = (e: Entry) => e.chunks.map((c) => c.id).join(',');
 
@@ -486,10 +487,11 @@ export class SyncEngine {
     await pool(ranges, this.cfg.concurrency, async (range) => {
       const data = await repo.getPackRange(range.pack, range.start, range.end);
       if (!data) throw new Error(`Remote pack ${range.pack} is missing`);
-      for (const ref of range.refs) {
+      // Decrypting and inflating run off the main thread, so one range's chunks need not queue behind each other.
+      await pool(range.refs, OPEN_PARALLEL, async (ref) => {
         const at = ref.off - range.start;
         sink(ref, await repo.openChunk(ref.id, data.subarray(at, at + ref.len)));
-      }
+      });
     });
   }
 
