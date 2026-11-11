@@ -1,8 +1,9 @@
 import { readFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { join, resolve } from 'node:path';
-import { resolveConfig, type SyncConfig } from '../core/config.ts';
+import { DEFAULT_CONFIG, resolveConfig, type SyncConfig } from '../core/config.ts';
 import { SyncEngine } from '../core/engine.ts';
+import { vaultKey } from '../core/paths.ts';
 import type { RemoteStore } from '../core/types.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
@@ -29,6 +30,8 @@ const USAGE = `Usage: node src/node/cli.ts <command> [--config=selfsync.json]
 
 Secrets come from the environment: SELFSYNC_PASSPHRASE, and for S3
 SELFSYNC_ACCESS_KEY and SELFSYNC_SECRET_KEY, for WebDAV SELFSYNC_WEBDAV_PASSWORD.`;
+
+const STATE_DIR = '.self-sync';
 
 const env = (name: string) => {
   const v = process.env[name];
@@ -63,9 +66,14 @@ async function main(): Promise<number> {
   const engine = new SyncEngine({
     fs: new NodeFS(vault),
     store,
-    stateStore: new FileState(join(vault, '.self-sync', 'state.json')),
+    stateStore: new FileState(join(vault, STATE_DIR, 'state.json')),
     passphrase: env('SELFSYNC_PASSPHRASE'),
-    config: resolveConfig({ deviceName: hostname().split('.')[0], ...cli.sync }),
+    config: resolveConfig({
+      deviceName: hostname().split('.')[0],
+      ...cli.sync,
+      // A custom list replaces the defaults, but this device's own state must never sync.
+      exclude: [...(cli.sync?.exclude ?? DEFAULT_CONFIG.exclude), `${STATE_DIR}/**`],
+    }),
     log: console.error,
   });
 
@@ -77,13 +85,13 @@ async function main(): Promise<number> {
     return r.errors.length ? 1 : 0;
   }
   if (command === 'history' && rest[0]) {
-    for (const v of await engine.history(rest[0])) {
+    for (const v of await engine.history(vaultKey(rest[0]))) {
       console.log(`${String(v.seq).padStart(6)}  ${new Date(v.time).toISOString()}  ${v.device.padEnd(16)} ${v.entry ? `${v.entry.size} bytes` : 'deleted'}`);
     }
     return 0;
   }
   if (command === 'restore' && rest[1]) {
-    const version = (await engine.history(rest[0])).find((v) => v.seq === Number(rest[1]));
+    const version = (await engine.history(vaultKey(rest[0]))).find((v) => v.seq === Number(rest[1]));
     if (!version?.entry) throw new Error(`No restorable version ${rest[1]} of ${rest[0]}`);
     await new NodeFS(vault).write(rest[0], await engine.readVersion(version.entry));
     console.log(`restored ${rest[0]} as of ${new Date(version.time).toISOString()}; run sync to send it to other devices`);

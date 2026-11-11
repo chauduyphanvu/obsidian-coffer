@@ -1,7 +1,7 @@
 import { Modal, Notice, PluginSettingTab, SecretComponent, Setting, SuggestModal, type App } from 'obsidian';
 import type { Version } from '../core/types.ts';
 import type SelfSyncPlugin from './main.ts';
-import type { Settings } from './settings.ts';
+import { parseNumberSetting, type Settings } from './settings.ts';
 
 export class HistoryModal extends SuggestModal<Version> {
   private plugin: SelfSyncPlugin;
@@ -64,8 +64,8 @@ export class SettingsTab extends PluginSettingTab {
       new Setting(containerEl).setName(name).setDesc(desc).addText((t) => {
         t.inputEl.type = 'number';
         t.setValue(String(s[key])).onChange((v) => {
-          const n = Number(v);
-          if (!Number.isFinite(n) || n < min) return;
+          const n = parseNumberSetting(v, min);
+          if (n === null) return;
           s[key] = n;
           save();
         });

@@ -121,6 +121,12 @@ export function syncConfig(s: Settings, configDir: string, pluginDir: string): S
   });
 }
 
+/** The value a number field holds, or null when it is empty, not a number, or below `min`. */
+export function parseNumberSetting(text: string, min: number): number | null {
+  const n = Number(text);
+  return text.trim() === '' || !Number.isFinite(n) || n < min ? null : n;
+}
+
 export function cleanupDue(s: Settings, now: number): boolean {
   return s.autoCleanDays > 0 && now - s.lastCleanup > s.autoCleanDays * DAY;
 }

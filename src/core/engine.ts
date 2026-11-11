@@ -65,7 +65,11 @@ const contentKey = (e: Entry) => e.chunks.map((c) => c.id).join(',');
 const unchanged = (cur: FileStat | null, l: Local | undefined) => (l ? !!cur && cur.size === l.size && cur.mtime === l.mtime : !cur);
 
 const recordError = (res: SyncResult, path: string, e: unknown) => {
-  res.errors.push({ path, message: e instanceof Error ? e.message : String(e) });
+  const message = e instanceof Error ? e.message : String(e);
+  // A later pass of the same sync may try the file again; it is still one failed file.
+  const earlier = res.errors.find((x) => x.path === path);
+  if (earlier) earlier.message = message;
+  else res.errors.push({ path, message });
 };
 
 /** What one pass works with, shared by its steps. */
@@ -76,8 +80,9 @@ interface Pass {
   /** Local keys by lower-case name, so a pull cannot create a second file that differs only by case. */
   byLower: Map<string, string>;
   res: SyncResult;
-  /** Planned pulls, the total that download progress counts toward. */
+  /** What download progress counts toward: planned pulls, plus conflicts, which may download the remote side. */
   pulls: number;
+  downloaded: number;
 }
 
 export class SyncEngine {
@@ -215,7 +220,7 @@ export class SyncEngine {
     if (nothingToDo(p)) return false;
     this.checkDeletes(p, st, force);
 
-    const pass: Pass = { repo, st, local, byLower: new Map(), res, pulls: p.pulls.length };
+    const pass: Pass = { repo, st, local, byLower: new Map(), res, pulls: p.pulls.length + p.conflicts.length, downloaded: 0 };
     for (const key of local.keys()) pass.byLower.set(key.toLowerCase(), key);
     const moved = await this.deleteLocal(pass, p);
     await this.pull(pass, p.pulls, moved);
@@ -301,7 +306,7 @@ export class SyncEngine {
     st.synced.set(key, { entry, lsize: stat.size, lmtime: stat.mtime });
     byLower.set(key.toLowerCase(), key);
     res.pulled++;
-    this.o.onProgress?.({ phase: 'download', done: res.pulled, total: pass.pulls });
+    this.o.onProgress?.({ phase: 'download', done: ++pass.downloaded, total: pass.pulls });
   }
 
   /** Downloads remote changes in batches. `moved` holds the bytes of files a move already has here. */

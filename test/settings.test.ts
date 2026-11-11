@@ -9,6 +9,7 @@ import {
   encodeSetupCode,
   hasStorageAddress,
   isConfigured,
+  parseNumberSetting,
   remoteSpec,
   syncConfig,
   type Settings,
@@ -94,4 +95,13 @@ test('setup codes carry storage settings and keys under the passphrase', async (
   });
   assert.deepEqual(stored, [['self-sync-access-key', 'AKID'], ['self-sync-secret-key', 'SECRET'], ['self-sync-passphrase', 'vault pass']]);
   await assert.rejects(decodeSetupCode(code, 'wrong'), /Wrong passphrase/);
+});
+
+test('settings: a cleared or invalid number field changes nothing', () => {
+  assert.equal(parseNumberSetting('', 0), null);
+  assert.equal(parseNumberSetting('  ', 0), null);
+  assert.equal(parseNumberSetting('abc', 0), null);
+  assert.equal(parseNumberSetting('1', 2), null);
+  assert.equal(parseNumberSetting('0', 0), 0);
+  assert.equal(parseNumberSetting('15', 1), 15);
 });

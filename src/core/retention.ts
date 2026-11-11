@@ -26,8 +26,10 @@ export async function listVersions(repo: Repo, lastSeq: number, path: string, cf
     let expired = false;
     for (const c of commits.reverse()) {
       const ch = c.changes.find((x) => x.path === path);
-      if (ch) out.push({ seq: c.seq, time: c.time, device: c.device, entry: ch.entry });
-      // Versions older than the window may already have been cleaned up, so stop at the first such commit.
+      if (!ch) continue;
+      out.push({ seq: c.seq, time: c.time, device: c.device, entry: ch.entry });
+      // Older versions may already have been cleaned up. This one was current when the window
+      // began, which cleanup keeps, so it is the last one listed.
       if (c.time < cutoff) {
         expired = true;
         break;

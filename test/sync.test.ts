@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { SafetyError } from '../src/core/engine.ts';
+import { SafetyError, SyncEngine } from '../src/core/engine.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
 import { rng, SimStore } from '../src/testing/netsim.ts';
 import { Device } from './helpers.ts';
@@ -299,6 +299,22 @@ test('history lists versions and an old one can be read back', async () => {
   assert.equal(new TextDecoder().decode(await a.engine.readVersion(versions[2].entry!)), 'v2\n');
 });
 
+test('history includes the version that was current when the retention window began', async () => {
+  const { devices: [a], clock } = setup(['A'], { snapshotEvery: 2, retentionDays: 30 });
+  a.fs.put('n.md', 'old text\n');
+  a.fs.put('other.md', 'x\n');
+  await a.sync();
+  a.fs.put('other.md', 'y\n');
+  await a.sync();
+  clock.now += 40 * DAY;
+  a.fs.put('n.md', 'edited today\n');
+  await a.sync();
+  const versions = await a.engine.history('n.md');
+  assert.deepEqual(versions.map((v) => v.seq), [3, 1]);
+  await a.engine.gc();
+  assert.equal(new TextDecoder().decode(await a.engine.readVersion(versions[1].entry!)), 'old text\n');
+});
+
 test('cleanup removes only data that no version inside the retention window needs', async () => {
   const { devices: [a, b], mem, clock } = setup(['A', 'B'], { snapshotEvery: 2, retentionDays: 7, packMaxBlobBytes: 4096 });
   a.fs.put('keep.md', 'keep\n');
@@ -427,7 +443,9 @@ test('history reaches past thousands of commits using one request per snapshot i
   assert.ok(net.stats.get < 200, `${net.stats.get} requests for 2,501 commits`);
 
   clock.now += 29 * DAY;
-  assert.deepEqual((await a.engine.history('target.md')).map((v) => v.seq), [1202], 'versions older than the retention window are not offered');
+  assert.deepEqual((await a.engine.history('target.md')).map((v) => v.seq), [1202, 1], 'the first version was still current inside the window');
+  clock.now += 2 * DAY;
+  assert.deepEqual((await a.engine.history('target.md')).map((v) => v.seq), [1202], 'versions replaced before the retention window are not offered');
 });
 
 test('the passphrase can be changed without re-uploading anything', async () => {
@@ -484,4 +502,36 @@ test('progress is reported for uploads and downloads', async () => {
     await d.sync();
   }
   assert.ok(seen.includes('upload 25/25') && seen.includes('download 25/25'), seen.slice(-3).join(', '));
+});
+
+test('a file that cannot be read is reported once', async () => {
+  const { devices: [a] } = setup(['A']);
+  a.fs.put('ok.md', 'ok\n');
+  await a.sync();
+  a.fs.put('locked.md', 'locked\n');
+  const read = a.fs.read.bind(a.fs);
+  a.fs.read = async (path) => {
+    if (path === 'locked.md') throw new Error('EACCES: permission denied');
+    return read(path);
+  };
+  const r = await a.sync();
+  assert.deepEqual(r.errors, [{ path: 'locked.md', message: 'EACCES: permission denied' }]);
+});
+
+test('download progress never counts past its total', async () => {
+  const { devices: [a, b], net, clock } = setup();
+  a.fs.put('pic.bin', random(5000, 1));
+  await a.sync();
+  await b.sync();
+  a.fs.put('pic.bin', random(5000, 2));
+  b.fs.put('pic.bin', random(5000, 3));
+  await a.sync();
+  const seen: { done: number; total: number }[] = [];
+  b.engine = new SyncEngine({
+    fs: b.fs, store: net, stateStore: b.state, passphrase: 'test passphrase', config: b.config, now: () => clock.now,
+    onProgress: (p) => p.phase === 'download' && seen.push(p),
+  });
+  assert.equal((await b.sync()).conflictCopies.length, 1);
+  assert.ok(seen.length > 0);
+  for (const p of seen) assert.ok(p.done <= p.total, `${p.done} of ${p.total}`);
 });
