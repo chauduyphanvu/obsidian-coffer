@@ -1,8 +1,9 @@
 import { Modal, Notice, Platform, Plugin, PluginSettingTab, SecretComponent, Setting, SuggestModal, TFile, debounce, type App } from 'obsidian';
 import { DEFAULT_CONFIG, resolveConfig } from '../core/config.ts';
 import { openWithPassphrase, sealWithPassphrase } from '../core/crypto.ts';
-import { SafetyError, SyncEngine, type SyncResult, type Version } from '../core/engine.ts';
+import { SafetyError, SyncEngine, type SyncResult } from '../core/engine.ts';
 import { vaultKey } from '../core/paths.ts';
+import type { Version } from '../core/types.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
 import { ObsidianFS, PluginState, obsidianHttp } from './obsidianfs.ts';

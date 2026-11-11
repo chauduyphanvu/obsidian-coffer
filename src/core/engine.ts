@@ -1,9 +1,11 @@
-import { concat, pool } from './bytes.ts';
+import { pool } from './bytes.ts';
 import { worthCompressing } from './compress.ts';
 import { compileExcludes, type SyncConfig } from './config.ts';
 import { merge3 } from './merge.ts';
+import { Packer } from './packer.ts';
 import { conflictCopyName, ext, vaultKey } from './paths.ts';
 import { Repo } from './repo.ts';
+import { collectGarbage, listVersions } from './retention.ts';
 import { LocalState } from './state.ts';
 import {
   hasChunks,
@@ -17,6 +19,7 @@ import {
   type LocalFile,
   type RemoteStore,
   type StateStore,
+  type Version,
 } from './types.ts';
 
 export interface EngineOptions {
@@ -43,13 +46,6 @@ export interface SyncResult {
   rounds: number;
 }
 
-export interface Version {
-  seq: number;
-  time: number;
-  device: string;
-  entry: Entry | null;
-}
-
 /** Thrown instead of syncing when a sync would delete a suspiciously large share of the vault. */
 export class SafetyError extends Error {
   readonly localDeletes: number;
@@ -73,8 +69,6 @@ interface Prepared {
   entry: Entry;
 }
 
-const DAY = 86_400_000;
-const GC_GRACE = DAY;
 const MAX_ROUNDS = 5;
 const PULL_BATCH = 32 << 20;
 const MAX_RANGE = 8 << 20;
@@ -82,69 +76,6 @@ const MOVE_CACHE = 64 << 20;
 const OPTIMISTIC_BYTES = 256 << 10;
 
 const contentKey = (e: Entry) => e.chunks.map((c) => c.id).join(',');
-
-class Packer {
-  private repo: Repo;
-  private target: number;
-  private solo: number;
-  private limit: number;
-  private parts: Uint8Array[] = [];
-  private size = 0;
-  private id: string;
-  private inflight = new Set<Promise<void>>();
-  private failure: unknown;
-
-  constructor(repo: Repo, target: number, solo: number, limit: number) {
-    this.repo = repo;
-    this.target = target;
-    this.solo = solo;
-    this.limit = limit;
-    this.id = repo.newPackId();
-  }
-
-  /** Synchronous so that two files racing on the same chunk cannot both add it. */
-  add(id: string, sealed: Uint8Array, size: number): ChunkRef {
-    // Large chunks get an object of their own, so deleting a big file frees its space
-    // without waiting for every small note that shared a pack with it to die too.
-    if (sealed.length >= this.solo) {
-      const pack = this.repo.newPackId();
-      this.upload(pack, sealed);
-      return { id, pack, off: 0, len: sealed.length, size };
-    }
-    const ref = { id, pack: this.id, off: this.size, len: sealed.length, size };
-    this.parts.push(sealed);
-    this.size += sealed.length;
-    if (this.size >= this.target) this.rotate();
-    return ref;
-  }
-
-  private rotate(): void {
-    this.upload(this.id, concat(this.parts));
-    this.parts = [];
-    this.size = 0;
-    this.id = this.repo.newPackId();
-  }
-
-  private upload(id: string, data: Uint8Array): void {
-    const p: Promise<void> = this.repo
-      .putPack(id, data)
-      .catch((e) => {
-        this.failure ??= e;
-      })
-      .finally(() => this.inflight.delete(p));
-    this.inflight.add(p);
-  }
-
-  async backpressure(): Promise<void> {
-    while (this.inflight.size >= this.limit) await Promise.race(this.inflight);
-  }
-
-  async flush(): Promise<void> {
-    if (this.size) this.rotate();
-    await Promise.all(this.inflight);
-    if (this.failure) throw this.failure;
-  }
-}
 
 export class SyncEngine {
   private o: EngineOptions;
@@ -681,34 +612,7 @@ export class SyncEngine {
   async history(path: string): Promise<Version[]> {
     const { repo, st } = await this.open();
     await this.fetchRemote();
-    const cutoff = this.now() - this.cfg.retentionDays * DAY;
-    const n = this.cfg.snapshotEvery;
-    const out: Version[] = [];
-    // Walk back one snapshot interval at a time: a whole interval is one request when its digest exists.
-    for (let hi = st.lastSeq; hi > 0; ) {
-      const lo = hi % n === 0 ? hi - n + 1 : hi - (hi % n) + 1;
-      let commits = hi % n === 0 ? await repo.readDigest(hi, n) : null;
-      if (!commits) {
-        const block: (Commit | null)[] = new Array(hi - lo + 1);
-        await pool(block, this.cfg.concurrency, async (_, i) => {
-          block[i] = await repo.readCommit(lo + i);
-        });
-        commits = block.filter((c): c is Commit => !!c);
-      }
-      let expired = false;
-      for (const c of commits.reverse()) {
-        const ch = c.changes.find((x) => x.path === path);
-        if (ch) out.push({ seq: c.seq, time: c.time, device: c.device, entry: ch.entry });
-        // Versions older than the window may already have been cleaned up, so stop at the first such commit.
-        if (c.time < cutoff) {
-          expired = true;
-          break;
-        }
-      }
-      if (expired) break;
-      hi = lo - 1;
-    }
-    return out;
+    return listVersions(repo, st.lastSeq, path, this.cfg, this.now());
   }
 
   async readVersion(entry: Entry): Promise<Uint8Array> {
@@ -725,46 +629,10 @@ export class SyncEngine {
     return out;
   }
 
-  /**
-   * Deletes packs that no version inside the retention window refers to, and snapshots older
-   * than that window. Packs younger than a day are kept: a device may still be about to commit them.
-   */
+  /** Deletes stored data that no version inside the retention window needs. */
   async gc(): Promise<{ packsDeleted: number; bytesFreed: number; snapshotsDeleted: number }> {
     const { repo, st } = await this.open();
     await this.fetchRemote();
-    const now = this.now();
-    const cutoff = now - this.cfg.retentionDays * DAY;
-    const snaps = await repo.snapshots();
-    const floor = snaps.filter((s) => s.modified <= cutoff).pop();
-    const live = new Set<string>();
-    const mark = (e: Entry | null) => e?.chunks.forEach((c) => live.add(c.pack));
-    for (const e of st.remote.values()) mark(e);
-    if (floor) {
-      const files = await repo.readSnapshot(floor.seq);
-      if (!files) throw new Error(`Snapshot ${floor.seq} cannot be read`);
-      for (const e of files.values()) mark(e);
-    }
-    const seqs = Array.from({ length: st.lastSeq - (floor?.seq ?? 0) }, (_, i) => (floor?.seq ?? 0) + 1 + i);
-    await pool(seqs, this.cfg.concurrency, async (seq) => {
-      const c = await repo.readCommit(seq);
-      if (!c) throw new Error(`Commit ${seq} cannot be read`);
-      for (const ch of c.changes) mark(ch.entry);
-    });
-
-    const result = { packsDeleted: 0, bytesFreed: 0, snapshotsDeleted: 0 };
-    const dead = (await repo.listPacks()).filter((o) => !live.has(o.id) && o.modified < now - GC_GRACE);
-    await pool(dead, this.cfg.concurrency, async (o) => {
-      await repo.deletePack(o.id);
-      result.packsDeleted++;
-      result.bytesFreed += o.size;
-    });
-    if (floor) {
-      for (const s of snaps) {
-        if (s.seq >= floor.seq) break;
-        await repo.deleteSnapshot(s.seq);
-        result.snapshotsDeleted++;
-      }
-    }
-    return result;
+    return collectGarbage(repo, st, this.cfg, this.now());
   }
 }

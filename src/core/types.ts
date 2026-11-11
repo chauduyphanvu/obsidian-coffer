@@ -26,6 +26,13 @@ export interface Commit {
   changes: Change[];
 }
 
+export interface Version {
+  seq: number;
+  time: number;
+  device: string;
+  entry: Entry | null;
+}
+
 export interface ObjectInfo {
   key: string;
   size: number;
