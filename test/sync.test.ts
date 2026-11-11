@@ -1,0 +1,412 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { SafetyError } from '../src/core/engine.ts';
+import { MemoryStore } from '../src/stores/memory.ts';
+import { rng, SimStore } from '../src/testing/netsim.ts';
+import { Device } from './helpers.ts';
+
+const DAY = 86_400_000;
+
+function setup(names = ['A', 'B'], config = {}) {
+  const clock = { now: 1_800_000_000_000 };
+  const mem = new MemoryStore(() => clock.now);
+  const net = new SimStore(mem);
+  const devices = names.map((n) => new Device(n, net, clock, config));
+  return { clock, mem, net, devices };
+}
+
+const random = (n: number, seed: number) => {
+  const r = rng(seed);
+  return Uint8Array.from({ length: n }, () => (r() * 256) | 0);
+};
+
+test('create, edit and delete travel between devices', async () => {
+  const { devices: [a, b] } = setup();
+  a.fs.put('notes/one.md', 'hello\n');
+  a.fs.put('img/pic.png', random(50_000, 1));
+  a.fs.put('empty.md', '');
+  await a.sync();
+  const r = await b.sync();
+  assert.equal(r.pulled, 3);
+  assert.deepEqual(b.snapshot(), a.snapshot());
+  assert.equal(b.fs.files.get('notes/one.md')!.mtime, a.fs.files.get('notes/one.md')!.mtime);
+
+  b.fs.put('notes/one.md', 'hello\nworld\n');
+  await b.sync();
+  await a.sync();
+  assert.equal(a.fs.text('notes/one.md'), 'hello\nworld\n');
+
+  a.fs.files.delete('img/pic.png');
+  assert.equal((await a.sync()).deletedRemote, 1);
+  assert.equal((await b.sync()).deletedLocal, 1);
+  assert.deepEqual(b.snapshot(), a.snapshot());
+});
+
+test('a sync with nothing to do costs two empty reads, and a small edit two writes', async () => {
+  const { devices: [a, b], net } = setup();
+  a.fs.put('a.md', 'x\n');
+  await a.sync();
+  await b.sync();
+  net.reset();
+  await a.sync();
+  assert.deepEqual(net.stats, { get: 2, put: 0, list: 0, delete: 0, up: 0, down: 0 });
+  a.fs.put('a.md', 'x\ny\n');
+  net.reset();
+  await a.sync();
+  assert.equal(net.stats.get + net.stats.list, 0);
+  assert.equal(net.stats.put, 2);
+  net.reset();
+  await b.sync();
+  assert.equal(b.fs.text('a.md'), 'x\ny\n');
+  assert.equal(net.stats.get, 3);
+});
+
+test('nothing readable is stored remotely', async () => {
+  const { devices: [a], mem } = setup();
+  a.fs.put('Secret Project/plan.md', 'the launch code is swordfish\n'.repeat(20));
+  await a.sync();
+  for (const [key, o] of mem.objects) {
+    const text = Buffer.from(o.data).toString('latin1');
+    assert.ok(!/Secret|plan\.md|swordfish/.test(key + text), key);
+  }
+});
+
+test('edits to different parts of a note merge', async () => {
+  const { devices: [a, b] } = setup();
+  a.fs.put('n.md', '# Title\n\none\n\ntwo\n\nthree\n');
+  await a.sync();
+  await b.sync();
+  a.fs.put('n.md', '# Title\n\nONE\n\ntwo\n\nthree\n');
+  b.fs.put('n.md', '# Title\n\none\n\ntwo\n\nthree\n\nfour\n');
+  await a.sync();
+  const r = await b.sync();
+  assert.equal(r.merged, 1);
+  assert.deepEqual(r.conflictCopies, []);
+  await a.sync();
+  assert.equal(a.fs.text('n.md'), '# Title\n\nONE\n\ntwo\n\nthree\n\nfour\n');
+  assert.deepEqual(b.snapshot(), a.snapshot());
+});
+
+test('overlapping edits keep both versions', async () => {
+  const { devices: [a, b] } = setup();
+  a.fs.put('n.md', 'line\n');
+  await a.sync();
+  await b.sync();
+  a.fs.put('n.md', 'from A\n');
+  b.fs.put('n.md', 'from B\n');
+  await a.sync();
+  const r = await b.sync();
+  assert.equal(r.conflictCopies.length, 1);
+  await a.sync();
+  assert.deepEqual(b.snapshot(), a.snapshot());
+  assert.equal(a.fs.text('n.md'), 'from A\n');
+  assert.equal(a.fs.text(r.conflictCopies[0]), 'from B\n');
+  assert.match(r.conflictCopies[0], /^n \(conflict B \d{8}-\d{6}\)\.md$/);
+});
+
+test('binary files and the copy strategy never merge', async () => {
+  const { devices: [a, b] } = setup(['A', 'B'], { conflictStrategy: 'copy' });
+  a.fs.put('n.md', 'a\nb\nc\n');
+  a.fs.put('p.png', random(1000, 1));
+  await a.sync();
+  await b.sync();
+  a.fs.put('n.md', 'A\nb\nc\n');
+  b.fs.put('n.md', 'a\nb\nC\n');
+  a.fs.put('p.png', random(1000, 2));
+  b.fs.put('p.png', random(1000, 3));
+  await a.sync();
+  const r = await b.sync();
+  assert.equal(r.merged, 0);
+  assert.equal(r.conflictCopies.length, 2);
+  await a.sync();
+  assert.deepEqual(b.snapshot(), a.snapshot());
+  assert.equal(Object.keys(a.snapshot()).length, 4);
+});
+
+test('an edit beats a delete, in both directions', async () => {
+  const { devices: [a, b] } = setup();
+  a.fs.put('x.md', 'x\n');
+  a.fs.put('y.md', 'y\n');
+  await a.sync();
+  await b.sync();
+  a.fs.files.delete('x.md');
+  b.fs.put('x.md', 'x\nedited on B\n');
+  a.fs.put('y.md', 'y\nedited on A\n');
+  b.fs.files.delete('y.md');
+  await a.sync();
+  await b.sync();
+  await a.sync();
+  assert.equal(a.fs.text('x.md'), 'x\nedited on B\n');
+  assert.equal(b.fs.text('y.md'), 'y\nedited on A\n');
+  assert.deepEqual(b.snapshot(), a.snapshot());
+});
+
+test('a moved folder is applied on the other device without downloading it again', async () => {
+  const { devices: [a, b], net } = setup();
+  for (let i = 0; i < 40; i++) a.fs.put(`old/n${i}.md`, `note ${i}\n`.repeat(50));
+  await a.sync();
+  await b.sync();
+  for (const [path, f] of [...a.fs.files]) {
+    a.fs.files.delete(path);
+    a.fs.files.set(path.replace('old/', 'new/'), f);
+  }
+  net.reset();
+  await a.sync();
+  assert.equal(net.stats.put, 1, 'only the commit is uploaded');
+  net.reset();
+  const r = await b.sync();
+  assert.equal(r.pulled, 40);
+  assert.equal(r.deletedLocal, 40);
+  assert.equal(net.stats.down < 5000, true, `downloaded ${net.stats.down} bytes`);
+  assert.deepEqual(b.snapshot(), a.snapshot());
+});
+
+test('a small change to a large file uploads only the chunks around it', async () => {
+  const { devices: [a, b], net } = setup();
+  const big = random(3_000_000, 5);
+  a.fs.put('big.bin', big);
+  await a.sync();
+  await b.sync();
+  const edited = new Uint8Array(big.length + 10);
+  edited.set(big.subarray(0, 1_500_000));
+  edited.set(big.subarray(1_500_000), 1_500_010);
+  a.fs.put('big.bin', edited);
+  net.reset();
+  await a.sync();
+  assert.ok(net.stats.up < 200_000, `uploaded ${net.stats.up} bytes`);
+  net.reset();
+  await b.sync();
+  assert.ok(net.stats.down < 200_000, `downloaded ${net.stats.down} bytes`);
+  assert.deepEqual(b.fs.files.get('big.bin')!.data, edited);
+});
+
+test('identical content is stored once', async () => {
+  const { devices: [a], net } = setup();
+  const data = random(200_000, 9);
+  a.fs.put('one.bin', data);
+  a.fs.put('two.bin', data);
+  await a.sync();
+  assert.ok(net.stats.up < 230_000, `uploaded ${net.stats.up} bytes`);
+});
+
+test('first sync of two devices that already hold the same files transfers no file data', async () => {
+  const { devices: [a, b], net } = setup();
+  for (const d of [a, b]) {
+    d.fs.put('same.md', 'same\n');
+    d.fs.put('pic.png', random(100_000, 4));
+  }
+  b.fs.put('differs.md', 'B version\n');
+  a.fs.put('differs.md', 'A version\n');
+  await a.sync();
+  net.reset();
+  const r = await b.sync();
+  assert.equal(r.conflictCopies.length, 1);
+  assert.ok(net.stats.down < 5000 && net.stats.up < 5000, JSON.stringify(net.stats));
+  await a.sync();
+  assert.deepEqual(b.snapshot(), a.snapshot());
+});
+
+test('a sync that would wipe most of the vault is refused unless forced', async () => {
+  const { devices: [a, b] } = setup();
+  for (let i = 0; i < 30; i++) a.fs.put(`n${i}.md`, `${i}\n`);
+  await a.sync();
+  await b.sync();
+  const saved = new Map(a.fs.files);
+  a.fs.files.clear(); // e.g. the vault folder failed to mount
+  await assert.rejects(a.sync(), SafetyError);
+  a.fs.files = saved;
+  await a.sync();
+  await b.sync();
+  assert.equal(b.fs.files.size, 30);
+
+  a.fs.files.clear();
+  await a.sync(true);
+  await assert.rejects(b.sync(), SafetyError);
+  await b.sync(true);
+  assert.equal(b.fs.files.size, 0);
+});
+
+test('losing the local state file loses nothing', async () => {
+  const { devices: [a, b] } = setup();
+  a.fs.put('a.md', 'a\n');
+  a.fs.put('b.md', 'b\n');
+  await a.sync();
+  await b.sync();
+  b.state.data = null;
+  b.restart();
+  b.fs.put('b.md', 'b\nmore\n');
+  a.fs.put('c.md', 'c\n');
+  await a.sync();
+  const r = await b.sync();
+  assert.equal(r.pulled, 2); // c.md, plus A's b.md while B's own edit moves to a conflict copy
+  assert.equal(r.conflictCopies.length, 1);
+  await a.sync();
+  await b.sync();
+  assert.deepEqual(b.snapshot(), a.snapshot());
+  assert.ok(Object.values(a.snapshot()).some((v) => Buffer.from(v, 'base64').toString() === 'b\nmore\n'));
+});
+
+test('file names are matched across Unicode normal forms', async () => {
+  const { devices: [a, b] } = setup();
+  const nfd = 'Tiếng Việt.md'.normalize('NFD');
+  a.fs.put(nfd, 'xin chào\n');
+  await a.sync();
+  await b.sync();
+  assert.equal(b.fs.text('Tiếng Việt.md'.normalize('NFC')), 'xin chào\n');
+  b.fs.put('Tiếng Việt.md'.normalize('NFC'), 'xin chào\ntạm biệt\n');
+  await b.sync();
+  await a.sync();
+  assert.equal(a.fs.files.size, 1);
+  assert.equal(a.fs.text(nfd), 'xin chào\ntạm biệt\n');
+});
+
+test('excluded and oversized files stay local', async () => {
+  const { devices: [a, b] } = setup(['A', 'B'], { exclude: ['.obsidian/workspace*.json', 'private/'], maxFileSizeMB: 1 });
+  a.fs.put('.obsidian/workspace.json', '{}');
+  a.fs.put('.obsidian/app.json', '{}');
+  a.fs.put('private/diary.md', 'x');
+  a.fs.put('huge.bin', new Uint8Array(2 << 20));
+  await a.sync();
+  await b.sync();
+  assert.deepEqual(Object.keys(b.snapshot()), ['.obsidian/app.json']);
+});
+
+test('a new device starts from a snapshot instead of replaying the whole log', async () => {
+  const { devices: [a], net, clock } = setup(['A'], { snapshotEvery: 10 });
+  for (let i = 0; i < 35; i++) {
+    a.fs.put(`n${i % 7}.md`, `rev ${i}\n`);
+    await a.sync();
+  }
+  const c = new Device('C', net, clock, { snapshotEvery: 10 });
+  net.reset();
+  await c.sync();
+  assert.deepEqual(c.snapshot(), a.snapshot());
+  assert.ok(net.stats.get < 20, `${net.stats.get} GETs`);
+});
+
+test('history lists versions and an old one can be read back', async () => {
+  const { devices: [a], clock } = setup();
+  for (const text of ['v1\n', 'v2\n', 'v3\n']) {
+    a.fs.put('n.md', text);
+    await a.sync();
+    clock.now += 60_000;
+  }
+  a.fs.files.delete('n.md');
+  await a.sync();
+  const versions = await a.engine.history('n.md');
+  assert.deepEqual(versions.map((v) => v.seq), [4, 3, 2, 1]);
+  assert.equal(versions[0].entry, null);
+  assert.equal(new TextDecoder().decode(await a.engine.readVersion(versions[2].entry!)), 'v2\n');
+});
+
+test('cleanup removes only data that no version inside the retention window needs', async () => {
+  const { devices: [a, b], mem, clock } = setup(['A', 'B'], { snapshotEvery: 2, retentionDays: 7, packMaxBlobBytes: 4096 });
+  a.fs.put('keep.md', 'keep\n');
+  a.fs.put('old.bin', random(300_000, 1));
+  await a.sync();
+  clock.now += DAY;
+  a.fs.put('old.bin', random(300_000, 2));
+  await a.sync();
+  const packs = () => [...mem.objects.keys()].filter((k) => k.startsWith('pack/')).length;
+  const before = packs();
+
+  assert.equal((await a.engine.gc()).packsDeleted, 0, 'the first version is still inside the window');
+  clock.now += 3 * DAY;
+  a.fs.put('later.md', 'later\n');
+  await a.sync();
+  a.fs.put('later.md', 'later 2\n');
+  await a.sync(); // commit 4 writes a snapshot that will become the floor
+  clock.now += 10 * DAY;
+  const r = await a.engine.gc();
+  assert.ok(r.packsDeleted >= 1 && r.bytesFreed >= 300_000, JSON.stringify(r));
+  assert.ok(packs() < before + 2);
+
+  await b.sync();
+  assert.deepEqual(b.snapshot(), a.snapshot());
+
+  a.fs.put('fresh.bin', random(10_000, 3));
+  await a.sync();
+  a.fs.files.delete('fresh.bin');
+  await a.sync();
+  assert.equal((await a.engine.gc()).packsDeleted, 0, 'recent packs are never collected');
+});
+
+test('remote corruption is detected, not written into the vault', async () => {
+  const { devices: [a, b], mem } = setup();
+  a.fs.put('n.md', 'important\n'.repeat(100));
+  await a.sync();
+  for (const [key, o] of mem.objects) if (key.startsWith('pack/')) o.data[o.data.length >> 1] ^= 0xff;
+  await assert.rejects(b.sync(), /authentication/);
+  assert.equal(b.fs.files.size, 0);
+});
+
+test('a wrong passphrase is reported as such', async () => {
+  const { devices: [a], net, clock } = setup();
+  a.fs.put('n.md', 'x');
+  await a.sync();
+  const b = new Device('B', net, clock);
+  (b as unknown as { engine: unknown }).engine = new (await import('../src/core/engine.ts')).SyncEngine({
+    fs: b.fs, store: net, stateStore: b.state, passphrase: 'not it', config: b.config,
+  });
+  await assert.rejects(b.sync(), /Wrong passphrase/);
+});
+
+test('three devices committing at once all converge', async () => {
+  const { devices } = setup(['A', 'B', 'C']);
+  const [a, b, c] = devices;
+  a.fs.put('shared.md', 'top\n\nmiddle\n\nbottom\n');
+  await a.sync();
+  await Promise.all([b.sync(), c.sync()]);
+  a.fs.put('a.md', 'a\n');
+  b.fs.put('b.md', 'b\n');
+  c.fs.put('c.md', 'c\n');
+  a.fs.put('shared.md', 'TOP\n\nmiddle\n\nbottom\n');
+  c.fs.put('shared.md', 'top\n\nmiddle\n\nBOTTOM\n');
+  await Promise.all(devices.map((d) => d.sync()));
+  for (let i = 0; i < 2; i++) for (const d of devices) await d.sync();
+  assert.deepEqual(b.snapshot(), a.snapshot());
+  assert.deepEqual(c.snapshot(), a.snapshot());
+  assert.equal(a.fs.text('shared.md'), 'TOP\n\nmiddle\n\nBOTTOM\n');
+  assert.equal(a.fs.files.size, 4);
+});
+
+test('a commit whose confirmation is lost is recognised as our own, not as a conflict', async () => {
+  const { devices: [a, b], net } = setup();
+  a.fs.put('n.md', 'one\n');
+  await a.sync();
+  await b.sync();
+  const put = net.put.bind(net);
+  let lied = false;
+  net.put = async (key, data, opts) => {
+    const ok = await put(key, data, opts);
+    if (ok && opts?.ifNoneMatch && key.startsWith('log/') && !lied) {
+      lied = true;
+      return false; // stored, but the caller is told it was not (a retried request after a dropped reply)
+    }
+    return ok;
+  };
+  a.fs.put('n.md', 'one\ntwo\n');
+  a.fs.put('new.md', 'new\n');
+  const r = await a.sync();
+  assert.ok(lied);
+  assert.deepEqual(r.conflictCopies, []);
+  assert.deepEqual(r.errors, []);
+  await b.sync();
+  await a.sync();
+  assert.deepEqual(b.snapshot(), a.snapshot());
+  assert.deepEqual(Object.keys(a.snapshot()), ['n.md', 'new.md']);
+  assert.equal(b.fs.text('n.md'), 'one\ntwo\n');
+});
+
+test('a file that was only touched does not stop remote changes from arriving', async () => {
+  const { devices: [a, b] } = setup();
+  a.fs.put('n.md', 'one\n');
+  await a.sync();
+  await b.sync();
+  a.fs.put('other.md', 'from A\n');
+  await a.sync();
+  b.fs.put('n.md', 'one\n'); // same content, new timestamp
+  const r = await b.sync();
+  assert.equal(r.pushed, 0);
+  assert.equal(b.fs.text('other.md'), 'from A\n');
+});

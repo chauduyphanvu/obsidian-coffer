@@ -1,0 +1,9 @@
+{
+  "id": "self-sync",
+  "name": "Self Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.11.4",
+  "description": "End-to-end encrypted vault sync to storage you control (any S3-compatible bucket).",
+  "author": "",
+  "isDesktopOnly": false
+}
