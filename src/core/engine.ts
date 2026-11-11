@@ -2,6 +2,7 @@ import { concat, pool } from './bytes.ts';
 import { worthCompressing } from './compress.ts';
 import { compileExcludes, type SyncConfig } from './config.ts';
 import { merge3 } from './merge.ts';
+import { conflictCopyName, ext, vaultKey } from './paths.ts';
 import { Repo } from './repo.ts';
 import { LocalState } from './state.ts';
 import {
@@ -81,10 +82,6 @@ const MOVE_CACHE = 64 << 20;
 const OPTIMISTIC_BYTES = 256 << 10;
 
 const contentKey = (e: Entry) => e.chunks.map((c) => c.id).join(',');
-const ext = (path: string) => {
-  const dot = path.lastIndexOf('.');
-  return dot > path.lastIndexOf('/') ? path.slice(dot + 1).toLowerCase() : '';
-};
 
 class Packer {
   private repo: Repo;
@@ -238,8 +235,7 @@ export class SyncEngine {
     const maxSize = this.cfg.maxFileSizeMB * (1 << 20) || Infinity;
     const local = new Map<string, Local>();
     for (const f of await this.o.fs.list()) {
-      // Paths are compared in NFC so the same name typed on macOS and elsewhere is one file.
-      const key = f.path.normalize('NFC');
+      const key = vaultKey(f.path);
       if (this.excluded(key) || f.size > maxSize || local.has(key)) continue;
       local.set(key, { ...f, key });
     }
@@ -496,13 +492,9 @@ export class SyncEngine {
     }
 
     // Keep both: this device's version moves aside, the remote version takes the original name.
-    const d = new Date(this.now());
-    const two = (n: number) => String(n).padStart(2, '0');
-    const stamp = `${d.getFullYear()}${two(d.getMonth() + 1)}${two(d.getDate())}-${two(d.getHours())}${two(d.getMinutes())}${two(d.getSeconds())}`;
-    const device = this.cfg.deviceName.replace(/[^\w-]+/g, '_');
-    const dot = key.lastIndexOf('.') > key.lastIndexOf('/') ? key.lastIndexOf('.') : key.length;
-    let copy = `${key.slice(0, dot)} (conflict ${device} ${stamp})${key.slice(dot)}`;
-    for (let n = 2; await fs.stat(copy); n++) copy = `${key.slice(0, dot)} (conflict ${device} ${stamp} ${n})${key.slice(dot)}`;
+    const at = new Date(this.now());
+    let copy = conflictCopyName(key, this.cfg.deviceName, at);
+    for (let n = 2; await fs.stat(copy); n++) copy = conflictCopyName(key, this.cfg.deviceName, at, n);
     const copyStat = await fs.write(copy, mine, l.mtime);
     await writeRemote(key, r, await this.readVersion(r));
     res.conflictCopies.push(copy);

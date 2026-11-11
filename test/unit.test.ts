@@ -4,6 +4,7 @@ import { cutPoints } from '../src/core/chunker.ts';
 import { compileExcludes } from '../src/core/config.ts';
 import { chunkId, createKeys, open, seal, unlockKeys, WrongPassphraseError } from '../src/core/crypto.ts';
 import { merge3 } from '../src/core/merge.ts';
+import { conflictCopyName, ext, vaultKey } from '../src/core/paths.ts';
 import { checkStore } from '../src/stores/doctor.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
 import { sign } from '../src/stores/sigv4.ts';
@@ -158,4 +159,16 @@ test('setup codes open only with the right passphrase', async () => {
   assert.equal(await openWithPassphrase(code, 'pass', 1000), '{"bucket":"b","secret":"s3cr3t"}');
   await assert.rejects(openWithPassphrase(code, 'nope', 1000), WrongPassphraseError);
   await assert.rejects(openWithPassphrase('not a code!', 'pass', 1000), /not a valid setup code/);
+});
+
+test('path rules: extensions, conflict copy names, Unicode forms', () => {
+  assert.equal(ext('Notes/Photo.JPG'), 'jpg');
+  assert.equal(ext('dir.v2/README'), '');
+  assert.equal(ext('file.'), '');
+  assert.equal(ext('.gitignore'), 'gitignore');
+  const at = new Date(2026, 0, 2, 15, 4, 5);
+  assert.equal(conflictCopyName('notes/a.md', 'B laptop/1', at), 'notes/a (conflict B_laptop_1 20260102-150405).md');
+  assert.equal(conflictCopyName('notes/a.md', 'B', at, 2), 'notes/a (conflict B 20260102-150405 2).md');
+  assert.equal(conflictCopyName('dir.v2/README', 'B', at), 'dir.v2/README (conflict B 20260102-150405)');
+  assert.equal(vaultKey('Cafe\u0301.md'), 'Caf\u00e9.md');
 });

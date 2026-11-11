@@ -1,3 +1,5 @@
+import { ext } from './paths.ts';
+
 const bp = (u: Uint8Array) => u as unknown as BlobPart;
 
 async function pipe(data: Uint8Array, stream: CompressionStream | DecompressionStream): Promise<Uint8Array> {
@@ -13,6 +15,5 @@ const INCOMPRESSIBLE = new Set(
 
 export function worthCompressing(path: string, size: number): boolean {
   if (size < 256) return false;
-  const dot = path.lastIndexOf('.');
-  return dot < 0 || !INCOMPRESSIBLE.has(path.slice(dot + 1).toLowerCase());
+  return !INCOMPRESSIBLE.has(ext(path));
 }

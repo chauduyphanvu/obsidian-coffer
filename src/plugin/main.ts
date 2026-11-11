@@ -2,6 +2,7 @@ import { Modal, Notice, Platform, Plugin, PluginSettingTab, SecretComponent, Set
 import { DEFAULT_CONFIG, resolveConfig } from '../core/config.ts';
 import { openWithPassphrase, sealWithPassphrase } from '../core/crypto.ts';
 import { SafetyError, SyncEngine, type SyncResult, type Version } from '../core/engine.ts';
+import { vaultKey } from '../core/paths.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
 import { ObsidianFS, PluginState, obsidianHttp } from './obsidianfs.ts';
@@ -371,7 +372,7 @@ export default class SelfSyncPlugin extends Plugin {
   private async showHistory(path: string): Promise<void> {
     try {
       const notice = new Notice('Loading version history…', 0);
-      const versions = await this.getEngine().history(path.normalize('NFC'));
+      const versions = await this.getEngine().history(vaultKey(path));
       notice.hide();
       if (!versions.length) new Notice('No stored versions of this file.');
       else new HistoryModal(this.app, this, path, versions).open();
