@@ -1,74 +1,25 @@
 import { Notice, Platform, Plugin, TFile, debounce } from 'obsidian';
-import { DEFAULT_CONFIG, resolveConfig } from '../core/config.ts';
-import { openWithPassphrase, sealWithPassphrase } from '../core/crypto.ts';
 import { SafetyError, SyncEngine, type SyncResult } from '../core/engine.ts';
 import { vaultKey } from '../core/paths.ts';
 import type { Version } from '../core/types.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
 import { ObsidianFS, PluginState, obsidianHttp } from './obsidianfs.ts';
+import {
+  cleanupDue,
+  decodeSetupCode,
+  defaultSettings,
+  encodeSetupCode,
+  hasStorageAddress,
+  isConfigured,
+  remoteSpec,
+  statePath,
+  syncConfig,
+  type Settings,
+} from './settings.ts';
 import { HistoryModal, SettingsTab } from './views.ts';
 
-export interface Settings {
-  storageType: 's3' | 'webdav';
-  webdavUrl: string;
-  webdavUser: string;
-  webdavPasswordSecret: string;
-  endpoint: string;
-  region: string;
-  bucket: string;
-  prefix: string;
-  pathStyle: boolean;
-  /** Names of entries in Obsidian's secret storage; the values never touch the vault. */
-  accessKeySecret: string;
-  secretKeySecret: string;
-  passphraseSecret: string;
-  deviceName: string;
-  syncOnStart: boolean;
-  intervalMinutes: number;
-  changeDelaySeconds: number;
-  /** How often to ask the storage whether another device has synced. 0 turns it off. */
-  pollSeconds: number;
-  /** Expired versions are removed this often. 0 leaves it to the manual command. */
-  autoCleanDays: number;
-  lastCleanup: number;
-  syncConfigDir: boolean;
-  exclude: string;
-  conflictStrategy: 'merge' | 'copy';
-  retentionDays: number;
-  maxFileSizeMB: number;
-  concurrency: number;
-  compression: boolean;
-}
-
-const DEFAULTS: Settings = {
-  storageType: 's3',
-  webdavUrl: '',
-  webdavUser: '',
-  webdavPasswordSecret: '',
-  endpoint: '',
-  region: 'auto',
-  bucket: '',
-  prefix: 'vault',
-  pathStyle: true,
-  accessKeySecret: '',
-  secretKeySecret: '',
-  passphraseSecret: '',
-  deviceName: '',
-  syncOnStart: true,
-  intervalMinutes: 5,
-  changeDelaySeconds: 5,
-  pollSeconds: 30,
-  autoCleanDays: 7,
-  lastCleanup: 0,
-  syncConfigDir: true,
-  exclude: '',
-  conflictStrategy: DEFAULT_CONFIG.conflictStrategy,
-  retentionDays: DEFAULT_CONFIG.retentionDays,
-  maxFileSizeMB: Platform.isMobile ? 200 : DEFAULT_CONFIG.maxFileSizeMB,
-  concurrency: DEFAULT_CONFIG.concurrency,
-  compression: DEFAULT_CONFIG.compression,
-};
+const DEFAULTS = defaultSettings(Platform.isMobile);
 
 const summarize = (r: SyncResult) => {
   const parts = [
@@ -186,32 +137,11 @@ export default class SelfSyncPlugin extends Plugin {
   }
 
   configured(): boolean {
-    const s = this.settings;
-    const storage =
-      s.storageType === 'webdav'
-        ? s.webdavUrl && s.webdavUser && this.secret(s.webdavPasswordSecret)
-        : s.endpoint && s.bucket && this.secret(s.accessKeySecret) && this.secret(s.secretKeySecret);
-    return !!(storage && this.secret(s.passphraseSecret));
+    return isConfigured(this.settings, (name) => this.secret(name));
   }
 
   private store() {
-    const s = this.settings;
-    if (s.storageType === 'webdav') {
-      return openRemote({ type: 'webdav', url: s.webdavUrl.trim(), username: s.webdavUser, password: this.secret(s.webdavPasswordSecret) }, obsidianHttp);
-    }
-    return openRemote(
-      {
-        type: 's3',
-        endpoint: s.endpoint.trim(),
-        region: s.region.trim() || 'auto',
-        bucket: s.bucket.trim(),
-        prefix: s.prefix,
-        pathStyle: s.pathStyle,
-        accessKey: this.secret(s.accessKeySecret),
-        secretKey: this.secret(s.secretKeySecret),
-      },
-      obsidianHttp,
-    );
+    return openRemote(remoteSpec(this.settings, (name) => this.secret(name)), obsidianHttp);
   }
 
   getEngine(): SyncEngine {
@@ -223,23 +153,9 @@ export default class SelfSyncPlugin extends Plugin {
       this.engine = new SyncEngine({
         fs: this.fs,
         store: this.store(),
-        stateStore: new PluginState(this.app, `${own}/state.json`),
+        stateStore: new PluginState(this.app, statePath(own)),
         passphrase: this.secret(s.passphraseSecret),
-        config: resolveConfig({
-          deviceName: s.deviceName,
-          exclude: [
-            ...DEFAULT_CONFIG.exclude.map((p) => p.replace(/^\.obsidian\//, `${dir}/`)),
-            // Device-specific. The plugin's code itself does sync, so an update reaches every device.
-            `${own}/state.json`,
-            `${own}/data.json`,
-            ...s.exclude.split('\n'),
-          ],
-          conflictStrategy: s.conflictStrategy,
-          retentionDays: s.retentionDays,
-          maxFileSizeMB: s.maxFileSizeMB,
-          concurrency: s.concurrency,
-          compression: s.compression,
-        }),
+        config: syncConfig(s, dir, own),
         onProgress: (p) => this.showProgress(`${p.phase === 'upload' ? 'Sending' : 'Receiving'} ${p.done.toLocaleString()} of ${p.total.toLocaleString()}`, p.total),
       });
     }
@@ -280,7 +196,7 @@ export default class SelfSyncPlugin extends Plugin {
       if (manual || r.conflictCopies.length) new Notice(`Sync: ${summarize(r)}`);
       for (const copy of r.conflictCopies) new Notice(`Both versions kept: ${copy}`, 15_000);
       const s = this.settings;
-      if (!r.errors.length && s.autoCleanDays > 0 && Date.now() - s.lastCleanup > s.autoCleanDays * 86_400_000) {
+      if (!r.errors.length && cleanupDue(s, Date.now())) {
         await this.getEngine().gc();
         s.lastCleanup = Date.now();
         await this.saveData(s);
@@ -306,34 +222,14 @@ export default class SelfSyncPlugin extends Plugin {
     }
   }
 
-  /** Storage settings and keys, encrypted under the vault passphrase, for pasting into another device. */
-  async exportSetupCode(): Promise<string> {
-    const s = this.settings;
-    const payload = {
-      storageType: s.storageType, endpoint: s.endpoint, region: s.region, bucket: s.bucket, prefix: s.prefix, pathStyle: s.pathStyle,
-      webdavUrl: s.webdavUrl, webdavUser: s.webdavUser,
-      accessKey: this.secret(s.accessKeySecret), secretKey: this.secret(s.secretKeySecret), webdavPassword: this.secret(s.webdavPasswordSecret),
-    };
-    return `selfsync1.${await sealWithPassphrase(JSON.stringify(payload), this.secret(s.passphraseSecret))}`;
+  exportSetupCode(): Promise<string> {
+    return encodeSetupCode(this.settings, (name) => this.secret(name));
   }
 
   async importSetupCode(code: string, passphrase: string): Promise<void> {
-    const body = code.trim().replace(/^selfsync1\./, '');
-    const p = JSON.parse(await openWithPassphrase(body, passphrase)) as Record<string, string | boolean>;
-    const s = this.settings;
-    const keep = (id: string, value: string | boolean) => {
-      if (value) this.app.secretStorage.setSecret(id, String(value));
-      return value ? id : '';
-    };
-    Object.assign(s, {
-      storageType: p.storageType === 'webdav' ? 'webdav' : 's3',
-      endpoint: p.endpoint, region: p.region, bucket: p.bucket, prefix: p.prefix, pathStyle: p.pathStyle,
-      webdavUrl: p.webdavUrl, webdavUser: p.webdavUser,
-      accessKeySecret: keep('self-sync-access-key', p.accessKey),
-      secretKeySecret: keep('self-sync-secret-key', p.secretKey),
-      webdavPasswordSecret: keep('self-sync-webdav-password', p.webdavPassword),
-      passphraseSecret: keep('self-sync-passphrase', passphrase),
-    });
+    const { settings, secrets } = await decodeSetupCode(code, passphrase);
+    for (const [id, value] of secrets) this.app.secretStorage.setSecret(id, value);
+    Object.assign(this.settings, settings);
     await this.saveSettings();
   }
 
@@ -345,8 +241,7 @@ export default class SelfSyncPlugin extends Plugin {
   }
 
   async checkStorage(): Promise<void> {
-    const s = this.settings;
-    if (s.storageType === 'webdav' ? !s.webdavUrl : !s.endpoint || !s.bucket) {
+    if (!hasStorageAddress(this.settings)) {
       new Notice('Fill in the storage address first.');
       return;
     }

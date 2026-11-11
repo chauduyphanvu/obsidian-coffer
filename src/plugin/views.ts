@@ -1,7 +1,7 @@
 import { Modal, Notice, PluginSettingTab, SecretComponent, Setting, SuggestModal, type App } from 'obsidian';
 import type { Version } from '../core/types.ts';
 import type SelfSyncPlugin from './main.ts';
-import type { Settings } from './main.ts';
+import type { Settings } from './settings.ts';
 
 export class HistoryModal extends SuggestModal<Version> {
   private plugin: SelfSyncPlugin;
