@@ -57,6 +57,29 @@ test('hints: each event goes to the place it is in, by its path there, and a fil
   assert.equal(log.take(work, 'edit', { folderMissing: true }), undefined);
 });
 
+test('hints: each event says which places it is in, so a place paused before a mass delete knows something in it changed', () => {
+  const work = shareWith({ id: 'w', folder: 'Work' });
+  const log = new ChangeLog(() => [work]);
+  assert.equal(log.file('a.md'), '');
+  assert.equal(log.file('Work/w.md'), 'w');
+  assert.deepEqual(log.folder('Notes', 'Work/Notes'), ['', 'w']);
+  assert.deepEqual(log.folder('Work'), ['w'], 'the shared folder itself is in its own place');
+});
+
+test('hints: an event in the other Unicode form than the shared folder\'s name names the file inside it, in the form it has on disk', () => {
+  const nfc = 'Café'.normalize('NFC');
+  const nfd = 'Café'.normalize('NFD');
+  for (const [stored, given] of [[nfc, nfd], [nfd, nfc]]) {
+    const cafe = shareWith({ id: 'c', folder: stored });
+    const log = new ChangeLog(() => [cafe]);
+    log.take(cafe, 'manual');
+    log.take(undefined, 'manual');
+    log.file(`${given}/${given}.md`);
+    assert.deepEqual(sorted(log.take(cafe, 'edit')), [`${given}.md`]);
+    assert.deepEqual(sorted(log.take(undefined, 'edit')), []);
+  }
+});
+
 test('hints: a folder renamed, moved or deleted makes the places it was and is in list, and every shared folder it is or holds', () => {
   const work = shareWith({ id: 'w', folder: 'Work' });
   const inner = shareWith({ id: 'i', folder: 'Work/Inner' });

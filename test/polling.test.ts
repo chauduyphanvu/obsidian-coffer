@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { nextPollDelay } from '../src/plugin/polling.ts';
+import type { Why } from '../src/plugin/changes.ts';
+import { Pauses, nextPollDelay, pollPlaces } from '../src/plugin/polling.ts';
 
 const S = 1000;
 const MIN = 60 * S;
@@ -35,4 +36,36 @@ test('the setting is never polled faster than every 5 seconds', () => {
 
 test('activity in the future, from a clock that moved back, counts as recent', () => {
   assert.equal(nextPollDelay(30, T + 10 * MIN, T), 5 * S);
+});
+
+test('a place paused before deleting many files is left out of every sync nobody asked for, until the user acts or something in it changes', () => {
+  const p = new Pauses();
+  p.pause('');
+  for (const why of ['poll', 'timer', 'resume', 'edit', 'start'] as Why[]) assert.equal(p.includes('', why), false, why);
+  assert.ok(p.includes('', 'manual'), 'a sync the user asks for tries it again');
+  assert.ok(p.includes('w', 'timer'), 'other places keep syncing');
+  p.lift('w');
+  assert.equal(p.includes('', 'edit'), false, 'a change elsewhere does not count');
+  p.lift('');
+  assert.ok(p.includes('', 'edit'), 'a change in it does');
+});
+
+test('a poll does not ask a paused place, so its storage, which keeps saying something changed, starts no sync and is no activity', async () => {
+  const p = new Pauses();
+  const asked: string[] = [];
+  const changed = (ids: string[]) => async (id: string) => {
+    asked.push(id);
+    return ids.includes(id);
+  };
+  p.pause('');
+  assert.equal(await pollPlaces(['', 'w'], p, changed(['', 'w'])), true, 'another place with changes still starts a sync');
+  assert.deepEqual(asked, ['w']);
+  asked.length = 0;
+  assert.equal(await pollPlaces(['', 'w'], p, changed([''])), false);
+  assert.deepEqual(asked, ['w']);
+  assert.equal(await pollPlaces(['', 'w'], p, async () => Promise.reject(new Error('offline'))), false, 'a place that can not be asked counts as unchanged');
+  p.lift('');
+  asked.length = 0;
+  assert.equal(await pollPlaces(['', 'w'], p, changed([''])), true);
+  assert.deepEqual(asked, ['']);
 });

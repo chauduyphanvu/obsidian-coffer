@@ -3,7 +3,7 @@ import { worthCompressing } from './compress.ts';
 import { copyChunks, placeKey, planCompaction } from './compact.ts';
 import { compileExcludes, type SyncConfig } from './config.ts';
 import { merge3, mergeJson } from './merge.ts';
-import { Packer } from './packer.ts';
+import { Packer, packRanges } from './packer.ts';
 import { conflictCopyName, ext, vaultKey } from './paths.ts';
 import { nothingToDo, planChanges, type Local, type Plan } from './plan.ts';
 import { Repo } from './repo.ts';
@@ -281,17 +281,18 @@ export class SyncEngine {
     this.unsaved = false;
   }
 
-  /** Brings the cached remote file table up to the newest commit. Returns the paths that changed. */
+  /**
+   * Brings the cached remote file table up to the newest commit. Returns the paths that changed. Each is
+   * put in `recheck` as it enters the table, so a request that fails later loses none of them.
+   */
   private async fetchRemote(): Promise<Set<string>> {
-    const touched = await this.fetchCommits();
-    for (const p of touched) this.recheck.add(p);
-    if (touched.size) this.unplanned = true;
-    return touched;
-  }
-
-  private async fetchCommits(): Promise<Set<string>> {
     const { repo, st } = await this.open();
     const touched = new Set<string>();
+    const touch = (p: string) => {
+      touched.add(p);
+      this.recheck.add(p);
+      this.unplanned = true;
+    };
     const add = (c: Commit) => {
       // A commit without `prev` comes from a version that did not chain the log. It is taken as it
       // is, and the chain restarts from it: the next chained commit names its digest like any other.
@@ -302,7 +303,7 @@ export class SyncEngine {
       // moves this device's merge base too, whose old place goes once no kept version records it.
       for (const { path, entry } of c.changes) {
         const was = st.remote.get(path);
-        if (!c.moved || !entry || !was || !sameContent(was, entry)) touched.add(path);
+        if (!c.moved || !entry || !was || !sameContent(was, entry)) touch(path);
         const s = c.moved && entry && st.synced.get(path);
         if (s && sameContent(s.entry, entry)) s.entry = entry;
       }
@@ -320,8 +321,8 @@ export class SyncEngine {
       if (snap.head !== undefined && snap.head !== at.hash) {
         throw new Error(`Remote snapshot ${latest.seq} was taken at a different commit ${latest.seq} than storage holds: the log was tampered with or forked`);
       }
-      for (const p of st.remote.keys()) touched.add(p);
-      for (const p of snap.files.keys()) touched.add(p);
+      for (const p of st.remote.keys()) touch(p);
+      for (const p of snap.files.keys()) touch(p);
       st.remote = snap.files;
       st.lastSeq = latest.seq;
       st.head = at.hash;
@@ -808,27 +809,9 @@ export class SyncEngine {
   /** Downloads and decrypts chunks, fetching neighbours in one pack with one request. `sink` gets each chunk once. */
   private async fetchChunks(refs: ChunkRef[], sink: (ref: ChunkRef, plain: Uint8Array) => void): Promise<void> {
     const { repo } = await this.open();
-    const byPack = new Map<string, ChunkRef[]>();
-    const seen = new Set<string>();
-    for (const ref of refs) {
-      if (seen.has(ref.id)) continue;
-      seen.add(ref.id);
-      let list = byPack.get(ref.pack);
-      if (!list) byPack.set(ref.pack, (list = []));
-      list.push(ref);
-    }
-    const ranges: { pack: string; start: number; end: number; refs: ChunkRef[] }[] = [];
-    for (const [pack, list] of byPack) {
-      list.sort((a, b) => a.off - b.off);
-      let cur: (typeof ranges)[number] | undefined;
-      for (const ref of list) {
-        if (cur && ref.off - cur.end <= this.cfg.rangeGapBytes && ref.off + ref.len - cur.start <= MAX_RANGE) {
-          cur.end = ref.off + ref.len;
-          cur.refs.push(ref);
-        } else ranges.push((cur = { pack, start: ref.off, end: ref.off + ref.len, refs: [ref] }));
-      }
-    }
-    await pool(ranges, this.cfg.concurrency, async (range) => {
+    const once = new Map<string, ChunkRef>();
+    for (const ref of refs) if (!once.has(ref.id)) once.set(ref.id, ref);
+    await pool(packRanges([...once.values()], this.cfg.rangeGapBytes, MAX_RANGE), this.cfg.concurrency, async (range) => {
       const data = await repo.getPackRange(range.pack, range.start, range.end);
       if (!data) throw new Error(`Remote pack ${range.pack} is missing`);
       // Decrypting and inflating run off the main thread, so one range's chunks need not queue behind each other.

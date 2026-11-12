@@ -1,5 +1,6 @@
 // Small building blocks for the plugin's screens, laid out to work at phone width.
 import { ButtonComponent, FuzzySuggestModal, TFile, type App, type TFolder } from 'obsidian';
+import { lookup } from './obsidianfs.ts';
 
 /** Picks one of the vault's folders, leaving out those `skip` refuses (given as "path/"). */
 export class FolderSuggest extends FuzzySuggestModal<TFolder> {
@@ -70,7 +71,7 @@ export function button(parent: HTMLElement, text: string, onClick: () => unknown
 
 /** A link that opens a vault file in a new tab, after `before` (which closes the dialog); nothing when the file is gone. */
 export function openLink(parent: HTMLElement, app: App, label: string, path: string, before: () => void): void {
-  const file = app.vault.getAbstractFileByPath(path);
+  const file = lookup(app, path);
   if (!(file instanceof TFile)) return;
   const a = parent.createEl('a', { cls: 'self-sync-open', text: label, href: '#' });
   a.addEventListener('click', (e) => {

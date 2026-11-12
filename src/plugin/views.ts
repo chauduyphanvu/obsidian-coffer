@@ -186,7 +186,10 @@ export class SettingsTab extends PluginSettingTab {
     number(what, 'Largest file (MB)', 'Larger files stay on this device and are listed as problems. 0 means no limit.', 'maxFileSizeMB', 0);
     new Setting(what)
       .setName('Leave out')
-      .setDesc('One pattern per line. * matches within a folder, ** across folders, a trailing / a whole folder.')
+      .setDesc(
+        'One pattern per line. * matches within a folder, ** across folders, a trailing / a whole folder. ' +
+          'Files and folders whose name starts with a dot, which Obsidian does not show, are always left out on this device; the settings folder has its own switch above.',
+      )
       .addTextArea((t) =>
         t.setPlaceholder('Private/\n*.tmp').setValue(s.exclude).onChange((v) => {
           s.exclude = v;

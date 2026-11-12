@@ -21,12 +21,17 @@ interface WireCommit {
   t: number;
   p: string[];
   c: [string, WireEntry | null][];
-  /** Older versions ignore it, so adding it needed no format change. */
+  /** Older versions ignore it in a commit, so adding it needed no format change. */
   h?: string;
-  /** Set on a commit that only moves data (`Commit.moved`). Older versions ignore it and see entries with unchanged content. */
+  /** Set on a commit that only moves data (`Commit.moved`). Older versions ignore it in a commit and see entries with unchanged content; in a digest, see `f`. */
   m?: 1;
-  /** Set on a commit whose deletions the user confirmed (`Commit.confirmed`). Older versions ignore it and count them like any deletion. */
+  /** Set on a commit whose deletions the user confirmed (`Commit.confirmed`). Older versions ignore it in a commit and count them like any deletion; in a digest, see `f`. */
   a?: 1;
+  /**
+   * Set on every commit of a digest whose writer keeps `m` and `a`. A version from before them writes the
+   * digest from commits it decoded without them, so without this a move would read as a user commit.
+   */
+  f?: 1;
 }
 
 function encCommit(c: Commit): WireCommit {
@@ -129,12 +134,13 @@ export class Repo {
   /** The `count` commits ending at `seq` in one object, so history does not fetch them one by one. */
   async writeDigest(seq: number, commits: Commit[]): Promise<void> {
     const key = seqKey('idx', seq);
-    await this.store.put(key, await this.sealJson(key, commits.map(encCommit)));
+    await this.store.put(key, await this.sealJson(key, commits.map((c) => ({ ...encCommit(c), f: 1 }))));
   }
 
+  /** Null when there is none, or its writer lost the commits' flags (see `WireCommit.f`): then only the commits tell. */
   async readDigest(seq: number, count: number): Promise<Commit[] | null> {
     const w = await this.openJson<WireCommit[]>(seqKey('idx', seq));
-    if (!w || w.length !== count) return null;
+    if (!w || w.length !== count || !w.every((c) => c.f)) return null;
     return w.map((c, i) => decCommit(seq - count + 1 + i, c));
   }
 

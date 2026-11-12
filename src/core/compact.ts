@@ -1,6 +1,6 @@
 import { pool } from './bytes.ts';
 import type { SyncConfig } from './config.ts';
-import { Packer } from './packer.ts';
+import { Packer, packRanges } from './packer.ts';
 import type { Repo } from './repo.ts';
 import { DAY } from './retention.ts';
 import type { ChunkRef, Entry } from './types.ts';
@@ -73,14 +73,7 @@ export function planCompaction(packs: { id: string; size: number; modified: numb
  * whose pack could not be read whole is left out.
  */
 export async function copyChunks(repo: Repo, plan: Compaction, cfg: SyncConfig): Promise<Map<string, ChunkRef>> {
-  const ranges: { pack: string; start: number; end: number; refs: ChunkRef[] }[] = [];
-  let cur: (typeof ranges)[number] | undefined;
-  for (const ref of plan.chunks) {
-    if (cur && cur.pack === ref.pack && ref.off - cur.end <= cfg.rangeGapBytes && ref.off + ref.len - cur.start <= MAX_RANGE) {
-      cur.end = ref.off + ref.len;
-      cur.refs.push(ref);
-    } else ranges.push((cur = { pack: ref.pack, start: ref.off, end: ref.off + ref.len, refs: [ref] }));
-  }
+  const ranges = packRanges(plan.chunks, cfg.rangeGapBytes, MAX_RANGE);
   const data: (Uint8Array | null)[] = new Array(ranges.length);
   await pool(ranges, cfg.concurrency, async (r, i) => {
     const got = await repo.getPackRange(r.pack, r.start, r.end);

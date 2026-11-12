@@ -1,12 +1,12 @@
 // Shared folders on screen: the list in settings, adding one (sharing a folder or joining with an invite link),
 // copying an invite link, stopping, and choosing the vault or a shared folder for commands that work on one.
-import { Modal, Notice, Setting, SuggestModal, TFile, Vault, type App } from 'obsidian';
+import { Modal, Notice, Setting, SuggestModal, TFile, TFolder, Vault, type App } from 'obsidian';
 import { DEFAULT_CONFIG } from '../core/config.ts';
 import { WrongPassphraseError } from '../core/crypto.ts';
 import { Repo } from '../core/repo.ts';
 import { openRemote } from '../stores/open.ts';
 import type SelfSyncPlugin from './main.ts';
-import { obsidianHttp } from './obsidianfs.ts';
+import { lookup, obsidianHttp } from './obsidianfs.ts';
 import {
   PROVIDERS,
   besideVault,
@@ -27,7 +27,7 @@ import {
   type Storage,
   type StorageForm,
 } from './settings.ts';
-import { newShareId } from './shares.ts';
+import { newShareId, rejoinNote } from './shares.ts';
 import { IDS, MIN_PASSPHRASE, formStorage, storageFields, tryStorage, type Keys } from './setup.ts';
 import { summarize, type Problem } from './status.ts';
 import { FolderSuggest, button, buttonRow, choice, field, message } from './ui.ts';
@@ -36,8 +36,8 @@ const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 /** Files in the vault folder `path`, at any depth; undefined when there is no such folder. */
 function filesIn(app: App, path: string): number | undefined {
-  const folder = path ? app.vault.getFolderByPath(path) : null;
-  if (!folder) return undefined;
+  const folder = path ? lookup(app, path) : null;
+  if (!(folder instanceof TFolder)) return undefined;
   let n = 0;
   Vault.recurseChildren(folder, (f) => {
     if (f instanceof TFile) n++;
@@ -212,6 +212,8 @@ class StopSharingModal extends Modal {
     this.modalEl.addClass('self-sync-modal', 'self-sync-share-modal');
     this.setTitle(`Stop sharing “${s.folder}” on this device?`);
     if (!s.missing) c.createEl('p', { cls: 'self-sync-intro', text: `The files stay in “${s.folder}” and from now on sync with the rest of this vault, to your own storage.` });
+    const note = rejoinNote(s);
+    if (note) c.createEl('p', { cls: 'self-sync-intro', text: note });
     c.createEl('p', {
       cls: 'self-sync-intro',
       text: 'Nothing is deleted from the shared storage, and the others who share this folder are not affected. To join again later, you need the invite link and the passphrase.',
@@ -364,7 +366,8 @@ export class ShareModal extends Modal {
             ? `“${folder}” is empty.`
             : this.joining
               ? `“${folder}” already has ${n === 1 ? 'a file' : `${n.toLocaleString()} files`}. They are added to the shared folder, so everyone who shares it sees them; a file with the same name is compared, and both are kept when they differ. Nothing is deleted.`
-              : `Its ${n === 1 ? 'file is' : `${n.toLocaleString()} files are`} sent to the shared storage, where everyone who joins can see ${n === 1 ? 'it' : 'them'}.`;
+              : `Its ${n === 1 ? 'file is' : `${n.toLocaleString()} files are`} sent to the shared storage, where everyone who joins can see ${n === 1 ? 'it' : 'them'}. ` +
+                'Your other devices keep their copy in this vault until you add the shared folder there too.';
       message(info, text, 'self-sync-note');
     };
     const input = field(c, 'Folder', { value: this.folder, placeholder: 'Shared', hint: 'An existing folder, or a new one to make.' }, (v) => {

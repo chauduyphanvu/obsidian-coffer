@@ -319,6 +319,102 @@ test('a folder restore plan leaves other folders alone, skips identical files, a
   assert.deepEqual(planRestore(v.remote, target, 'notes'), { write: [], remove: [] }, 'the folder now matches the moment');
 });
 
+test('a moment picked by its sequence number is exactly that moment, whatever the clocks of the devices that made it say', async () => {
+  const MIN = 60_000;
+  const storage = { now: 1_800_000_000_000 }; // on the hour
+  const mem = new MemoryStore(() => storage.now);
+  const net = new SimStore(mem);
+  const fast = { now: storage.now + 90_000 }; // A's clock runs ninety seconds fast
+  const a = new Device('A', net, fast, { snapshotEvery: 4 });
+  const b = new Device('B', net, storage, { snapshotEvery: 4 });
+  const tick = (ms: number) => {
+    storage.now += ms;
+    fast.now += ms;
+  };
+  const step = async (d: Device, path: string) => {
+    d.fs.put(path, `${path} ${storage.now}\n`);
+    await d.sync();
+    tick(MIN);
+  };
+  await step(a, 'x.md'); // 1
+  await b.sync();
+  await step(a, 'a.md'); // 2, stamped ahead
+  await step(b, 'b.md'); // 3, made later, stamped earlier
+  b.fs.put('c.md', 'c\n');
+  await b.sync(); // 4, a snapshot
+  await step(b, 'd.md'); // 5, in the same millisecond as 4
+  for (const p of ['e.md', 'f.md', 'g.md', 'h.md']) await step(b, p); // 6-9, 8 a snapshot
+  await a.sync();
+
+  let v = await view(a);
+  const list = await commits(v);
+  assert.deepEqual(list.map((c) => c.seq), [9, 8, 7, 6, 5, 4, 3, 2, 1]);
+  assert.ok(list[6].time < list[7].time && list[4].time === list[5].time);
+  const exact = (seq: number) => tableAt(v.repo, v.remote, v.lastSeq, v.cfg, v.now, { seq });
+  for (const m of list) {
+    const got = await exact(m.seq);
+    assert.deepEqual(got.commit, { seq: m.seq, time: m.time, device: m.device });
+    assert.deepEqual(got.files, await replay(v.repo, m.seq), `the vault at commit ${m.seq}`);
+  }
+  assert.equal((await at(v, list[7].time)).commit.seq, 3, 'by its time, moment 2 cannot be told from the later 3 stamped before it');
+  assert.equal((await at(v, list[5].time)).commit.seq, 5, 'nor 4 from 5 in the same millisecond');
+  await assert.rejects(exact(10), /Commit 10 is not a kept moment: there is no such commit/);
+  await assert.rejects(exact(0), /Commit 0 is not a kept moment: there is no such commit/);
+
+  // A move is not a moment, and a state thinned since it was listed is no longer one.
+  const st = LocalState.parse(await b.state.load());
+  tick(DAY + 10 * MIN);
+  await v.repo.writeCommit({ seq: 10, device: 'B', time: storage.now, changes: [{ path: 'h.md', entry: st.remote.get('h.md')! }], prev: st.head, moved: true });
+  tick(MIN);
+  await step(b, 'i.md'); // 11
+  tick(10 * MIN);
+  await step(b, 'j.md'); // 12, in the same hour as 11, and a snapshot
+  tick(DAY);
+  v = await view(b);
+  assert.deepEqual((await commits(v)).map((c) => c.seq), [12, 9], 'older than a day, 1-8 and 11 end no hour');
+  await assert.rejects(exact(10), /Commit 10 is not a kept moment: it only moved stored data/);
+  await assert.rejects(exact(11), /Commit 11 is not a kept moment: it has been thinned out of history/);
+  await assert.rejects(exact(7), (e: unknown) => e instanceof TooOldError && e.earliest.seq === 9);
+  await assert.rejects(exact(13), /there is no such commit/);
+  const nine = await exact(9);
+  assert.equal(nine.commit.seq, 9);
+  assert.deepEqual(nine.files, await replay(v.repo, 10), 'the vault just before the next user commit, the move included');
+  assert.deepEqual((await exact(12)).files, v.remote);
+});
+
+test('a time resolves to the newest kept moment stamped at or before it, whether or not a snapshot was stored since', async () => {
+  const MIN = 60_000;
+  const storage = { now: 1_800_000_000_000 };
+  const mem = new MemoryStore(() => storage.now);
+  const net = new SimStore(mem);
+  const fast = { now: storage.now + 2 * MIN };
+  const a = new Device('A', net, storage, { snapshotEvery: 5 });
+  const f = new Device('F', net, fast, { snapshotEvery: 5 });
+  const step = async (d: Device, path: string) => {
+    d.fs.put(path, `${path}\n`);
+    await d.sync();
+    storage.now += MIN;
+    fast.now += MIN;
+  };
+  await step(a, 'a.md'); // 1
+  await step(a, 'b.md'); // 2
+  await f.sync();
+  await step(f, 'c.md'); // 3, stamped two minutes ahead
+  await step(a, 'd.md'); // 4, made after 3 and stamped before it
+  const v1 = await view(a);
+  const t4 = (await v1.repo.readCommit(4))!.time;
+  assert.ok((await v1.repo.readCommit(3))!.time > t4 + 30_000);
+  assert.equal((await at(v1, t4 + 30_000)).commit.seq, 4);
+
+  storage.now += 2 * 3_600_000;
+  fast.now += 2 * 3_600_000;
+  await step(a, 'e.md'); // 5, a snapshot stored well after that time
+  const v2 = await view(a);
+  const got = await at(v2, t4 + 30_000);
+  assert.equal(got.commit.seq, 4);
+  assert.deepEqual(got.files, await replay(v2.repo, 4));
+});
+
 test('paging by sequence number lists every moment once, even moments that share a millisecond', async () => {
   const { devices: [a], clock } = setup();
   for (let i = 0; i < 9; i++) {

@@ -63,33 +63,49 @@ export function resolveConfig(partial: Partial<SyncConfig> = {}): SyncConfig {
   return c;
 }
 
-function globToRegExp(glob: string): RegExp {
+/**
+ * `*` matches within a folder name, `?` one character of it, `**` across folders (`**` then `/`: none or any number of
+ * whole folders), and `!(a|b)` the rest of a name when that is neither `a` nor `b`.
+ */
+function globSource(glob: string): string {
   let re = '';
   for (let i = 0; i < glob.length; i++) {
     const ch = glob[i];
+    const close = ch === '!' && glob[i + 1] === '(' ? glob.indexOf(')', i) : -1;
     if (ch === '*') {
       if (glob[i + 1] === '*') {
-        re += '.*';
         i++;
-        if (glob[i + 1] === '/') i++;
+        if (glob[i + 1] === '/') {
+          re += '(?:.*/)?';
+          i++;
+        } else re += '.*';
       } else re += '[^/]*';
     } else if (ch === '?') re += '[^/]';
-    else re += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    else if (close > 0) {
+      re += `(?!(?:${glob.slice(i + 2, close).split('|').map(globSource).join('|')})(?:/|$))[^/]*`;
+      i = close;
+    } else re += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&');
   }
-  return new RegExp(`^${re}$`);
+  return re;
 }
+
+const globToRegExp = (glob: string) => new RegExp(`^${globSource(glob)}$`);
 
 export function compileExcludes(patterns: string[]): (path: string) => boolean {
   const full: RegExp[] = [];
   const base: RegExp[] = [];
-  for (let p of patterns) {
-    p = p.trim();
+  // Whole paths without wildcards, which can come by the thousand, are looked up rather than matched one by one, also
+  // untrimmed: a file name may end with a space.
+  const exact = new Set<string>();
+  for (const raw of patterns) {
+    let p = raw.trim();
     if (!p) continue;
     if (p.endsWith('/')) p += '**';
-    (p.includes('/') ? full : base).push(globToRegExp(p));
+    if (p.includes('/') && !/[*?]|!\(/.test(p)) exact.add(p).add(raw);
+    else (p.includes('/') ? full : base).push(globToRegExp(p));
   }
   return (path) => {
-    if (full.some((r) => r.test(path))) return true;
+    if (exact.has(path) || full.some((r) => r.test(path))) return true;
     if (!base.length) return false;
     const name = path.slice(path.lastIndexOf('/') + 1);
     return base.some((r) => r.test(name));

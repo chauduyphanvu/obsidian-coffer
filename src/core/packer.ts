@@ -2,6 +2,42 @@ import { concat } from './bytes.ts';
 import type { Repo } from './repo.ts';
 import type { ChunkRef } from './types.ts';
 
+/** A stretch of one pack to fetch with one request, and the chunks stored in it. */
+export interface PackRange {
+  pack: string;
+  start: number;
+  end: number;
+  refs: ChunkRef[];
+}
+
+/**
+ * Coalesces chunk references into ranges of their packs: references at most `gap` bytes apart share a
+ * range while it spans at most `max` bytes, which bounds the memory a range takes; one larger chunk
+ * gets a range of its own. Packs come in the order of their first reference, ranges within a pack by offset.
+ */
+export function packRanges(refs: ChunkRef[], gap: number, max: number): PackRange[] {
+  const byPack = new Map<string, ChunkRef[]>();
+  for (const ref of refs) {
+    let list = byPack.get(ref.pack);
+    if (!list) byPack.set(ref.pack, (list = []));
+    list.push(ref);
+  }
+  const out: PackRange[] = [];
+  for (const [pack, list] of byPack) {
+    list.sort((a, b) => a.off - b.off);
+    let cur: PackRange | undefined;
+    for (const ref of list) {
+      const end = ref.off + ref.len;
+      if (cur && ref.off - cur.end <= gap && end - cur.start <= max) {
+        // A reference inside the one before, as in a damaged table, must not cut the range short.
+        cur.end = Math.max(cur.end, end);
+        cur.refs.push(ref);
+      } else out.push((cur = { pack, start: ref.off, end, refs: [ref] }));
+    }
+  }
+  return out;
+}
+
 export class Packer {
   private repo: Repo;
   private target: number;

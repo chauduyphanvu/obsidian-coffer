@@ -13,15 +13,13 @@ export interface Plan {
   pulls: string[];
   pullDeletes: string[];
   conflicts: string[];
-  /** Paths left alone because this device's or the remote copy is over the size limit. */
-  tooLarge: string[];
 }
 
 /**
  * Compares every path's local and remote state with the version both sides last agreed on.
  * Where nothing needs doing it brings that agreed version up to date in `st`.
  * `tooLargeHere` holds paths whose local file is over the size limit: they are missing from
- * `local`, but must not be mistaken for local deletions.
+ * `local`, but must not be mistaken for local deletions. A path over the limit on either side is left alone.
  * With `keys`, compares only those paths, and `local` need only hold those of them that exist.
  */
 export function planChanges(
@@ -37,17 +35,13 @@ export function planChanges(
   const pulls: string[] = [];
   const pullDeletes: string[] = [];
   const conflicts: string[] = [];
-  const tooLarge: string[] = [];
 
   const plan = (key: string) => {
     if (excluded(key)) return;
     const l = local.get(key);
     const s = st.synced.get(key);
     const r = st.remote.get(key);
-    if (tooLargeHere.has(key) || (r && r.size > maxSize)) {
-      tooLarge.push(key);
-      return;
-    }
+    if (tooLargeHere.has(key) || (r && r.size > maxSize)) return;
     const base = s?.entry;
     const localTouched = l ? !s || s.lsize !== l.size || s.lmtime !== l.mtime : !!s;
     const remoteChanged = base ? !r || !sameContent(r, base) : !!r;
@@ -72,7 +66,7 @@ export function planChanges(
     for (const key of st.remote.keys()) if (!local.has(key) && !st.synced.has(key)) plan(key);
     for (const key of tooLargeHere) if (!st.synced.has(key) && !st.remote.has(key)) plan(key);
   }
-  return { pushes, pushDeletes, pulls, pullDeletes, conflicts, tooLarge };
+  return { pushes, pushDeletes, pulls, pullDeletes, conflicts };
 }
 
 export const nothingToDo = (p: Plan) => !p.pushes.length && !p.pushDeletes.length && !p.pulls.length && !p.pullDeletes.length && !p.conflicts.length;

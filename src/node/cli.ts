@@ -1,7 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { join, resolve } from 'node:path';
-import { pool } from '../core/bytes.ts';
 import { DEFAULT_CONFIG, resolveConfig, type SyncConfig } from '../core/config.ts';
 import { heartbeatDue, writeHeartbeat } from '../core/devices.ts';
 import { SafetyError, SyncEngine, type SyncResult } from '../core/engine.ts';
@@ -9,7 +8,7 @@ import { vaultKey } from '../core/paths.ts';
 import { plural } from '../core/text.ts';
 import { TooOldError, listCommits, listDeleted, planRestore, tableAt } from '../core/timeline.ts';
 import type { RemoteStore } from '../core/types.ts';
-import { countSteps, deleteLimitCrossed, keepOut, restoreSteps, type Step } from '../plugin/restore.ts';
+import { applyRestore, countSteps, deleteLimitCrossed, keepOut, restoreSteps } from '../plugin/restore.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
 import type { S3Config } from '../stores/s3.ts';
@@ -34,11 +33,14 @@ const USAGE = `Usage: node src/node/cli.ts <command> [--config=selfsync.json]
   history <path>         list stored versions of a file
   restore <path> <seq>   write a stored version back into the vault
   deleted [folder]       list deleted files that can still be restored, newest first
-  log [--limit=20]       list the times the vault can be restored to, newest first
+  log [--limit=20]       list the times the vault can be restored to, newest first, each after
+                         its number
   restore-at <time> [folder] [--dry-run]
                          bring the vault, or one folder, back to how it was at <time> (ISO 8601,
-                         like 2026-11-10T14:30); syncs first, prints what changes, changes it, and
-                         syncs again to send it, no --force needed for the files it removes
+                         like 2026-11-10T14:30, or a number from log, which names that moment even
+                         when device clocks disagree); syncs first, prints what changes, changes it,
+                         leaving alone any file with changes that sync could not send, and syncs
+                         again to send it, no --force needed for the files it removes
   verify [--deep]        check the stored data end to end without changing it; --deep also
                          downloads and checks everything the current files are stored in
   clean                  delete versions older than the retention window from storage
@@ -83,12 +85,14 @@ const iso = (time: number) => new Date(time).toISOString();
 const STEP = { add: 'bring back', change: 'change', remove: 'remove' } as const;
 
 /**
- * Brings the vault, or `folder`, back to how it was at `when`, removals first. Syncs first, so edits not yet synced
- * are kept in history and the plan matches the files here, and after, to send the result. With `dry`, only prints the plan.
+ * Brings the vault, or `folder`, back to how it was at `when`: a time, or a moment's number as `log` prints it, which
+ * names that moment exactly whatever the clocks of the devices said. Removals first. Syncs first, so edits not yet
+ * synced are kept in history and the plan matches the files here, and after, to send the result; a file with changes
+ * that sync could not send is left as it is (see `applyRestore`). With `dry`, only prints the plan.
  */
 async function restoreAt(engine: SyncEngine, fs: NodeFS, when: string, folder: string, dry: boolean): Promise<number> {
-  const at = Date.parse(when);
-  if (Number.isNaN(at)) throw new Error(`"${when}" is not a time; use ISO 8601, like 2026-11-10T14:30`);
+  const at = /^\d+$/.test(when) ? { seq: Number(when) } : Date.parse(when);
+  if (typeof at === 'number' && Number.isNaN(at)) throw new Error(`"${when}" is not a time; use ISO 8601, like 2026-11-10T14:30, or a number that log prints`);
   if (!dry) {
     const r = await engine.sync();
     report(r, 'synced first: ');
@@ -99,7 +103,7 @@ async function restoreAt(engine: SyncEngine, fs: NodeFS, when: string, folder: s
   }
   const v = await engine.view();
   const past = await tableAt(v.repo, v.st.remote, v.st.lastSeq, v.cfg, v.now, at).catch((e: unknown) => {
-    throw e instanceof TooOldError ? new Error(`${when} is too far back; the earliest time that can be restored is ${iso(e.earliest.time)}`) : e;
+    throw e instanceof TooOldError ? new Error(`${when} is too far back; the earliest time that can be restored is ${iso(e.earliest.time)} (number ${e.earliest.seq})`) : e;
   });
   const { steps } = restoreSteps(planRestore(v.st.remote, past.files, folder), v.st.remote, keepOut(v.cfg.exclude, []));
   const scope = folder ? `${vaultKey(folder).replace(/\/+$/, '')}/` : 'the vault';
@@ -116,22 +120,23 @@ async function restoreAt(engine: SyncEngine, fs: NodeFS, when: string, folder: s
   }
 
   const here = new Map((await fs.list()).map((f) => [vaultKey(f.path), f.path]));
-  const done = { add: 0, change: 0, remove: 0 };
-  const removed: string[] = [];
-  let failed = 0;
-  const run = async (s: Step) => {
-    try {
-      if (s.kind === 'remove') await fs.remove(here.get(s.path) ?? s.path);
-      else await fs.write(here.get(s.path) ?? s.path, await engine.readVersion(s.entry!));
-      done[s.kind]++;
-      if (s.kind === 'remove') removed.push(s.path);
-    } catch (e) {
-      failed++;
-      console.error(`failed: ${s.path}: ${e instanceof Error ? e.message : e}`);
-    }
-  };
-  for (const s of steps.filter((x) => x.kind === 'remove')) await run(s);
-  await pool(steps.filter((x) => x.kind !== 'remove'), v.cfg.concurrency, run);
+  const on = (path: string) => here.get(path) ?? path;
+  const synced = new Map([...v.st.synced].map(([key, s]) => [key, { lsize: s.lsize, lmtime: s.lmtime }]));
+  const applied = await applyRestore(
+    steps,
+    synced,
+    {
+      stat: (path) => fs.stat(on(path)),
+      write: async (path, data) => void (await fs.write(on(path), data)),
+      remove: (path) => fs.remove(on(path)),
+      read: (entry) => engine.readVersion(entry),
+    },
+    v.cfg.concurrency,
+  );
+  for (const f of applied.failed) console.error(`failed: ${f.path}: ${f.message}`);
+  const done = countSteps(applied.done);
+  const removed = applied.done.filter((s) => s.kind === 'remove').map((s) => s.path);
+  const failed = applied.failed.length;
   console.log(`restored ${scope} as of ${iso(past.commit.time)}: brought back ${done.add}, changed ${done.change}, removed ${done.remove}`);
   const limit = deleteLimitCrossed(done.add + done.change, done.remove, v.st.synced.size, v.cfg);
   // The removals are deletions the user asked for: they do not count against the guard here, nor on other devices.
@@ -260,7 +265,7 @@ async function main(): Promise<number> {
     if (!Number.isInteger(limit) || limit < 1) throw new Error('--limit must be a whole number above 0');
     const v = await engine.view();
     for (const c of await listCommits(v.repo, v.st.lastSeq, v.cfg, v.now, { limit })) {
-      console.log(`${iso(c.time)}  ${c.device.padEnd(16)} ${c.added} added, ${c.changed} changed, ${c.deleted} deleted`);
+      console.log(`${String(c.seq).padStart(6)}  ${iso(c.time)}  ${c.device.padEnd(16)} ${c.added} added, ${c.changed} changed, ${c.deleted} deleted`);
     }
     return 0;
   }

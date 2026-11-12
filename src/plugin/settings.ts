@@ -38,6 +38,11 @@ export interface Share extends Storage {
   conflictCopies: string[];
   /** The folder went missing. Nothing syncs until the user downloads it again or stops sharing it here. */
   missing: boolean;
+  /**
+   * The vault's files that were in the folder when it was shared on this device, by vault path. The vault's storage
+   * keeps them for devices that did not add the share, and this device's vault sync leaves them alone: see shares.ts.
+   */
+  vaultCopies: string[];
 }
 
 export interface Settings extends Storage {
@@ -115,7 +120,7 @@ const STORAGE_DEFAULTS: Storage = {
 
 /** A share with every field present, as saved by any version. */
 export function shareWith(fields: Partial<Share> & Pick<Share, 'id' | 'folder'>): Share {
-  return { ...STORAGE_DEFAULTS, lastSuccess: 0, lastCleanup: 0, conflictCopies: [], missing: false, ...fields };
+  return { ...STORAGE_DEFAULTS, lastSuccess: 0, lastCleanup: 0, conflictCopies: [], missing: false, vaultCopies: [], ...fields };
 }
 
 /** The settings as saved, with defaults for whatever an older version did not save. */
@@ -169,18 +174,33 @@ const tuning = (s: Settings) => ({
   compression: s.compression,
 });
 
-/** The vault's own sync. Shared folders sync with their own storage, so the vault leaves them out. */
+/**
+ * What this device's sync can not see, and so leaves out: what Obsidian's file list leaves out, files and folders
+ * whose name starts with a dot, except the settings folder, which is read from disk (without its node_modules folders)
+ * when it syncs. A file the sync downloaded and then could not see would look deleted, and the next sync would delete
+ * it everywhere; left out, such files are neither downloaded nor deleted here, wherever other devices sync them.
+ */
+function unlisted(configDir: string, withConfig: boolean): string[] {
+  const top = withConfig && configDir.startsWith('.') ? `.!(${configDir.slice(1)})/` : '.*/';
+  return ['.*', '*/**/.*/', top, ...(withConfig ? [`${configDir}/**/node_modules/`] : [`${configDir}/`])];
+}
+
+/**
+ * The vault's own sync. Shared folders sync with their own storage, so the vault leaves them out, and with them the
+ * vault's own files that were in them when they were shared here, wherever they have moved since (see shares.ts).
+ */
 export function syncConfig(s: Settings, configDir: string, pluginDir: string): SyncConfig {
   return resolveConfig({
     deviceName: s.deviceName,
     configDir,
     exclude: [
       ...DEFAULT_CONFIG.exclude.map((p) => p.replace(/^\.obsidian\//, `${configDir}/`)),
+      ...unlisted(configDir, s.syncConfigDir),
       // Device-specific. The plugin's code itself does sync, so an update reaches every device.
       statePath(pluginDir),
       `${pluginDir}/data.json`,
       ...s.exclude.split('\n'),
-      ...s.shares.flatMap((x) => [`${vaultKey(x.folder)}/`, statePath(pluginDir, x.id)]),
+      ...s.shares.flatMap((x) => [`${vaultKey(x.folder)}/`, ...x.vaultCopies.filter((key) => !isInside(x.folder, key)), statePath(pluginDir, x.id)]),
     ],
     ...tuning(s),
   });
@@ -201,6 +221,8 @@ export function shareConfig(s: Settings, share: Share, configDir: string): SyncC
     else if (p.startsWith(at) && p.length > at.length) exclude.push(p.slice(at.length));
   }
   for (const other of s.shares) if (isInside(share.folder, other.folder)) exclude.push(`${vaultKey(other.folder).slice(at.length)}/`);
+  // Obsidian's file list has no name starting with a dot, at any depth of a shared folder: see `unlisted`.
+  exclude.push('.*', '**/.*/');
   return resolveConfig({ deviceName: s.deviceName, configDir, exclude, ...tuning(s) });
 }
 

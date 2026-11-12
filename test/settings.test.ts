@@ -89,6 +89,7 @@ test('settings: storage address and sync config', () => {
   const c = syncConfig(s3({ exclude: 'Private/\n*.tmp', deviceName: 'laptop', retentionDays: 0 }), '.config', '.config/plugins/self-sync');
   assert.deepEqual(c.exclude, [
     '.self-sync/**', '.config/workspace*.json', '.trash/**', '.git/**', '.DS_Store',
+    '.*', '*/**/.*/', '.!(config)/', '.config/**/node_modules/',
     '.config/plugins/self-sync/state.json', '.config/plugins/self-sync/data.json', 'Private/', '*.tmp',
   ]);
   assert.equal(c.deviceName, 'laptop');
@@ -217,13 +218,29 @@ test('the vault leaves out every shared folder and its state, and a shared folde
   assert.equal(statePath('p', 'w1'), 'p/state-w1.json');
 
   const w = shareConfig(s, s.shares[0], '.obsidian');
-  assert.deepEqual(w.exclude, ['.DS_Store', '*.tmp', 'drafts/', '*.bak', '**/cache/']);
+  assert.deepEqual(w.exclude, ['.DS_Store', '*.tmp', 'drafts/', '*.bak', '**/cache/', '.*', '**/.*/']);
   assert.equal(w.deviceName, s.deviceName);
   const inside = compileExcludes(w.exclude);
   assert.ok(inside('drafts/a.md') && inside('x.tmp') && inside('a/cache/b') && !inside('a.md') && !inside('x.md'));
+  assert.ok(!inside('mycache/b'), '**/ stands for whole folders');
   // A share moved inside another leaves the inner one to its own sync.
   const nested = s3({ shares: [share({ id: 'o', folder: 'Outer' }), share({ id: 'i', folder: 'Outer/Inner' })] });
-  assert.deepEqual(shareConfig(nested, nested.shares[0], '.obsidian').exclude, ['.DS_Store', 'Inner/']);
+  assert.deepEqual(shareConfig(nested, nested.shares[0], '.obsidian').exclude, ['.DS_Store', 'Inner/', '.*', '**/.*/']);
+});
+
+test('what Obsidian does not list is left out: names starting with a dot, except the settings folder when it syncs, without its node_modules', () => {
+  const vault = compileExcludes(syncConfig(s3(), '.obsidian', '.obsidian/plugins/self-sync').exclude);
+  for (const path of ['.gitignore', '.vscode/settings.json', 'notes/.keep', 'notes/.cache/x.json', 'a/b/.c/d.md', '.obsidianx/a', '.obsidian/plugins/p/.hotreload', '.obsidian/plugins/p/node_modules/m/i.js', '.obsidian/plugins/p/.git/HEAD']) {
+    assert.ok(vault(path), path);
+  }
+  for (const path of ['notes/n.md', 'v1.2.md', 'notes/a.b/c.md', 'a/b.c/.d', '.obsidian/app.json', '.obsidian/plugins/p/main.js', '.obsidian/snippets/x.css']) {
+    assert.equal(vault(path), path === 'a/b.c/.d', path);
+  }
+  const without = compileExcludes(syncConfig(s3({ syncConfigDir: false }), '.obsidian', '.obsidian/plugins/self-sync').exclude);
+  assert.ok(without('.obsidian/app.json') && without('.obsidian/plugins/p/main.js') && !without('notes/n.md'));
+  const shared = compileExcludes(shareConfig(s3(), share({ id: 'w', folder: 'Work' }), '.obsidian').exclude);
+  for (const path of ['.keep', '.hidden/a.md', 'sub/.hidden/a.md', 'sub/.keep']) assert.ok(shared(path), path);
+  for (const path of ['a.md', 'sub/v1.2/a.md', 'sub.d/a.md']) assert.ok(!shared(path), path);
 });
 
 test('a shared folder must be a real folder of the vault, outside the others, the settings folder and what is left out', () => {
@@ -245,6 +262,9 @@ test('a shared folder must be a real folder of the vault, outside the others, th
   assert.match(problem('a/../b'), /not a folder name/);
   assert.match(problem('/Notes'), /not a folder name/);
   assert.match(problem('What?'), /can not contain/);
+  const cafe = s3({ shares: [share({ id: 'c', folder: 'Café'.normalize('NFD') })] });
+  assert.equal(folderProblem(cafe, 'Café'.normalize('NFC'), '.obsidian', '.obsidian/plugins/self-sync'), `“${'Café'.normalize('NFD')}” is already a shared folder.`, 'either Unicode form names the same folder');
+  assert.match(folderProblem(cafe, `${'Café'.normalize('NFC')}/Sub`, '.obsidian', '.obsidian/plugins/self-sync'), /inside the shared folder/);
   assert.equal(normalFolder(' /Notes//Sub/ '), 'Notes/Sub');
   assert.equal(normalFolder('Notes\\Sub'), 'Notes/Sub');
 });

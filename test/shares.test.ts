@@ -6,18 +6,21 @@ import { Repo } from '../src/core/repo.ts';
 import { MissingFolderError, ScopedFS, type FolderFS } from '../src/core/scopedfs.ts';
 import { ChangeLog, type Why } from '../src/plugin/changes.ts';
 import { defaultSettings, shareWith, statePath, type Settings, type Share } from '../src/plugin/settings.ts';
-import { followRename, goneWith, inVault, makeEngine, placeOf, syncAll, vaultPath, type EngineHost } from '../src/plugin/shares.ts';
+import { vaultKey } from '../src/core/paths.ts';
+import { followRename, freeTaken, goneWith, inVault, makeEngine, placeOf, rejoin, rejoinNote, syncAll, takeVaultCopies, vaultPath, type EngineHost } from '../src/plugin/shares.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
 import { MemFS, MemState } from '../src/testing/memfs.ts';
-import { TEST_CONFIG } from './helpers.ts';
+import { Device, TEST_CONFIG } from './helpers.ts';
 
 /** A vault on disk: files, and folders that exist even when empty, as Obsidian keeps them. */
 class VaultFS extends MemFS implements FolderFS {
   folders = new Set<string>();
 
+  /** Folders are found in any Unicode form, as on macOS and iOS. */
   async listFolder(folder: string) {
-    const files = (await this.list()).filter((f) => f.path.startsWith(`${folder}/`));
-    return this.folders.has(folder) || files.length ? files : null;
+    const at = `${folder.normalize('NFC')}/`;
+    const files = (await this.list()).filter((f) => f.path.normalize('NFC').startsWith(at));
+    return [...this.folders].some((f) => f.normalize('NFC') === folder.normalize('NFC')) || files.length ? files : null;
   }
 
   /** A folder renamed or moved: its files keep their bytes and times. */
@@ -42,17 +45,35 @@ class VaultFS extends MemFS implements FolderFS {
   }
 }
 
+/**
+ * A vault as Obsidian lists it: its file index has no file or folder whose name starts with a dot, and the settings
+ * folder, read file by file when it syncs, without its node_modules folders. Reading, writing and asking about a file
+ * by name reach every file, as the vault's adapter does.
+ */
+class ObsidianLikeFS extends VaultFS {
+  withConfig = true;
+
+  override async list() {
+    return (await super.list()).filter((f) => {
+      const parts = f.path.split('/');
+      if (parts[0] === '.obsidian') return this.withConfig && !parts.includes('node_modules');
+      return !parts.some((p) => p.startsWith('.'));
+    });
+  }
+}
+
 const PLUGIN_DIR = '.obsidian/plugins/self-sync';
 
 /** One person's device: a vault syncing with its own storage, and the shared folders added to it. */
 class Person {
-  fs = new VaultFS();
+  fs: VaultFS;
   states = new Map<string, MemState>();
   settings: Settings;
   host: EngineHost;
   private engines = new Map<string, SyncEngine>();
 
-  constructor(name: string, stores: Record<string, MemoryStore>, vault: string, secrets: Record<string, string>) {
+  constructor(name: string, stores: Record<string, MemoryStore>, vault: string, secrets: Record<string, string>, fs = new VaultFS()) {
+    this.fs = fs;
     this.settings = { ...defaultSettings(false), deviceName: name, endpoint: 'https://s3.test', bucket: 'b', prefix: vault, accessKeySecret: 'ak', secretKeySecret: 'sk', passphraseSecret: `pass:${vault}` };
     this.host = {
       settings: this.settings,
@@ -68,13 +89,27 @@ class Person {
     };
   }
 
-  /** Adds a shared folder, its folder made in the vault as adding one does. */
-  share(id: string, folder: string, remote: string): Share {
+  /** Adds a shared folder as the plugin does: its folder made in the vault, and the vault's own files there noted. */
+  async share(id: string, folder: string, remote: string): Promise<Share> {
     const s = shareWith({ id, folder, endpoint: 'https://s3.test', bucket: 'b', prefix: remote, accessKeySecret: 'ak', secretKeySecret: 'sk', passphraseSecret: `pass:${remote}` });
+    this.restart();
+    await takeVaultCopies(this.host, s);
     this.settings.shares.push(s);
     this.fs.folders.add(folder);
-    this.restart();
     return s;
+  }
+
+  /** Stops sharing as the plugin does: the vault takes the folder back, and the share's state is forgotten. */
+  async stopSharing(s: Share): Promise<void> {
+    const remote = new Set((await this.engine().view()).st.remote.keys());
+    this.restart();
+    await rejoin(this.host, s, (key) => this.has(key), remote);
+    this.settings.shares = this.settings.shares.filter((x) => x !== s);
+    this.states.delete(statePath(PLUGIN_DIR, s.id));
+  }
+
+  has(key: string): boolean {
+    return [...this.fs.files.keys()].some((p) => vaultKey(p) === key);
   }
 
   engine(share?: Share): SyncEngine {
@@ -89,7 +124,8 @@ class Person {
   }
 
   /** One sync run as the plugin does it. */
-  syncAll() {
+  async syncAll() {
+    if (await freeTaken(this.host, (key) => this.has(key))) this.restart();
     return syncAll(this.settings, this.host.secret, (s) => this.engine(s).sync());
   }
 
@@ -127,8 +163,8 @@ async function sharing() {
   a.fs.put('Shared/sub/s2.md', 'from A, deeper');
   b.fs.put('b.md', 'only in B');
   b.fs.put('Projects/Team/t1.md', 'from B');
-  const sa = a.share('sa', 'Shared', 'team');
-  const sb = b.share('sb', 'Projects/Team', 'team');
+  const sa = await a.share('sa', 'Shared', 'team');
+  const sb = await b.share('sb', 'Projects/Team', 'team');
   ok(await a.syncAll());
   ok(await b.syncAll());
   ok(await a.syncAll());
@@ -217,6 +253,42 @@ test('routing: a renamed or moved folder takes the shares in it along; a deleted
   assert.deepEqual(goneWith(shares, 'Work'), []);
 });
 
+const NFC = 'Café'.normalize('NFC');
+const NFD = 'Café'.normalize('NFD');
+
+test('routing: a path in the other Unicode form than the shared folder\'s name is routed, cut and followed alike, keeping its own form inside', () => {
+  for (const [stored, given] of [[NFC, NFD], [NFD, NFC]]) {
+    const s = shareWith({ id: 'c', folder: `${stored}/Notes` });
+    const other = shareWith({ id: 'o', folder: 'Other' });
+    const shares = [s, other];
+    assert.deepEqual(placeOf(shares, `${given}/Notes/n.md`), { share: s, path: 'n.md' });
+    assert.deepEqual(placeOf(shares, `${given}/Notes`), { share: s, path: '' });
+    assert.deepEqual(placeOf(shares, `${given}/Notes/${given}/x.md`), { share: s, path: `${given}/x.md` }, 'the path inside keeps the form the file has on disk');
+    assert.deepEqual(placeOf(shares, `${given}/Notes x/n.md`), { path: `${given}/Notes x/n.md` });
+    assert.equal(vaultPath(s, placeOf(shares, `${given}/Notes/n.md`).path).normalize('NFC'), `${NFC}/Notes/n.md`);
+    assert.deepEqual(goneWith(shares, given), [s]);
+    assert.deepEqual(goneWith(shares, `${given}/Notes`), [s]);
+    assert.deepEqual(followRename(shares, `${given}/Notes`, `${given}/Old notes`), [s]);
+    assert.equal(s.folder, `${given}/Old notes`);
+    assert.deepEqual(followRename(shares, given, 'Archive'), [s]);
+    assert.equal(s.folder, 'Archive/Old notes');
+  }
+});
+
+test('scoped: a shared folder whose name the file system gives in the other Unicode form lists its files and deletes nothing', async () => {
+  for (const [stored, onDisk] of [[NFC, NFD], [NFD, NFC]]) {
+    const fs = new VaultFS();
+    fs.put(`${onDisk}/a.md`, 'a');
+    fs.put(`${onDisk}/sub/b.md`, 'b');
+    fs.put(`${onDisk} notes/c.md`, 'sibling');
+    fs.folders.add(onDisk);
+    const scoped = new ScopedFS(fs, () => stored);
+    assert.deepEqual((await scoped.list()).map((f) => f.path).sort(), ['a.md', 'sub/b.md']);
+    const vault = new ScopedFS(fs, () => '', () => [stored]);
+    assert.deepEqual((await vault.list()).map((f) => f.path), [`${onDisk} notes/c.md`]);
+  }
+});
+
 test('two people share a folder under different names: files flow both ways and never reach either vault\'s storage', async () => {
   const { a, b, sa, sb } = await sharing();
   assert.equal(a.fs.text('Shared/t1.md'), 'from B');
@@ -264,7 +336,7 @@ test('what a vault\'s storage holds under a shared folder\'s name stays out of t
   const other = new Person('A2', stores, 'vault-a', secrets);
   other.fs.put('Shared/private.md', 'vault file, not for the share');
   ok(await other.syncAll());
-  const sa = a.share('sa', 'Shared', 'team');
+  const sa = await a.share('sa', 'Shared', 'team');
   ok(await a.syncAll());
   assert.ok(!a.fs.files.has('Shared/private.md'));
   assert.deepEqual(await a.remote(sa), []);
@@ -382,13 +454,214 @@ test('hinted syncs of the vault and a shared folder: a file moved into it leaves
   assert.deepEqual(await a.remote(sa), before);
 });
 
+const projects = (n = 6) => Array.from({ length: n }, (_, i) => `Projects/p${i}.md`);
+
+/**
+ * A and A2 are two devices of one vault, which syncs a folder Projects. A shares that folder; A2 does not add the
+ * share, so for A2 it stays a folder of the vault.
+ */
+async function sharedFromVault() {
+  const w = await world();
+  const { a, stores, secrets } = w;
+  const a2 = new Person('A2', stores, 'vault-a', secrets);
+  for (const p of projects()) a.fs.put(p, `${p} from the vault`);
+  a.fs.put('a.md', 'a vault note');
+  ok(await a.syncAll());
+  ok(await a2.syncAll());
+  assert.deepEqual(a2.paths(), [...projects(), 'a.md']);
+  const sa = await a.share('sa', 'Projects', 'team');
+  ok(await a.syncAll());
+  return { ...w, a2, sa };
+}
+
+test('a folder the vault already syncs, shared on one device and renamed there, is neither deleted for the vault\'s other devices nor brought back', async () => {
+  const { a, a2, sa } = await sharedFromVault();
+  a2.fs.put('Projects/p0.md', 'edited on A2, which did not add the share');
+  ok(await a2.syncAll());
+  ok(await a.syncAll());
+  assert.equal(a.fs.text('Projects/p0.md'), 'Projects/p0.md from the vault', "the vault's copy stays out of the shared folder");
+
+  a.fs.moveFolder('Projects', 'Work');
+  followRename(a.settings.shares, 'Projects', 'Work');
+  a.restart();
+  ok(await a.syncAll());
+  ok(await a2.syncAll());
+  ok(await a.syncAll());
+  assert.deepEqual(a2.paths(), [...projects(), 'a.md'], 'A2 keeps every file');
+  assert.equal(a2.fs.text('Projects/p0.md'), 'edited on A2, which did not add the share');
+  assert.deepEqual(await a.remote(), [...projects(), 'a.md'], "the vault's storage keeps them for the devices that did not add the share");
+  assert.deepEqual(a.paths(), [...projects().map((p) => p.replace('Projects/', 'Work/')), 'a.md'], 'and they do not come back to A under the old name');
+  assert.deepEqual(await a.remote(sa), projects().map((p) => p.slice('Projects/'.length)));
+
+  // Moved again, into another folder of the vault.
+  a.fs.moveFolder('Work', 'Archive/Work');
+  followRename(a.settings.shares, 'Work', 'Archive/Work');
+  a.restart();
+  ok(await a.syncAll());
+  ok(await a2.syncAll());
+  assert.deepEqual(a2.paths(), [...projects(), 'a.md']);
+  assert.deepEqual(await a.remote(), [...projects(), 'a.md']);
+});
+
+/** Every file of a person's vault with its text. */
+const texts = (p: Person) => Object.fromEntries(p.paths().map((path) => [path, p.fs.text(path)]));
+
+test('stopping sharing a folder the vault already synced takes it back into the vault, deleting nothing on either side and merging edits', async () => {
+  const { a, a2, sa } = await sharedFromVault();
+  a.fs.put('Projects/p1.md', 'edited on A while shared');
+  a.fs.files.delete('Projects/p2.md');
+  a.fs.put('Projects/new.md', 'added on A while shared');
+  ok(await a.syncAll());
+  a2.fs.put('Projects/p3.md', 'edited on A2');
+  a2.fs.files.delete('Projects/p4.md');
+  ok(await a2.syncAll());
+  ok(await a.syncAll());
+  const shared = await a.remote(sa);
+
+  assert.match(rejoinNote(sa), /^Your vault's storage still has the files that were in this folder when it was shared, for your devices/);
+  await a.stopSharing(sa);
+  ok(await a.syncAll());
+  ok(await a2.syncAll());
+  ok(await a.syncAll());
+  const expected = {
+    'Projects/new.md': 'added on A while shared',
+    'Projects/p0.md': 'Projects/p0.md from the vault',
+    'Projects/p1.md': 'edited on A while shared',
+    'Projects/p2.md': 'Projects/p2.md from the vault',
+    'Projects/p3.md': 'edited on A2',
+    'Projects/p4.md': 'Projects/p4.md from the vault',
+    'Projects/p5.md': 'Projects/p5.md from the vault',
+    'a.md': 'a vault note',
+  };
+  assert.deepEqual(texts(a), expected, 'what only one side had is copied to the other, and an edit made on one side only wins without a conflict copy');
+  assert.deepEqual(texts(a2), expected);
+  assert.deepEqual(await a.remote(sa), shared, 'the shared storage is left as it was');
+});
+
+test('stopping sharing a folder that was renamed while shared: the vault\'s files come back under the old name beside it, and nothing is deleted', async () => {
+  const { a, a2, sa } = await sharedFromVault();
+  a.fs.moveFolder('Projects', 'Work');
+  followRename(a.settings.shares, 'Projects', 'Work');
+  a.fs.files.delete('Work/p2.md');
+  a.restart();
+  ok(await a.syncAll());
+  assert.match(rejoinNote(sa), /, under “Projects”, for your devices/);
+  await a.stopSharing(sa);
+  ok(await a.syncAll());
+  ok(await a2.syncAll());
+  ok(await a.syncAll());
+  const work = projects().filter((p) => p !== 'Projects/p2.md').map((p) => p.replace('Projects/', 'Work/'));
+  assert.deepEqual(a.paths(), [...projects(), 'a.md', ...work].sort());
+  assert.deepEqual(a2.paths(), a.paths());
+});
+
+test('a shared folder that went missing and was downloaded again leaves the vault\'s copies alone; stopping instead brings them back', async () => {
+  const { a, a2, sa } = await sharedFromVault();
+  a.fs.dropFolder('Projects');
+  const out = await a.syncAll();
+  assert.equal(out[0].error, undefined);
+  assert.ok(out[1].error instanceof MissingFolderError && sa.missing);
+  ok(await a2.syncAll());
+  assert.deepEqual(a2.paths(), [...projects(), 'a.md'], 'a missing shared folder deletes nothing from the vault either');
+
+  // "Download it again".
+  a.fs.folders.add('Projects');
+  a.states.get(statePath(PLUGIN_DIR, 'sa'))!.data = null;
+  sa.missing = false;
+  a.restart();
+  ok(await a.syncAll());
+  ok(await a2.syncAll());
+  assert.deepEqual(a.paths(), [...projects(), 'a.md']);
+  assert.deepEqual(a2.paths(), [...projects(), 'a.md']);
+  assert.deepEqual(await a.remote(), [...projects(), 'a.md']);
+
+  // Missing again, and this time sharing stops: the vault's copies come back, as the confirmation says.
+  a.fs.dropFolder('Projects');
+  await a.syncAll();
+  await a.stopSharing(sa);
+  ok(await a.syncAll());
+  ok(await a2.syncAll());
+  assert.deepEqual(a.paths(), [...projects(), 'a.md']);
+  assert.deepEqual(a2.paths(), [...projects(), 'a.md']);
+});
+
+test('an ordinary folder made later under the old name of a renamed shared folder syncs, without the vault\'s old copies coming back', async () => {
+  const { a, a2 } = await sharedFromVault();
+  a.fs.moveFolder('Projects', 'Work');
+  followRename(a.settings.shares, 'Projects', 'Work');
+  a.restart();
+  ok(await a.syncAll());
+  a.fs.put('Projects/fresh.md', 'a new note in a new folder');
+  a.fs.put('Projects/p0.md', 'another note that happens to have an old name');
+  a.fs.move('a.md', 'Projects/a.md');
+  ok(await a.syncAll());
+  ok(await a2.syncAll());
+  ok(await a.syncAll());
+  const copy = a.paths().find((p) => p.startsWith('Projects/p0 (conflict A '))!;
+  assert.ok(copy, 'the note that took an old name is kept beside the vault\'s copy, not written over it');
+  assert.deepEqual(a.paths(), ['Projects/a.md', copy, 'Projects/fresh.md', 'Projects/p0.md', ...projects().map((p) => p.replace('Projects/', 'Work/'))].sort());
+  assert.equal(a.fs.text(copy), 'another note that happens to have an old name');
+  assert.deepEqual(a2.paths(), [...projects(), 'Projects/a.md', copy, 'Projects/fresh.md'].sort());
+  assert.equal(a2.fs.text('Projects/p0.md'), 'Projects/p0.md from the vault');
+  assert.equal(a2.fs.text('Projects/a.md'), 'a vault note');
+});
+
+test('a file Obsidian does not list, such as one whose name starts with a dot, is neither received nor deleted by a plugin device', async () => {
+  const stores = { cli: new MemoryStore(), team: new MemoryStore() };
+  for (const store of Object.values(stores)) await Repo.open(store, 'test passphrase', { kdfIterations: TEST_CONFIG.kdfIterations!, chunk: TEST_CONFIG.chunk! });
+  const secrets = { 'pass:cli': 'test passphrase', 'pass:team': 'test passphrase' };
+  const fs = new ObsidianLikeFS();
+  const p = new Person('P', stores, 'cli', secrets, fs);
+  // Devices that list every file, as the command line does: one syncing the vault, one the shared folder.
+  const clock = { now: 1_800_000_000_000 };
+  const cli = new Device('C', stores.cli, clock);
+  const member = new Device('M', stores.team, clock);
+  const hidden = ['.gitignore', '.vscode/settings.json', 'notes/.keep', 'notes/.cache/x.json', '.obsidian/plugins/p/.hotreload', '.obsidian/plugins/p/node_modules/m/index.js', '.obsidianx/a'];
+  for (const path of [...hidden, 'notes/n.md', '.obsidian/plugins/p/main.js']) cli.fs.put(path, path);
+  await cli.sync();
+  ok(await p.syncAll());
+  fs.put('notes/mine.md', 'written on P, so the next sync lists the vault');
+  ok(await p.syncAll());
+  ok(await p.syncAll());
+  await cli.sync();
+  assert.deepEqual([...cli.fs.files.keys()].sort(), [...hidden, 'notes/mine.md', 'notes/n.md', '.obsidian/plugins/p/main.js'].sort(), 'nothing the plugin device can not list is deleted');
+  assert.deepEqual(p.paths(), ['.obsidian/plugins/p/main.js', 'notes/mine.md', 'notes/n.md'], 'and none of it is downloaded there');
+
+  // With the settings folder not synced on the plugin device, its files are left alone too.
+  p.settings.syncConfigDir = false;
+  fs.withConfig = false;
+  p.restart();
+  cli.fs.put('.obsidian/plugins/q/main.js', 'a plugin the plugin device does not have');
+  cli.fs.put('.obsidian/plugins/p/main.js', 'an update');
+  await cli.sync();
+  fs.put('notes/mine.md', 'edited, so the next sync lists the vault');
+  ok(await p.syncAll());
+  ok(await p.syncAll());
+  await cli.sync();
+  assert.equal(cli.fs.text('.obsidian/plugins/q/main.js'), 'a plugin the plugin device does not have');
+  assert.equal(p.fs.text('.obsidian/plugins/p/main.js'), '.obsidian/plugins/p/main.js', 'nor are they downloaded');
+  assert.ok(!p.fs.files.has('.obsidian/plugins/q/main.js'));
+
+  // The same inside a shared folder.
+  await p.share('t', 'Team', 'team');
+  for (const path of ['.keep', 'sub/.hidden/y.md', 'sub/z.md']) member.fs.put(path, path);
+  await member.sync();
+  ok(await p.syncAll());
+  fs.put('Team/mine.md', 'mine');
+  ok(await p.syncAll());
+  ok(await p.syncAll());
+  await member.sync();
+  assert.deepEqual([...member.fs.files.keys()].sort(), ['.keep', 'mine.md', 'sub/.hidden/y.md', 'sub/z.md']);
+  assert.deepEqual(p.paths().filter((x) => x.startsWith('Team/')), ['Team/mine.md', 'Team/sub/z.md']);
+});
+
 test('one shared folder failing (wrong passphrase) does not stop the vault or the shared folder after it', async () => {
   const { a, secrets } = await world();
   a.fs.put('a.md', 'vault');
   a.fs.put('Other/o.md', 'other');
   a.fs.put('Shared/s.md', 'shared');
-  const bad = a.share('bad', 'Other', 'other');
-  const good = a.share('good', 'Shared', 'team');
+  const bad = await a.share('bad', 'Other', 'other');
+  const good = await a.share('good', 'Shared', 'team');
   secrets['pass:other'] = 'not it';
   a.restart();
   const out = await a.syncAll();

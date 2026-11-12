@@ -233,17 +233,46 @@ test('cli: log lists the times the vault can go back to, newest first, with what
     rmSync(join(t.vault, 'a.md'));
     t.cli('sync');
     const lines = t.cli('log').trim().split('\n');
-    assert.deepEqual(lines.map((l) => l.split(/\s+/).slice(1).join(' ')), [
+    const fields = lines.map((l) => l.trim().split(/\s+/));
+    assert.deepEqual(fields.map((f) => f.slice(2).join(' ')), [
       'laptop 0 added, 0 changed, 1 deleted',
       'laptop 1 added, 1 changed, 0 deleted',
       'laptop 1 added, 0 changed, 0 deleted',
     ]);
-    const times = lines.map((l) => Date.parse(l.split(' ')[0]));
+    assert.deepEqual(fields.map((f) => f[0]), ['3', '2', '1'], 'each moment comes after its number, which restore-at takes');
+    const times = fields.map((f) => Date.parse(f[1]));
     assert.ok(times[0] >= times[1] && times[1] >= times[2]);
     assert.deepEqual(t.cli('log', '--limit=1').trim().split('\n'), [lines[0]]);
     const bad = t.run('log', '--limit=0');
     assert.equal(bad.status, 1);
     assert.match(bad.stderr, /--limit must be a whole number above 0/);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli: restore-at takes the number log prints for a moment, and restores exactly that one', () => {
+  const t = setup({ deviceName: 'laptop' });
+  try {
+    put(t.vault, 'a.md', 'one\n');
+    t.cli('sync');
+    put(t.vault, 'a.md', 'two\n');
+    put(t.vault, 'b.md', 'b\n');
+    t.cli('sync');
+    put(t.vault, 'a.md', 'three\n');
+    t.cli('sync');
+    const [, middle] = t.cli('log').trim().split('\n').map((l) => l.trim().split(/\s+/));
+    assert.equal(middle[0], '2');
+    const dry = t.run('restore-at', '2', '--dry-run');
+    assert.equal(dry.status, 0, dry.stderr);
+    assert.deepEqual(dry.stdout.trim().split('\n').slice(0, 2), [`the vault as of ${middle[1]}, synced by laptop:`, '  change      a.md']);
+    const r = t.run('restore-at', '2');
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(files(t.vault), { 'a.md': 'two\n', 'b.md': 'b\n' });
+    const none = t.run('restore-at', '9', '--dry-run');
+    assert.equal(none.status, 1);
+    assert.notEqual(none.stderr, '');
+    assert.deepEqual(files(t.vault), { 'a.md': 'two\n', 'b.md': 'b\n' });
   } finally {
     t.done();
   }

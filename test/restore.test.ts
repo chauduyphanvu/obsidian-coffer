@@ -6,6 +6,7 @@ import { planRestore, tableAt } from '../src/core/timeline.ts';
 import type { Entry } from '../src/core/types.ts';
 import type { VerifyReport } from '../src/core/verify.ts';
 import {
+  applyRestore,
   byDay,
   changesLabel,
   countSteps,
@@ -153,6 +154,58 @@ test('restoring the vault to an earlier time: protected paths stay, only the res
     Object.fromEntries([...b.fs.files.keys()].sort().map((p) => [p, b.fs.text(p)])),
     { 'Private/p.md': 'only synced by B\n', 'keep.md': 'keep v1\n', 'notes/0.md': 'note 0\n', 'notes/1.md': 'note 1\n', 'notes/2.md': 'note 2\n' },
   );
+});
+
+test('a restore leaves every file with changes this device has not synced as it is: one the sync before could not send, and one edited while it runs', async () => {
+  const clock = { now: 1_800_000_000_000 };
+  const a = new Device('A', new MemoryStore(() => clock.now), clock);
+  for (const n of ['a', 'b', 'c', 'd']) a.fs.put(`notes/${n}.md`, `${n}1\n`);
+  await a.sync();
+  const then = clock.now;
+  clock.now += 60_000;
+  for (const n of ['a', 'b']) a.fs.put(`notes/${n}.md`, `${n}2\n`);
+  a.fs.files.delete('notes/c.md');
+  a.fs.put('notes/new.md', 'new\n');
+  a.fs.put('notes/newer.md', 'newer\n');
+  await a.sync();
+
+  // Not sent: as when the note changed while the sync before the restore read it, so that sync skipped it.
+  a.fs.put('notes/a.md', 'a3, not synced yet\n');
+  const { repo, st, cfg, now } = await a.engine.view();
+  const past = await tableAt(repo, st.remote, st.lastSeq, cfg, now, then);
+  const { steps } = restoreSteps(planRestore(st.remote, past.files, 'notes'), st.remote, () => false);
+  assert.deepEqual(steps.map((s) => [s.kind, s.path]), [
+    ['remove', 'notes/new.md'], ['remove', 'notes/newer.md'], ['change', 'notes/a.md'], ['change', 'notes/b.md'], ['add', 'notes/c.md'],
+  ]);
+  const synced = new Map([...st.synced].map(([k, s]) => [k, { lsize: s.lsize, lmtime: s.lmtime }]));
+  let typed = false;
+  const target = {
+    stat: (p: string) => a.fs.stat(p),
+    write: (p: string, data: Uint8Array) => a.fs.write(p, data).then(() => undefined),
+    remove: async (p: string) => {
+      if (p === 'notes/new.md') a.fs.put('notes/newer.md', 'newer, edited while restoring\n');
+      await a.fs.remove(p);
+    },
+    read: (e: Entry) => {
+      if (!typed) {
+        // The user goes on writing while the restore downloads: a note it is about to change, and one it is about to bring back.
+        a.fs.put('notes/b.md', 'b, typed while restoring\n');
+        a.fs.put('notes/c.md', 'typed while restoring\n');
+        typed = true;
+      }
+      return a.engine.readVersion(e);
+    },
+  };
+  const { done, failed } = await applyRestore(steps, synced, target, 1);
+  assert.deepEqual(done.map((s) => s.path).sort(), ['notes/new.md']);
+  assert.deepEqual(failed.map((f) => f.path).sort(), ['notes/a.md', 'notes/b.md', 'notes/c.md', 'notes/newer.md']);
+  assert.match(failed[0].message, /^Changed on this device and not synced yet, so it was left as it is/);
+  assert.equal(a.fs.text('notes/a.md'), 'a3, not synced yet\n');
+  assert.equal(a.fs.text('notes/b.md'), 'b, typed while restoring\n');
+  assert.equal(a.fs.text('notes/c.md'), 'typed while restoring\n');
+  assert.equal(a.fs.text('notes/newer.md'), 'newer, edited while restoring\n');
+  assert.equal(a.fs.text('notes/d.md'), 'd1\n');
+  assert.ok(!a.fs.files.has('notes/new.md'));
 });
 
 test('a clean-up says what it deleted and what it packed tighter, or that nothing needed doing', () => {

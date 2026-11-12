@@ -1,4 +1,5 @@
-import { TFile, Vault, requestUrl, type App } from 'obsidian';
+import { TFile, TFolder, Vault, requestUrl, type App, type TAbstractFile } from 'obsidian';
+import { vaultKey } from '../core/paths.ts';
 import type { FolderFS } from '../core/scopedfs.ts';
 import type { FileStat, LocalFile, StateStore } from '../core/types.ts';
 import { uncachedHeaders, type Http } from '../stores/http.ts';
@@ -21,6 +22,12 @@ export const obsidianHttp: Http = async (req) => {
   return { status: r.status, body: new Uint8Array(r.arrayBuffer) };
 };
 
+/** The vault's file or folder at `path`, which the vault may hold under the other Unicode form of its name. */
+export function lookup(app: App, path: string): TAbstractFile | null {
+  const v = app.vault;
+  return v.getAbstractFileByPath(path) ?? v.getAbstractFileByPath(path.normalize('NFC')) ?? v.getAbstractFileByPath(path.normalize('NFD'));
+}
+
 export class ObsidianFS implements FolderFS {
   private app: App;
   private includeConfig: boolean;
@@ -36,8 +43,8 @@ export class ObsidianFS implements FolderFS {
 
   /** From the vault's own index, like `list`: no walk over the disk, and nothing outside the folder is looked at. */
   async listFolder(folder: string): Promise<LocalFile[] | null> {
-    const root = this.app.vault.getFolderByPath(folder);
-    if (!root) return null;
+    const root = lookup(this.app, folder);
+    if (!(root instanceof TFolder)) return null;
     const out: LocalFile[] = [];
     Vault.recurseChildren(root, (f) => {
       if (f instanceof TFile) out.push({ path: f.path, size: f.stat.size, mtime: f.stat.mtime });
@@ -96,15 +103,15 @@ export class ObsidianFS implements FolderFS {
 
   async remove(path: string): Promise<void> {
     const adapter = this.app.vault.adapter;
-    const file = this.app.vault.getAbstractFileByPath(path);
+    const file = lookup(this.app, path);
     // Goes wherever the user's "Deleted files" setting says: system trash, the vault's .trash, or gone.
     if (file) await this.app.fileManager.trashFile(file);
     else if (await adapter.exists(path)) await adapter.remove(path);
     // Tidy up folders this left empty, so a folder moved elsewhere does not linger as a husk. A shared folder stays:
     // without it the share would look deleted.
     try {
-      const mounts = this.mounts();
-      for (let dir = path.slice(0, path.lastIndexOf('/')); dir && !mounts.includes(dir); dir = dir.slice(0, dir.lastIndexOf('/'))) {
+      const mounts = new Set(this.mounts().map(vaultKey));
+      for (let dir = path.slice(0, path.lastIndexOf('/')); dir && !mounts.has(vaultKey(dir)); dir = dir.slice(0, dir.lastIndexOf('/'))) {
         const listing = await adapter.list(dir);
         if (listing.files.length || listing.folders.length) break;
         // Non-recursive rmdir fails with EISDIR on desktop; the folder was just checked to be empty.

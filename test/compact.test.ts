@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { utf8 } from '../src/core/bytes.ts';
+import { deflate, inflate } from '../src/core/compress.ts';
 import type { SyncConfig } from '../src/core/config.ts';
-import type { Repo } from '../src/core/repo.ts';
+import { open, seal, unlockKeys, type KeyHeader } from '../src/core/crypto.ts';
+import { seqKey, type Repo } from '../src/core/repo.ts';
 import { listCommits, listDeleted, tableAt, TooOldError } from '../src/core/timeline.ts';
 import { sameContent, type Commit, type Entry, type RemoteStore } from '../src/core/types.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
@@ -177,6 +180,48 @@ test('thinning keeps every state of the last day, one an hour back to a week and
   for (const x of await a.engine.history('n.md')) await download(v.repo, x.entry!);
   for (const d of await listDeleted(v.repo, v.st.lastSeq, v.cfg, v.now)) assert.equal(await text(v.repo, d.entry), 'later\n');
   assert.deepEqual((await a.engine.verify({ deep: true })).problems, []);
+});
+
+test('device clocks that disagree, and commits in one millisecond, change what is kept but never offer what cleanup removed', async () => {
+  const { devices: [a, b], clock } = setup(['A', 'B'], { packMaxBlobBytes: 4096, snapshotEvery: 4, retentionDays: 5 });
+  const behind = { now: clock.now };
+  b.clock = behind; // B's clock runs 50 minutes behind
+  let rev = 0;
+  const note = (d: Device) => () => d.fs.put('n.md', `revision ${++rev}\n`);
+  const edit = async (d: Device, time: number, f = note(d)) => {
+    clock.now = time;
+    behind.now = time - 50 * MIN;
+    await d.sync();
+    f();
+    await d.sync();
+  };
+  for (let day = 0; day < 10; day += 2) {
+    const t = T0 + day * DAY + 23 * HOUR + 30 * MIN;
+    await edit(a, t);
+    await edit(b, t + 5 * MIN); // made later, stamped in the hour and day before
+    await edit(b, t + 5 * MIN); // the same millisecond
+    await edit(a, t + 20 * MIN, () => {
+      note(a)();
+      a.fs.put(`d${day}.md`, `brief ${day}\n`);
+    });
+    await edit(b, t + 2 * HOUR, () => b.fs.files.delete(`d${day}.md`));
+  }
+  for (const days of [11, 13, 16]) {
+    clock.now = T0 + days * DAY;
+    behind.now = clock.now - 50 * MIN;
+    const v = await a.engine.view();
+    const { moments } = await oracle(v.repo, v.st.lastSeq, v.cfg, v.now);
+    const list = await listCommits(v.repo, v.st.lastSeq, v.cfg, v.now);
+    assert.deepEqual(list.map((c) => c.seq), moments.map((c) => c.seq).reverse(), `day ${days}`);
+    const versions = await a.engine.history('n.md');
+    const deleted = await listDeleted(v.repo, v.st.lastSeq, v.cfg, v.now);
+    await a.engine.gc();
+    for (const m of list) {
+      for (const e of (await tableAt(v.repo, v.st.remote, v.st.lastSeq, v.cfg, v.now, { seq: m.seq })).files.values()) await download(v.repo, e);
+    }
+    for (const x of versions) await download(v.repo, x.entry!);
+    for (const d of deleted) assert.match(await text(v.repo, d.entry), /^brief/);
+  }
 });
 
 test('the earliest moment is the last day-ending state at or before the floor snapshot, and only moves forward', async () => {
@@ -563,6 +608,38 @@ test('a device away across a move and the removal of the old packs still merges 
   await a.sync();
   assert.equal(a.fs.text('n.md'), base.replace('first', 'FIRST from B').replace('third', 'THIRD from A'));
   assert.deepEqual(a.snapshot(), b.snapshot());
+  assert.deepEqual((await a.engine.verify({ deep: true })).problems, []);
+});
+
+/** Rewrites history index `seq` as a version from before moves wrote it: each commit re-encoded with only the fields it knew. */
+async function oldIndex(mem: MemoryStore, seq: number): Promise<void> {
+  const header = JSON.parse(new TextDecoder().decode(mem.objects.get('vault.json')!.data)) as { id: string; kdf: KeyHeader };
+  const keys = await unlockKeys(header.kdf, 'test passphrase');
+  const key = seqKey('idx', seq);
+  const aad = `${header.id}:${key}`;
+  const { plain } = await open(keys, mem.objects.get(key)!.data, aad);
+  const commits = JSON.parse(new TextDecoder().decode(await inflate(plain))) as { d: unknown; t: unknown; p: unknown; c: unknown }[];
+  const old = commits.map(({ d, t, p, c }) => ({ d, t, p, c }));
+  mem.objects.get(key)!.data = await seal(keys, await deflate(utf8.encode(JSON.stringify(old))), aad);
+}
+
+test('a history index written by a version that drops the move flag does not turn the move into a moment, a version or activity', async () => {
+  const { devices: [a, b], mem, clock } = await grown(8);
+  assert.equal((await a.engine.gc()).packsCombined, 8); // 9: a move
+  clock.now += HOUR;
+  a.fs.put('n3.md', 'edited\n');
+  await a.sync(); // 10: a snapshot, and the index of 1-10
+  await b.sync();
+  const before = await seen(a);
+  const { repo } = await a.engine.view();
+  assert.equal((await repo.readDigest(10, 10))?.[8].moved, true, 'this version keeps the flag in the index');
+
+  await oldIndex(mem, 10);
+  assert.equal(await seen(a), before);
+  assert.equal(await seen(b), before);
+  clock.now += 3 * DAY;
+  const r = await a.engine.gc();
+  assert.equal(r.packsDeleted, 1, 'n7.md\'s first place: moment 8 reads the copy, the move being part of it, not a moment of its own');
   assert.deepEqual((await a.engine.verify({ deep: true })).problems, []);
 });
 

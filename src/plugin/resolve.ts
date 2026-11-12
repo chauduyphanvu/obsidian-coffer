@@ -4,6 +4,7 @@ import { applyChoices, hunks, type Choice, type Hunk } from '../core/merge.ts';
 import { conflictOriginal, fileName } from '../core/paths.ts';
 import { plural } from '../core/text.ts';
 import type SelfSyncPlugin from './main.ts';
+import { lookup } from './obsidianfs.ts';
 import { MAX_COMPARE_BYTES, compareConflict, unchangedSince, type Comparison, type Snapshot, type WholeReason } from './status.ts';
 import { button, buttonRow, choice, message, openLink } from './ui.ts';
 
@@ -28,7 +29,7 @@ export function resolveConflict(plugin: SelfSyncPlugin, copy: string): void {
 
 /** Opens the resolver for the first conflict copy still waiting, or says there is none. */
 export function resolveFirstConflict(plugin: SelfSyncPlugin): void {
-  const copy = plugin.allConflictCopies().find((p) => plugin.app.vault.getAbstractFileByPath(p) instanceof TFile);
+  const copy = plugin.allConflictCopies().find((p) => lookup(plugin.app, p) instanceof TFile);
   if (copy) resolveConflict(plugin, copy);
   else new Notice('No files are waiting to be resolved.');
 }
@@ -102,7 +103,7 @@ class ConflictModal extends Modal {
   }
 
   private file(path: string): TFile | undefined {
-    const f = this.app.vault.getAbstractFileByPath(path);
+    const f = lookup(this.app, path);
     return f instanceof TFile ? f : undefined;
   }
 

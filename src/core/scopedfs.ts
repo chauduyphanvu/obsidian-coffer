@@ -24,6 +24,15 @@ export class MissingFolderError extends Error {
 /** `path` is inside `folder`, compared in NFC like every vault path. */
 export const isInside = (folder: string, path: string) => vaultKey(path).startsWith(`${vaultKey(folder)}/`);
 
+/** `path` is `folder` itself or inside it, in either Unicode form. */
+export const isAtOrInside = (folder: string, path: string) => vaultKey(path) === vaultKey(folder) || isInside(folder, path);
+
+/**
+ * The part of `path` below `folder`, which holds it (see `isAtOrInside`). Cut by folder levels, not by length: the two
+ * may be in different Unicode forms, and the part below keeps the form it has, which is the file's name on disk.
+ */
+export const below = (folder: string, path: string) => (folder ? path.split('/').slice(folder.split('/').length).join('/') : path);
+
 /** Inside regardless of case: some file systems ignore it, so a write there would land in the folder. */
 const isInsideAnyCase = (folder: string, path: string) => vaultKey(path).toLowerCase().startsWith(`${vaultKey(folder).toLowerCase()}/`);
 
@@ -48,7 +57,7 @@ export class ScopedFS implements LocalFS {
 
   private nested(): string[] {
     const folder = this.folder;
-    return this.mounts().filter((m) => m !== folder && (!folder || isInside(folder, m)));
+    return this.mounts().filter((m) => vaultKey(m) !== vaultKey(folder) && (!folder || isInside(folder, m)));
   }
 
   /** The vault path of `path` in this scope. Refuses a path that would leave it, or enter a shared folder nested in it. */
@@ -66,15 +75,12 @@ export class ScopedFS implements LocalFS {
     if (!files) throw new MissingFolderError(folder);
     const nested = this.nested().map((m) => `${vaultKey(m)}/`);
     if (!folder && !nested.length) return files;
-    const start = folder ? `${folder}/` : '';
+    const start = folder ? `${vaultKey(folder)}/` : '';
     const out: LocalFile[] = [];
     for (const f of files) {
-      if (!f.path.startsWith(start)) continue;
-      if (nested.length) {
-        const key = vaultKey(f.path);
-        if (nested.some((m) => key.startsWith(m))) continue;
-      }
-      out.push({ ...f, path: f.path.slice(start.length) });
+      const key = vaultKey(f.path);
+      if (!key.startsWith(start) || nested.some((m) => key.startsWith(m))) continue;
+      out.push(folder ? { ...f, path: below(folder, f.path) } : f);
     }
     return out;
   }

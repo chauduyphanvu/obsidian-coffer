@@ -693,7 +693,8 @@ export class RestoreEarlierModal extends Modal {
     this.render();
     try {
       const look = (this.look = await this.plugin.look(this.share));
-      const past = await tableAt(look.repo, look.remote, look.lastSeq, look.cfg, look.now, m.time);
+      // By its number: device clocks disagree, and two moments can share a millisecond, so its time may name another.
+      const past = await tableAt(look.repo, look.remote, look.lastSeq, look.cfg, look.now, { seq: m.seq });
       const { steps, left } = restoreSteps(planRestore(look.remote, past.files, this.folder), look.remote, this.plugin.keptOut(this.share));
       if (this.asked !== asked) return;
       this.past = past;

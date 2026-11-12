@@ -1,4 +1,5 @@
 // What a restore does, and how the past reads to a person. No Obsidian import, so it runs under plain Node tests.
+import { pool } from '../core/bytes.ts';
 import { compileExcludes, type SyncConfig } from '../core/config.ts';
 import { deleteLimit, type GcResult } from '../core/engine.ts';
 import { diffCounts, lineDiff, type DiffRegion } from '../core/merge.ts';
@@ -6,7 +7,7 @@ import { ext, vaultKey } from '../core/paths.ts';
 import { DAY } from '../core/retention.ts';
 import { plural } from '../core/text.ts';
 import type { RestorePlan } from '../core/timeline.ts';
-import type { Entry } from '../core/types.ts';
+import type { Entry, FileStat } from '../core/types.ts';
 import type { VerifyReport } from '../core/verify.ts';
 import { MAX_COMPARE_BYTES, asText, sameBytes } from './status.ts';
 
@@ -75,6 +76,76 @@ export function placeRestored(paths: string[], taken: Set<string>): Map<string, 
     out.set(path, to);
   }
   return out;
+}
+
+export interface Failed {
+  path: string;
+  message: string;
+}
+
+/** Where a restore is applied, by the paths of its steps. */
+export interface RestoreTarget {
+  stat(path: string): Promise<FileStat | null>;
+  write(path: string, data: Uint8Array): Promise<void>;
+  remove(path: string): Promise<void>;
+  /** The content of a version, from storage. */
+  read(entry: Entry): Promise<Uint8Array>;
+}
+
+/** What this device last synced of a file: its size and time on disk then. */
+export type SyncedStat = { lsize: number; lmtime: number };
+
+const UNSENT = 'Changed on this device and not synced yet, so it was left as it is. Sync, then restore again to replace it.';
+
+/** A file as it is now (`now`) holds changes the sync has not sent: it is not the one last synced, or none was. */
+export const unsent = (now: FileStat | null, synced: SyncedStat | undefined) => !!now && (!synced || synced.lsize !== now.size || synced.lmtime !== now.mtime);
+
+/**
+ * Applies `steps`: removals one by one, then writes, `parallel` at a time. One file failing does not stop the rest.
+ * A file is changed or removed only when it is the one this device last synced (`synced`, by path), so that what it
+ * holds now is in storage too: one with changes a sync has not sent, as one the sync before could not finish, one
+ * edited while the restore runs, or a new file in the way, is left as it is and listed as failed. That is checked
+ * right before each change, after the version to write has been downloaded.
+ */
+export async function applyRestore(
+  steps: Step[],
+  synced: Map<string, SyncedStat>,
+  t: RestoreTarget,
+  parallel: number,
+  progress: (kind: 'remove' | 'write', done: number, total: number) => void = () => {},
+): Promise<{ done: Step[]; failed: Failed[] }> {
+  const done: Step[] = [];
+  const failed: Failed[] = [];
+  const settled = async (path: string) => {
+    if (unsent(await t.stat(path), synced.get(path))) throw new Error(UNSENT);
+  };
+  const run = async (s: Step) => {
+    try {
+      if (s.kind === 'remove') {
+        await settled(s.path);
+        await t.remove(s.path);
+      } else {
+        const data = await t.read(s.entry!);
+        await settled(s.path);
+        await t.write(s.path, data);
+      }
+      done.push(s);
+    } catch (e) {
+      failed.push({ path: s.path, message: e instanceof Error ? e.message : String(e) });
+    }
+  };
+  const removals = steps.filter((s) => s.kind === 'remove');
+  const writes = steps.filter((s) => s.kind !== 'remove');
+  for (const [i, s] of removals.entries()) {
+    progress('remove', i + 1, removals.length);
+    await run(s);
+  }
+  let n = 0;
+  await pool(writes, parallel, async (s) => {
+    await run(s);
+    progress('write', ++n, writes.length);
+  });
+  return { done, failed };
 }
 
 /**

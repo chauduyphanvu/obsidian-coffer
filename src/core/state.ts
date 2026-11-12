@@ -38,19 +38,16 @@ export class LocalState {
     return st;
   }
 
-  /** Advances the remote file table by one commit. Returns the paths it touched. */
-  apply(c: Commit): Set<string> {
-    const touched = new Set<string>();
+  /** Advances the remote file table by one commit. */
+  apply(c: Commit): void {
     for (const ch of c.changes) {
       if (ch.entry) this.remote.set(ch.path, ch.entry);
       else this.remote.delete(ch.path);
       if (c.confirmed && !ch.entry) this.confirmed.add(ch.path);
       else this.confirmed.delete(ch.path);
-      touched.add(ch.path);
     }
     this.lastSeq = c.seq;
     this.head = c.hash;
-    return touched;
   }
 
   /**

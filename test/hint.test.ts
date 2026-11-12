@@ -238,6 +238,43 @@ test('remote changes read outside a sync are still synced by a hint naming nothi
   assert.equal(await a.engine.remoteChanged(), false);
 });
 
+test('remote changes taken into the table before a later request failed are still synced by the next hinted sync', async () => {
+  const { a, b, net } = await synced();
+  // Two new commits are read with the first probe; listing the log for more then fails.
+  for (const p of ['one.md', 'two.md']) {
+    b.fs.put(p, `${p} from B\n`);
+    await b.sync();
+  }
+  const { list } = net;
+  net.list = async (prefix, after) => (prefix === 'log/' ? Promise.reject(new Error('offline')) : list.call(net, prefix, after));
+  await assert.rejects(a.engine.view(), /offline/);
+  net.list = list;
+  assert.equal(await a.engine.remoteChanged(), true, 'the commits read are not synced yet');
+  b.fs.put('three.md', 'three.md from B\n');
+  await b.sync();
+  let r = await hinted(a);
+  assert.deepEqual([r.pulled, r.errors.length], [3, 0]);
+  assert.deepEqual(a.snapshot(), b.snapshot());
+
+  // A device far behind loads a snapshot, then fails to read a commit after it.
+  const env = setup(['A', 'B'], { snapshotEvery: 3 });
+  const [c, d] = env.devices;
+  c.fs.put('a.md', 'a\n');
+  await c.sync();
+  await d.sync();
+  for (let i = 2; i <= 10; i++) {
+    d.fs.put(`f${i}.md`, `${i}\n`);
+    await d.sync();
+  }
+  const { get } = env.net;
+  env.net.get = async (key, range) => (key === 'log/000000000010' ? Promise.reject(new Error('offline')) : get.call(env.net, key, range));
+  await assert.rejects(c.engine.view(), /offline/);
+  env.net.get = get;
+  r = await hinted(c);
+  assert.deepEqual([r.pulled, r.errors.length], [9, 0]);
+  assert.deepEqual(c.snapshot(), d.snapshot());
+});
+
 test('a file that failed is tried again by the next hinted sync though nothing names it', async () => {
   const { a, b } = await synced();
   a.fs.put('locked.md', 'locked\n');

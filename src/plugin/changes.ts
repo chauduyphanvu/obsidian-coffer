@@ -50,19 +50,26 @@ export class ChangeLog {
     return s;
   }
 
-  /** A file created, changed or deleted, by vault path. A file renamed or moved is both paths. */
-  file(path: string): void {
+  /** A file created, changed or deleted, by vault path. A file renamed or moved is both paths. Returns its place's id. */
+  file(path: string): string {
     const { share, path: inside } = placeOf(this.shares(), path);
-    if (inside) this.of(share?.id ?? '').paths.add(inside);
+    const id = share?.id ?? '';
+    if (inside) this.of(id).paths.add(inside);
+    return id;
   }
 
-  /** A folder renamed or moved to `to`, or deleted: the places it was and is in, and the shared folders it is or holds. */
-  folder(path: string, to?: string): void {
+  /**
+   * A folder renamed or moved to `to`, or deleted: the places it was and is in, and the shared folders it is or holds.
+   * Returns their ids.
+   */
+  folder(path: string, to?: string): string[] {
     const shares = this.shares();
+    const ids: string[] = [];
     for (const at of to === undefined ? [path] : [path, to]) {
-      this.of(placeOf(shares, at).share?.id ?? '').unknown = true;
-      for (const s of goneWith(shares, at)) this.of(s.id).unknown = true;
+      ids.push(placeOf(shares, at).share?.id ?? '', ...goneWith(shares, at).map((s) => s.id));
     }
+    for (const id of ids) this.of(id).unknown = true;
+    return [...new Set(ids)];
   }
 
   /** Changes may have gone unseen anywhere. */

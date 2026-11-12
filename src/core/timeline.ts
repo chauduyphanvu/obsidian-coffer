@@ -13,9 +13,9 @@ export interface Moment {
 
 export interface PastVault {
   /**
-   * The kept moment used: the last one at or before the time asked for. States between kept moments
-   * are thinned away (see `keptState`), so a time inside such a stretch gets the kept moment before it.
-   * `files` is the vault at that moment.
+   * The kept moment used: the one asked for, or for a time, the newest one stamped at or before it.
+   * States between kept moments are thinned away (see `keptState`), so a time inside such a stretch gets
+   * the kept moment before it. `files` is the vault at that moment.
    */
   commit: Moment;
   files: Map<string, Entry>;
@@ -111,16 +111,33 @@ async function earliestMoment(reads: Reads, snaps: Snapshot[], k: Kept, lastSeq:
   return moment(prev);
 }
 
+/** Refuses a sequence number that names no moment `listCommits` offers. */
+async function checkMoment(reads: Reads, k: Kept, earliest: Moment, lastSeq: number, seq: number): Promise<void> {
+  const no = (why: string) => new Error(`Commit ${seq} is not a kept moment: ${why}`);
+  if (seq < 1 || seq > lastSeq) throw no('there is no such commit');
+  if (seq < earliest.seq) throw new TooOldError(earliest);
+  const c = await reads.get(seq);
+  if (c.moved) throw no('it only moved stored data');
+  if (seq > earliest.seq && !keptState(c.time, (await userAfter(reads, seq, lastSeq))?.time, k.now)) throw no('it has been thinned out of history');
+}
+
 interface Found {
   commit: Moment;
   files: Map<string, Entry>;
+}
+
+/** The moment to find: the newest kept one that `upTo` accepts. */
+interface Want {
+  upTo: (c: Commit) => boolean;
+  /** True for a user commit from which on `upTo` accepts nothing, where a replay stops. */
+  past: (c: Commit) => boolean;
 }
 
 /**
  * From the current table, undoing the commits made after the moment. The vault at a moment is the
  * vault just before the next user commit: moves made in between belong to it.
  */
-async function backward(reads: Reads, snaps: Snapshot[], k: Kept, remote: Map<string, Entry>, lastSeq: number, at: number): Promise<Found | undefined> {
+async function backward(reads: Reads, snaps: Snapshot[], k: Kept, remote: Map<string, Entry>, lastSeq: number, want: Want): Promise<Found | undefined> {
   const walk = new Backward(reads, snaps, lastSeq);
   const thin = restorable(k);
   const later = new Set<string>();
@@ -130,7 +147,7 @@ async function backward(reads: Reads, snaps: Snapshot[], k: Kept, remote: Map<st
       for (const ch of c.changes) if (!moved.has(ch.path)) moved.set(ch.path, ch.entry);
       continue;
     }
-    if (thin.see(c) && c.time <= at) {
+    if (thin.see(c) && want.upTo(c)) {
       const files = new Map(remote);
       const open = [...later].filter((p) => !moved.has(p));
       for (const [path, entry] of moved) if (later.has(path)) apply(files, path, entry);
@@ -146,23 +163,23 @@ async function backward(reads: Reads, snaps: Snapshot[], k: Kept, remote: Map<st
 }
 
 /**
- * From snapshot `base` (0: an empty vault), replaying commits up to the last kept moment made at or
- * before `at`. Undefined when no kept moment from `from` on falls between `base` and `at`.
+ * From snapshot `base` (0: an empty vault), replaying commits up to the moment wanted. Undefined when
+ * no kept moment from `from` on that it wants falls after `base`.
  */
-async function replay(reads: Reads, k: Kept, from: number, base: number, lastSeq: number, at: number): Promise<Found | undefined> {
+async function replay(reads: Reads, k: Kept, from: number, base: number, lastSeq: number, want: Want): Promise<Found | undefined> {
   const seen: Commit[] = [];
   let prev: Commit | undefined = base ? await reads.get(base) : undefined;
   if (prev?.moved) prev = undefined;
   let best: { c: Commit; end: number } | undefined;
   const consider = (u: Commit, next: Commit | undefined, end: number) => {
-    if (u.seq >= from && u.time <= at && keptState(u.time, next?.time, k.now)) best = { c: u, end };
+    if (u.seq >= from && want.upTo(u) && keptState(u.time, next?.time, k.now)) best = { c: u, end };
   };
   let stopped = false;
   const fwd = new Forward(reads, base + 1, lastSeq);
   for (let c: Commit | undefined; (c = await fwd.next()); ) {
     if (!c.moved) {
       if (prev) consider(prev, c, c.seq - 1);
-      if (c.time > at) {
+      if (want.past(c)) {
         stopped = true;
         break;
       }
@@ -182,34 +199,55 @@ async function replay(reads: Reads, k: Kept, from: number, base: number, lastSeq
   return { commit: moment(best.c), files };
 }
 
-/** From the newest snapshot stored by `at`, or an older one when no kept moment follows it by then. */
-async function forward(reads: Reads, snaps: Snapshot[], k: Kept, from: number, lastSeq: number, at: number): Promise<Found | undefined> {
-  const bases = snaps.filter((s) => s.modified <= at).map((s) => s.seq);
+/** From the newest of `bases`, or an older one when no kept moment wanted follows it. */
+async function forward(reads: Reads, bases: Snapshot[], k: Kept, from: number, lastSeq: number, want: Want): Promise<Found | undefined> {
   for (let i = bases.length - 1; ; i--) {
-    const base = i >= 0 ? bases[i] : 0;
-    const found = await replay(reads, k, from, base, lastSeq, at);
+    const base = i >= 0 ? bases[i].seq : 0;
+    const found = await replay(reads, k, from, base, lastSeq, want);
     if (found || base <= from) return found;
   }
 }
 
 /**
- * The vault as it was at `at`: every file at the last kept moment made at or before it.
- * Commit times are taken to rise with their sequence numbers. A moment after the newest snapshot is
- * worked out backward from `remote`, an older one forward from a snapshot before it. Throws
- * TooOldError for a time before `earliest`, whose files may no longer all be stored.
+ * The vault at a kept moment: the one `at` names by its commit's sequence number, as `listCommits` lists
+ * it, or for a time, the newest one stamped at or before it. Commit times come from device clocks, so a
+ * moment made later may be stamped earlier, and two may share a millisecond: only the sequence number
+ * names each moment. A time is resolved alike whether worked out backward from `remote` (a moment after
+ * the newest snapshot) or forward from a snapshot before it, provided no clock runs more than an hour
+ * behind the storage's. Throws TooOldError for a moment before `earliest`, or a time before its stamp,
+ * whose files may no longer all be stored, and an Error for a sequence number that names no kept moment.
  */
-export async function tableAt(repo: Repo, remote: Map<string, Entry>, lastSeq: number, cfg: SyncConfig, now: number, at: number): Promise<PastVault> {
+export async function tableAt(
+  repo: Repo,
+  remote: Map<string, Entry>,
+  lastSeq: number,
+  cfg: SyncConfig,
+  now: number,
+  at: number | { seq: number },
+): Promise<PastVault> {
   if (!lastSeq) throw new Error('Nothing has been synced yet');
   const all = await repo.snapshots();
   const k = kept(all, cfg, now);
   const snaps = all.filter((s) => s.seq <= lastSeq);
   const reads = new Reads(repo, cfg);
   const earliest = await earliestMoment(reads, snaps, k, lastSeq);
-  if (at < earliest.time) throw new TooOldError(earliest);
   const newest = snaps[snaps.length - 1];
-  const found = !newest || at >= newest.modified
-    ? await backward(reads, snaps, k, remote, lastSeq, at)
-    : await forward(reads, snaps, k, earliest.seq, lastSeq, at);
+  let want: Want, recent: boolean, bases: Snapshot[];
+  if (typeof at === 'number') {
+    if (at < earliest.time) throw new TooOldError(earliest);
+    // Stored an hour after `at`, so commits from it on were stamped after `at` even by a clock that runs behind the storage's.
+    const end = snaps.find((s) => s.modified >= at + HOUR)?.seq ?? Infinity;
+    want = { upTo: (c) => c.time <= at, past: (c) => c.seq >= end };
+    recent = !newest || at >= newest.modified;
+    bases = snaps.filter((s) => s.modified <= at);
+  } else {
+    const { seq } = at;
+    await checkMoment(reads, k, earliest, lastSeq, seq);
+    want = { upTo: (c) => c.seq <= seq, past: (c) => c.seq > seq };
+    recent = !newest || seq >= newest.seq;
+    bases = snaps.filter((s) => s.seq <= seq);
+  }
+  const found = recent ? await backward(reads, snaps, k, remote, lastSeq, want) : await forward(reads, bases, k, earliest.seq, lastSeq, want);
   if (!found || found.commit.seq < earliest.seq) throw new TooOldError(earliest);
   return { commit: found.commit, files: found.files, earliest };
 }
@@ -282,7 +320,8 @@ export async function listDeleted(repo: Repo, lastSeq: number, cfg: SyncConfig, 
  * `before`, starts at the newest moment made before then, reading from a snapshot near it rather than
  * from the newest commit. With `beforeSeq`, starts at the newest moment before that commit: the `seq`
  * of a page's last moment gives exactly the page after it, which a time cannot when two moments share
- * a millisecond.
+ * a millisecond or a later one is stamped earlier. Moments come in the order they were made, whatever
+ * their stamps say.
  */
 export async function listCommits(
   repo: Repo,

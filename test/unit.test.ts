@@ -4,6 +4,7 @@ import { cutPoints } from '../src/core/chunker.ts';
 import { compileExcludes } from '../src/core/config.ts';
 import { chunkId, createKeys, open, seal, unlockKeys, WrongPassphraseError } from '../src/core/crypto.ts';
 import { merge3, mergeJson } from '../src/core/merge.ts';
+import { packRanges } from '../src/core/packer.ts';
 import { conflictCopyName, conflictOriginal, ext, vaultKey } from '../src/core/paths.ts';
 import { plural } from '../src/core/text.ts';
 import { checkStore } from '../src/stores/doctor.ts';
@@ -137,6 +138,19 @@ test('merge3: fuzz against an independent oracle', () => {
     assert.equal(merge3(b, ours, b), ours);
     assert.equal(merge3(b, ours, ours), ours);
   }
+});
+
+test('pack ranges: neighbours within the gap share a request up to the cap, and a chunk inside another never cuts a range short', () => {
+  const ref = (pack: string, off: number, len: number) => ({ id: `${pack}${off}`, pack, off, len, size: len });
+  const got = packRanges([ref('b', 0, 10), ref('a', 50, 10), ref('a', 0, 10), ref('a', 15, 10), ref('a', 40, 30), ref('a', 45, 5), ref('a', 200, 500), ref('c', 0, 60), ref('c', 60, 60)], 5, 100);
+  assert.deepEqual(got.map((r) => [r.pack, r.start, r.end, r.refs.map((x) => x.off)]), [
+    ['b', 0, 10, [0]],
+    ['a', 0, 25, [0, 15]],
+    ['a', 40, 70, [40, 45, 50]],
+    ['a', 200, 700, [200]],
+    ['c', 0, 60, [0]],
+    ['c', 60, 120, [60]],
+  ]);
 });
 
 test('exclude patterns', () => {

@@ -1,4 +1,5 @@
 import { pool } from './bytes.ts';
+import { packRanges } from './packer.ts';
 import { seqKey, type Repo } from './repo.ts';
 import { sameContent, type ChunkRef, type Commit, type Entry } from './types.ts';
 
@@ -221,31 +222,22 @@ async function checkChunks(repo: Repo, o: Context, files: Map<string, Entry>, sk
       u.paths.push(path);
     }
   }
-  const ranges: { pack: string; start: number; end: number; units: { ref: ChunkRef; paths: string[] }[] }[] = [];
-  let total = 0;
-  for (const [pack, stored] of byPack) {
-    let cur: (typeof ranges)[number] | undefined;
-    for (const u of [...stored.values()].sort((a, b) => a.ref.off - b.ref.off)) {
-      const { off, len } = u.ref;
-      if (cur && off - cur.end <= o.rangeGapBytes && off + len - cur.start <= MAX_RANGE) {
-        cur.end = Math.max(cur.end, off + len);
-        cur.units.push(u);
-      } else ranges.push((cur = { pack, start: off, end: off + len, units: [u] }));
-      total++;
-    }
-  }
+  const units = [...byPack.values()].flatMap((stored) => [...stored.values()]);
+  const pathsOf = new Map(units.map((u) => [u.ref, u.paths]));
+  const total = units.length;
 
   let done = 0;
-  await pool(ranges, Math.min(o.concurrency, PARALLEL), async (r) => {
+  await pool(packRanges(units.map((u) => u.ref), o.rangeGapBytes, MAX_RANGE), Math.min(o.concurrency, PARALLEL), async (r) => {
     const data = await repo.getPackRange(r.pack, r.start, r.end);
     if (!data || data.length < r.end - r.start) {
-      problem(`Pack ${r.pack} is missing or shorter than its chunks need`, `pack/${r.pack}`, r.units.flatMap((u) => u.paths));
-      done += r.units.length;
+      problem(`Pack ${r.pack} is missing or shorter than its chunks need`, `pack/${r.pack}`, r.refs.flatMap((ref) => pathsOf.get(ref)!));
+      done += r.refs.length;
       o.onProgress?.({ phase: 'chunks', done, total });
       return;
     }
     report.bytes += data.length;
-    for (const { ref, paths } of r.units) {
+    for (const ref of r.refs) {
+      const paths = pathsOf.get(ref)!;
       const at = ref.off - r.start;
       const where = `Chunk ${ref.id} in pack ${ref.pack}`;
       try {
