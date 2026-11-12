@@ -280,24 +280,26 @@ export async function listDeleted(repo: Repo, lastSeq: number, cfg: SyncConfig, 
  * The kept moments, newest first, each with how many files were added, changed and deleted since the
  * kept moment before it. Stops after `limit` moments, or at the first one made before `since`. With
  * `before`, starts at the newest moment made before then, reading from a snapshot near it rather than
- * from the newest commit.
+ * from the newest commit. With `beforeSeq`, starts at the newest moment before that commit: the `seq`
+ * of a page's last moment gives exactly the page after it, which a time cannot when two moments share
+ * a millisecond.
  */
 export async function listCommits(
   repo: Repo,
   lastSeq: number,
   cfg: SyncConfig,
   now: number,
-  opts: { limit?: number; since?: number; before?: number } = {},
+  opts: { limit?: number; since?: number; before?: number; beforeSeq?: number } = {},
 ): Promise<CommitSummary[]> {
-  const { limit = Infinity, since = -Infinity, before = Infinity } = opts;
+  const { limit = Infinity, since = -Infinity, before = Infinity, beforeSeq = Infinity } = opts;
   const snaps = await repo.snapshots();
   const k = kept(snaps, cfg, now);
   const reads = new Reads(repo, cfg);
-  let from = lastSeq;
-  let next: number | undefined;
+  let from = Math.max(0, Math.min(lastSeq, beforeSeq - 1));
+  let next = from < lastSeq ? (await userAfter(reads, from, lastSeq))?.time : undefined;
   if (before !== Infinity) {
     // Stored an hour after `before`, so commits after it were made after `before` even by a clock that runs behind the storage's.
-    const start = snaps.find((s) => s.seq <= lastSeq && s.modified >= before + HOUR);
+    const start = snaps.find((s) => s.seq <= from && s.modified >= before + HOUR);
     if (start) {
       from = start.seq;
       next = (await userAfter(reads, from, lastSeq))?.time;

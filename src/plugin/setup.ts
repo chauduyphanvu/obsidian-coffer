@@ -7,16 +7,23 @@ import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
 import type SelfSyncPlugin from './main.ts';
 import { obsidianHttp } from './obsidianfs.ts';
-import { PROVIDERS, folderFor, remoteSpec, secretName, setupCodeFrom, storageSettings, type Provider, type Settings, type StorageForm } from './settings.ts';
+import { PROVIDERS, codeKind, folderFor, remoteSpec, secretName, setupCodeFrom, storageSettings, type Provider, type Settings, type Storage, type StorageForm } from './settings.ts';
 import { describeFailure, summarize } from './status.ts';
 import { button, buttonRow, choice, field, message } from './ui.ts';
 
 type Step = 'start' | 'provider' | 'storage' | 'passphrase' | 'join' | 'syncing' | 'done';
 
 /** What setup stores, the same secrets a setup code fills in; `secretName` makes each name this vault's own. */
-const IDS = { access: 'self-sync-access-key', secret: 'self-sync-secret-key', password: 'self-sync-webdav-password', passphrase: 'self-sync-passphrase' };
+export const IDS = { access: 'self-sync-access-key', secret: 'self-sync-secret-key', password: 'self-sync-webdav-password', passphrase: 'self-sync-passphrase' };
 
-const MIN_PASSPHRASE = 8;
+export const MIN_PASSPHRASE = 8;
+
+/** The keys typed into the storage form. Kept apart from settings until they are stored as secrets. */
+export interface Keys {
+  access: string;
+  secret: string;
+  password: string;
+}
 
 /** Why connecting failed: what to check, then the storage's own words. */
 function connectError(cause: string): string {
@@ -27,6 +34,70 @@ function connectError(cause: string): string {
   };
   const kind = describeFailure(new Error(cause)).id;
   return `${advice[kind] ?? 'Connecting failed.'}\n${cause}`;
+}
+
+/** The fields `provider` needs, filling in `f` and `k` as they are typed, for the vault's storage or a shared folder's. */
+export function storageFields(c: HTMLElement, provider: Provider, f: StorageForm, k: Keys, forShare = false): void {
+  const set = (key: keyof StorageForm) => (v: string) => ((f as unknown as Record<string, string>)[key] = v);
+  switch (provider) {
+    case 'r2':
+      field(c, 'Account ID', { value: f.location, placeholder: '0123456789abcdef0123456789abcdef', hint: "In Cloudflare's dashboard on the R2 page. The bucket's S3 API address works too." }, set('location'));
+      break;
+    case 'b2':
+      field(c, 'Endpoint', { value: f.location, placeholder: 's3.us-west-004.backblazeb2.com', hint: "Shown on the bucket's page." }, set('location'));
+      break;
+    case 'aws':
+      field(c, 'Region', { value: f.location, placeholder: 'us-east-1', hint: "Shown next to the bucket's name." }, set('location'));
+      break;
+    case 's3':
+      field(c, 'Endpoint', { value: f.location, placeholder: 'https://s3.example.com' }, set('location'));
+      field(c, 'Region', { value: f.region, placeholder: 'us-east-1', hint: 'Leave empty if your provider does not mention one.' }, set('region'));
+      break;
+    case 'webdav':
+      field(c, 'Folder address', { value: f.location, placeholder: 'https://cloud.example.com/remote.php/dav/files/me/Obsidian', hint: `A folder that will hold ${forShare ? 'the shared folder' : 'this vault'}. It is created if missing.` }, set('location'));
+      field(c, 'User name', { value: f.user }, set('user'));
+      field(c, 'Password', { value: k.password, password: true, hint: 'For Nextcloud, create an app password in its security settings.' }, (v) => (k.password = v));
+      break;
+  }
+  if (provider === 'webdav') return;
+  field(c, 'Bucket', { value: f.bucket, placeholder: 'my-notes' }, set('bucket'));
+  field(c, provider === 'b2' ? 'Key ID' : 'Access key ID', { value: k.access }, (v) => (k.access = v));
+  field(
+    c,
+    provider === 'b2' ? 'Application key' : 'Secret access key',
+    { value: k.secret, password: true, hint: `Use a key that can only reach ${forShare ? 'this folder in the bucket' : 'this bucket'}. It is kept in this device's secure storage.` },
+    (v) => (k.secret = v),
+  );
+  field(c, 'Folder in bucket', { value: f.prefix, hint: forShare ? 'Filled in for you. Everyone who joins uses the same folder.' : 'Lets one bucket hold several vaults. Filled in for you.' }, set('prefix'));
+  if (provider === 's3') {
+    const row = c.createEl('label', { cls: 'self-sync-check' });
+    const box = row.createEl('input', { attr: { type: 'checkbox' } });
+    box.checked = f.pathStyle;
+    box.addEventListener('change', () => (f.pathStyle = box.checked));
+    row.appendText(' Path-style addresses (MinIO and most self-hosted servers need this)');
+  }
+}
+
+/** The storage settings the form describes, or an error saying what is missing. */
+export function formStorage(provider: Provider, f: StorageForm, k: Keys): Partial<Settings> {
+  const storage = storageSettings(provider, f);
+  if (provider === 'webdav' ? !k.password : !k.access.trim() || !k.secret.trim()) throw new Error('Enter the keys.');
+  return storage;
+}
+
+/** Checks that `storage` works with keys `k`; true when it already holds synced data. Fails in words the user can act on. */
+export async function tryStorage(base: Storage, storage: Partial<Storage>, k: Keys): Promise<boolean> {
+  const values: Record<string, string> = { a: k.access.trim(), s: k.secret.trim(), p: k.password };
+  const trial: Storage = { ...base, ...storage, accessKeySecret: 'a', secretKeySecret: 's', webdavPasswordSecret: 'p' };
+  const store = openRemote(remoteSpec(trial, (n) => values[n] ?? ''), obsidianHttp);
+  try {
+    const report = await checkStore(store);
+    const bad = report.checks.find((x) => !x.ok);
+    if (bad) throw new Error(bad.detail ?? bad.name);
+    return await Repo.exists(store);
+  } catch (e) {
+    throw new Error(connectError(e instanceof Error ? e.message : String(e)));
+  }
 }
 
 export class SetupModal extends Modal {
@@ -112,48 +183,8 @@ export class SetupModal extends Modal {
 
   private storageStep(): void {
     const c = this.contentEl;
-    const f = this.form;
-    const k = this.keys;
     this.setTitle(PROVIDERS.find((p) => p.id === this.provider)!.name);
-    const set = (key: keyof StorageForm) => (v: string) => ((f as unknown as Record<string, string>)[key] = v);
-    switch (this.provider) {
-      case 'r2':
-        field(c, 'Account ID', { value: f.location, placeholder: '0123456789abcdef0123456789abcdef', hint: "In Cloudflare's dashboard on the R2 page. The bucket's S3 API address works too." }, set('location'));
-        break;
-      case 'b2':
-        field(c, 'Endpoint', { value: f.location, placeholder: 's3.us-west-004.backblazeb2.com', hint: "Shown on the bucket's page." }, set('location'));
-        break;
-      case 'aws':
-        field(c, 'Region', { value: f.location, placeholder: 'us-east-1', hint: "Shown next to the bucket's name." }, set('location'));
-        break;
-      case 's3':
-        field(c, 'Endpoint', { value: f.location, placeholder: 'https://s3.example.com' }, set('location'));
-        field(c, 'Region', { value: f.region, placeholder: 'us-east-1', hint: 'Leave empty if your provider does not mention one.' }, set('region'));
-        break;
-      case 'webdav':
-        field(c, 'Folder address', { value: f.location, placeholder: 'https://cloud.example.com/remote.php/dav/files/me/Obsidian', hint: 'A folder that will hold this vault. It is created if missing.' }, set('location'));
-        field(c, 'User name', { value: f.user }, set('user'));
-        field(c, 'Password', { value: k.password, password: true, hint: 'For Nextcloud, create an app password in its security settings.' }, (v) => (k.password = v));
-        break;
-    }
-    if (this.provider !== 'webdav') {
-      field(c, 'Bucket', { value: f.bucket, placeholder: 'my-notes' }, set('bucket'));
-      field(c, this.provider === 'b2' ? 'Key ID' : 'Access key ID', { value: k.access }, (v) => (k.access = v));
-      field(
-        c,
-        this.provider === 'b2' ? 'Application key' : 'Secret access key',
-        { value: k.secret, password: true, hint: 'Use a key that can only reach this bucket. It is kept in this device\'s secure storage.' },
-        (v) => (k.secret = v),
-      );
-      field(c, 'Folder in bucket', { value: f.prefix, hint: 'Lets one bucket hold several vaults. Filled in for you.' }, set('prefix'));
-      if (this.provider === 's3') {
-        const row = c.createEl('label', { cls: 'self-sync-check' });
-        const box = row.createEl('input', { attr: { type: 'checkbox' } });
-        box.checked = f.pathStyle;
-        box.addEventListener('change', () => (f.pathStyle = box.checked));
-        row.appendText(' Path-style addresses (MinIO and most self-hosted servers need this)');
-      }
-    }
+    storageFields(c, this.provider, this.form, this.keys);
     message(c, this.error);
     const row = buttonRow(c);
     button(row, 'Back', () => this.go('provider'));
@@ -161,10 +192,8 @@ export class SetupModal extends Modal {
   }
 
   private async connect(): Promise<void> {
-    const k = this.keys;
     try {
-      this.storage = storageSettings(this.provider, this.form);
-      if (this.provider === 'webdav' ? !k.password : !k.access.trim() || !k.secret.trim()) throw new Error('Enter the keys.');
+      this.storage = formStorage(this.provider, this.form, this.keys);
     } catch (e) {
       this.error = (e as Error).message;
       this.render();
@@ -174,17 +203,11 @@ export class SetupModal extends Modal {
     this.error = '';
     this.render();
     try {
-      const values: Record<string, string> = { a: k.access.trim(), s: k.secret.trim(), p: k.password };
-      const trial = { ...this.plugin.settings, ...this.storage, accessKeySecret: 'a', secretKeySecret: 's', webdavPasswordSecret: 'p' } as Settings;
-      const store = openRemote(remoteSpec(trial, (n) => values[n] ?? ''), obsidianHttp);
-      const report = await checkStore(store);
-      const bad = report.checks.find((x) => !x.ok);
-      if (bad) throw new Error(bad.detail ?? bad.name);
-      this.exists = await Repo.exists(store);
+      this.exists = await tryStorage(this.plugin.settings, this.storage, this.keys);
       this.go('passphrase');
     } catch (e) {
       this.busy = false;
-      this.error = connectError(e instanceof Error ? e.message : String(e));
+      this.error = (e as Error).message;
       this.render();
     }
   }
@@ -267,6 +290,11 @@ export class SetupModal extends Modal {
   private async joinWith(): Promise<void> {
     if (!this.code.trim() || !this.passphrase) {
       this.error = 'Paste the setup link and enter the passphrase.';
+      this.render();
+      return;
+    }
+    if (codeKind(setupCodeFrom(this.code)) === 'share') {
+      this.error = 'This is an invite link to a shared folder, not a setup link. Set up sync here first, then add it in Settings → Self Sync → Shared folders.';
       this.render();
       return;
     }

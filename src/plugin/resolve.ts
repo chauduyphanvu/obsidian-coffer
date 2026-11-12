@@ -27,7 +27,7 @@ export function resolveConflict(plugin: SelfSyncPlugin, copy: string): void {
 
 /** Opens the resolver for the first conflict copy still waiting, or says there is none. */
 export function resolveFirstConflict(plugin: SelfSyncPlugin): void {
-  const copy = plugin.settings.conflictCopies.find((p) => plugin.app.vault.getAbstractFileByPath(p) instanceof TFile);
+  const copy = plugin.allConflictCopies().find((p) => plugin.app.vault.getAbstractFileByPath(p) instanceof TFile);
   if (copy) resolveConflict(plugin, copy);
   else new Notice('No files are waiting to be resolved.');
 }
@@ -296,8 +296,6 @@ class ConflictModal extends Modal {
   }
 
   private async forget(): Promise<void> {
-    const s = this.plugin.settings;
-    s.conflictCopies = s.conflictCopies.filter((p) => p !== this.copy);
-    await this.plugin.saveSettings();
+    await this.plugin.forgetConflictCopy(this.copy);
   }
 }

@@ -1,6 +1,6 @@
 // Looking at the past and bringing it back: a file's versions, deleted files, the vault or a folder at an earlier
 // time, and a check of what storage holds. Decisions live in restore.ts; this file only shows them.
-import { FuzzySuggestModal, Modal, Notice, Platform, TFile, TFolder, type App } from 'obsidian';
+import { Modal, Notice, Platform, TFile, type App } from 'obsidian';
 import { fileName, vaultKey } from '../core/paths.ts';
 import { listVersions } from '../core/retention.ts';
 import { TooOldError, listCommits, listDeleted, planRestore, tableAt, type CommitSummary, type DeletedFile, type PastVault } from '../core/timeline.ts';
@@ -8,6 +8,7 @@ import { sameContent, type Version } from '../core/types.ts';
 import type { VerifyReport } from '../core/verify.ts';
 import type SelfSyncPlugin from './main.ts';
 import type { Failed, Look, RestoreOutcome } from './main.ts';
+import type { Share } from './settings.ts';
 import {
   byDay,
   changesLabel,
@@ -30,7 +31,7 @@ import {
   type Step,
 } from './restore.ts';
 import { MAX_COMPARE_BYTES, describeFailure, plural } from './status.ts';
-import { button, buttonRow, message, openLink, statusLine } from './ui.ts';
+import { FolderSuggest, button, buttonRow, message, openLink, statusLine } from './ui.ts';
 
 /** Rows drawn at most in one list; typing narrows it. */
 const MAX_ROWS = 300;
@@ -44,6 +45,12 @@ const failure = (e: unknown) => {
   return p.id.startsWith('failed') ? p.detail : `${p.title}. ${p.detail}`;
 };
 const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+
+/** Which synced place a screen is about, once the vault has shared folders: each has a history of its own. */
+function placeLine(parent: HTMLElement, plugin: SelfSyncPlugin, share: Share | undefined): void {
+  const text = share ? `Shared folder “${share.folder}”` : plugin.settings.shares.length ? 'This vault, without its shared folders' : '';
+  if (text) parent.createDiv({ cls: 'self-sync-place', text });
+}
 
 /** A row in a list: a title and a line under it, tappable when there is something to do. */
 function row(parent: HTMLElement, title: string, sub: string, onClick?: () => void): HTMLElement {
@@ -137,6 +144,8 @@ class Lane {
 export class VersionsModal extends Modal {
   private plugin: SelfSyncPlugin;
   private path: string;
+  /** The engine whose history the file is in, and its path there. */
+  private place: { share?: Share; path: string };
   private name: string;
   private versions: Version[] = [];
   /** The newest version that matches the synced file, so the list can say which one the file is now. */
@@ -162,6 +171,7 @@ export class VersionsModal extends Modal {
     super(app);
     this.plugin = plugin;
     this.path = path;
+    this.place = plugin.placeOf(path);
     this.name = fileName(path);
   }
 
@@ -181,8 +191,8 @@ export class VersionsModal extends Modal {
   private async load(): Promise<void> {
     this.contentEl.createEl('p', { cls: 'self-sync-intro', text: 'Loading versions…' });
     try {
-      const look = await this.plugin.look();
-      const key = vaultKey(this.path);
+      const look = await this.plugin.look(this.place.share);
+      const key = vaultKey(this.place.path);
       this.versions = await listVersions(look.repo, look.lastSeq, key, look.cfg, look.now);
       const synced = look.remote.get(key);
       const newest = this.versions.find((v) => v.entry);
@@ -199,7 +209,7 @@ export class VersionsModal extends Modal {
   private read(v: Version): Promise<Uint8Array> {
     let p = this.bytes.get(v.seq);
     if (!p) {
-      p = this.plugin.getEngine().readVersion(v.entry!);
+      p = this.plugin.getEngine(this.place.share).readVersion(v.entry!);
       this.bytes.set(v.seq, p);
       p.catch(() => this.bytes.delete(v.seq));
       if (this.bytes.size > 24) this.bytes.delete(this.bytes.keys().next().value!);
@@ -224,6 +234,7 @@ export class VersionsModal extends Modal {
 
   private renderList(parent: HTMLElement): void {
     const me = this.plugin.settings.deviceName;
+    if (this.place.share) placeLine(parent, this.plugin, this.place.share);
     parent.createEl('p', {
       cls: 'self-sync-intro',
       text: `Versions from the last ${plural(this.plugin.settings.retentionDays, 'day')}, newest first. Pick one to see it before restoring.`,
@@ -378,6 +389,7 @@ export class VersionsModal extends Modal {
 /** Files deleted within the time versions are kept, newest first, to bring back one or several at once. */
 export class DeletedModal extends Modal {
   private plugin: SelfSyncPlugin;
+  private share?: Share;
   private files: DeletedFile[] = [];
   private picked = new Set<DeletedFile>();
   private query = '';
@@ -387,9 +399,10 @@ export class DeletedModal extends Modal {
   private listEl?: HTMLElement;
   private footEl?: HTMLElement;
 
-  constructor(app: App, plugin: SelfSyncPlugin) {
+  constructor(app: App, plugin: SelfSyncPlugin, share?: Share) {
     super(app);
     this.plugin = plugin;
+    this.share = share;
   }
 
   onOpen(): void {
@@ -405,8 +418,8 @@ export class DeletedModal extends Modal {
 
   private async load(): Promise<void> {
     try {
-      const look = await this.plugin.look();
-      const kept = this.plugin.keptOut();
+      const look = await this.plugin.look(this.share);
+      const kept = this.plugin.keptOut(this.share);
       this.files = (await listDeleted(look.repo, look.lastSeq, look.cfg, look.now)).filter((d) => !kept(d.path));
     } catch (e) {
       this.error = `Could not look for deleted files: ${failure(e)}`;
@@ -418,6 +431,7 @@ export class DeletedModal extends Modal {
   private render(): void {
     const c = this.contentEl;
     c.empty();
+    placeLine(c, this.plugin, this.share);
     if (!this.files.length) {
       if (this.error) message(c, this.error);
       else if (this.loaded) {
@@ -496,7 +510,7 @@ export class DeletedModal extends Modal {
     this.error = '';
     this.renderFoot();
     try {
-      this.done(await this.plugin.restoreDeleted(this.files.filter((f) => this.picked.has(f))));
+      this.done(await this.plugin.restoreDeleted(this.files.filter((f) => this.picked.has(f)), this.share));
     } catch (e) {
       this.busy = false;
       this.error = `Could not restore: ${failure(e)}`;
@@ -514,35 +528,11 @@ export class DeletedModal extends Modal {
       for (const p of placed) {
         const r = list.createDiv({ cls: 'self-sync-file' });
         r.createSpan({ text: p.to === p.path ? p.path : `${p.path} came back as “${fileName(p.to)}”, as something has its name now` });
-        openLink(r, this.app, 'Open', p.to, () => this.close());
+        openLink(r, this.app, 'Open', this.share ? `${this.share.folder}/${p.to}` : p.to, () => this.close());
       }
     }
     if (failed.length) message(c, `${placed.length ? 'These could not be brought back' : 'Nothing could be brought back'}:\n${failed.map((x) => `${x.path}: ${x.message}`).join('\n')}`);
     button(buttonRow(c), 'Close', () => this.close(), 'cta');
-  }
-}
-
-class FolderSuggest extends FuzzySuggestModal<TFolder> {
-  private skip: (path: string) => boolean;
-  private chosen: (folder: TFolder) => void;
-
-  constructor(app: App, skip: (path: string) => boolean, chosen: (folder: TFolder) => void) {
-    super(app);
-    this.skip = skip;
-    this.chosen = chosen;
-    this.setPlaceholder('Choose the folder to restore');
-  }
-
-  getItems(): TFolder[] {
-    return this.app.vault.getAllFolders(false).filter((f) => !this.skip(`${f.path}/`));
-  }
-
-  getItemText(folder: TFolder): string {
-    return folder.path;
-  }
-
-  onChooseItem(folder: TFolder): void {
-    this.chosen(folder);
   }
 }
 
@@ -554,7 +544,12 @@ const KIND: [Step['kind'], string][] = [['add', 'Brought back'], ['change', 'Cha
  */
 export class RestoreEarlierModal extends Modal {
   private plugin: SelfSyncPlugin;
+  /** The shared folder whose history this works on, or none for the vault's. */
+  private share?: Share;
+  /** Inside the vault or the shared folder; '' for all of it. */
   private folder: string;
+  /** Bumped when the vault or shared folder changes, so times still loading for the one before are dropped. */
+  private generation = 0;
   private step: 'choose' | 'review' | 'working' | 'done' = 'choose';
   private look?: Look;
   private moments: CommitSummary[] = [];
@@ -570,15 +565,38 @@ export class RestoreEarlierModal extends Modal {
   private outcome?: RestoreOutcome;
   private closed = false;
 
+  /** `folder` is a vault path ('' for the whole vault); a folder in a shared folder is restored from that one's history. */
   constructor(app: App, plugin: SelfSyncPlugin, folder: string) {
     super(app);
     this.plugin = plugin;
-    this.folder = folder;
+    const place = folder ? plugin.placeOf(folder) : { path: '' };
+    this.share = place.share;
+    this.folder = place.path;
   }
 
   onOpen(): void {
     this.modalEl.addClass('self-sync-modal', 'self-sync-past');
     this.setTitle('Restore to an earlier time');
+    void this.loadMore();
+  }
+
+  /** “Notes”, the shared folder “Work”, or the whole vault: what is being restored, inside a sentence. */
+  private scopeText(): string {
+    const s = this.share;
+    return s ? (this.folder ? `“${s.folder}/${this.folder}”` : `the shared folder “${s.folder}”`) : scopeName(this.folder);
+  }
+
+  /** Restores from the vault's history, or from a shared folder's, which has times of its own. */
+  private target(share: Share | undefined, folder: string): void {
+    const moved = share?.id !== this.share?.id;
+    this.share = share;
+    this.folder = folder;
+    if (!moved) return this.render();
+    this.generation++;
+    this.look = undefined;
+    this.moments = [];
+    this.more = true;
+    this.loading = false;
     void this.loadMore();
   }
 
@@ -589,18 +607,20 @@ export class RestoreEarlierModal extends Modal {
 
   private async loadMore(): Promise<void> {
     if (this.loading) return;
+    const generation = this.generation;
     this.loading = true;
     this.error = '';
     this.render();
     try {
-      this.look ??= await this.plugin.look();
-      const l = this.look;
+      const l = (this.look ??= await this.plugin.look(this.share));
       const page = await listCommits(l.repo, l.lastSeq, l.cfg, l.now, { limit: PAGE, before: this.moments.at(-1)?.time });
+      if (generation !== this.generation) return;
       const seen = new Set(this.moments.map((m) => m.seq));
       const fresh = page.filter((m) => !seen.has(m.seq));
       this.moments.push(...fresh);
       this.more = page.length === PAGE && fresh.length > 0;
     } catch (e) {
+      if (generation !== this.generation) return;
       this.error = `Could not load earlier times: ${failure(e)}`;
     }
     this.loading = false;
@@ -625,19 +645,20 @@ export class RestoreEarlierModal extends Modal {
       b.buttonEl.toggleClass('is-selected', on);
       b.buttonEl.setAttr('aria-pressed', String(on));
     };
-    option('The whole vault', !this.folder, () => {
-      this.folder = '';
-      this.render();
-    });
-    option('One folder', !!this.folder, () => this.chooseFolder());
-    if (this.folder) {
+    const whole = !this.share && !this.folder;
+    option('The whole vault', whole, () => this.target(undefined, ''));
+    option('One folder', !whole, () => this.chooseFolder());
+    if (!whole) {
       const f = c.createDiv({ cls: 'self-sync-file' });
-      f.createSpan({ text: this.folder });
+      f.createSpan({ text: this.share && !this.folder ? `${this.share.folder} (shared folder)` : this.share ? `${this.share.folder}/${this.folder}` : this.folder });
       button(f, 'Change', () => this.chooseFolder());
+    }
+    if (whole && this.plugin.settings.shares.length) {
+      c.createDiv({ cls: 'self-sync-hint', text: 'Shared folders are not part of it: each has a history of its own. To restore one, choose it under “One folder”.' });
     }
 
     c.createDiv({ cls: 'self-sync-pick-label', text: 'Bring it back to how it was' });
-    c.createDiv({ cls: 'self-sync-hint', text: 'Each time is when a device synced. The numbers say what that sync changed across the vault.' });
+    c.createDiv({ cls: 'self-sync-hint', text: `Each time is when a device synced. The numbers say what that sync changed across ${this.share ? 'the shared folder' : 'the vault'}.` });
     const me = this.plugin.settings.deviceName;
     const list = c.createDiv({ cls: 'self-sync-list' });
     days(list, this.moments, (m) => m.time, (el, m, time) => {
@@ -652,9 +673,16 @@ export class RestoreEarlierModal extends Modal {
   }
 
   private chooseFolder(): void {
-    new FolderSuggest(this.app, this.plugin.keptOut(), (f) => {
-      this.folder = f.path;
-      this.render();
+    const plugin = this.plugin;
+    const vaultKept = plugin.keptOut();
+    const skip = (path: string) => {
+      const { share, path: inside } = plugin.placeOf(path.slice(0, -1));
+      if (!share) return vaultKept(path);
+      return !plugin.targets().includes(share) || (!!inside && plugin.keptOut(share)(`${inside}/`));
+    };
+    new FolderSuggest(this.app, 'Choose the folder to restore', skip, (f) => {
+      const { share, path } = plugin.placeOf(f.path);
+      this.target(share, path);
     }).open();
   }
 
@@ -665,9 +693,9 @@ export class RestoreEarlierModal extends Modal {
     this.error = this.note = '';
     this.render();
     try {
-      const look = (this.look = await this.plugin.look());
+      const look = (this.look = await this.plugin.look(this.share));
       const past = await tableAt(look.repo, look.remote, look.lastSeq, look.cfg, look.now, m.time);
-      const { steps, left } = restoreSteps(planRestore(look.remote, past.files, this.folder), look.remote, this.plugin.keptOut());
+      const { steps, left } = restoreSteps(planRestore(look.remote, past.files, this.folder), look.remote, this.plugin.keptOut(this.share));
       if (this.asked !== asked) return;
       this.past = past;
       this.steps = steps;
@@ -699,7 +727,7 @@ export class RestoreEarlierModal extends Modal {
       return;
     }
     const me = this.plugin.settings.deviceName;
-    c.createDiv({ cls: 'self-sync-preview-title', text: `${capital(scopeName(this.folder))} as it was ${momentLabel(past.commit.time, Date.now())}` });
+    c.createDiv({ cls: 'self-sync-preview-title', text: `${capital(this.scopeText())} as it was ${momentLabel(past.commit.time, Date.now())}` });
     c.createDiv({ cls: 'self-sync-row-sub', text: `When ${deviceLabel(past.commit.device, me)} synced.` });
     message(c, this.note, 'self-sync-note');
     message(c, this.error);
@@ -737,7 +765,7 @@ export class RestoreEarlierModal extends Modal {
     this.render();
     const unsubscribe = this.plugin.onChange(() => this.step === 'working' && this.render());
     try {
-      const out = await this.plugin.restoreTo(past.files, this.folder, this.steps);
+      const out = await this.plugin.restoreTo(past.files, this.folder, this.steps, this.share);
       if (out.changed) {
         this.steps = out.changed;
         this.step = 'review';
@@ -756,7 +784,7 @@ export class RestoreEarlierModal extends Modal {
       unsubscribe();
     }
     if (!this.closed) this.render();
-    else if (this.outcome) new Notice(`${capital(scopeName(this.folder))} is restored. ${stepSummary(countSteps(this.outcome.done), true)}`, 10_000);
+    else if (this.outcome) new Notice(`${capital(this.scopeText())} is restored. ${stepSummary(countSteps(this.outcome.done), true)}`, 10_000);
     else new Notice(this.error || this.note, 10_000);
   }
 
@@ -770,7 +798,7 @@ export class RestoreEarlierModal extends Modal {
     statusLine(c, out.failed.length ? `Restored, except ${plural(out.failed.length, 'file')}` : 'Restored', out.failed.length ? 'warning' : 'ok');
     c.createEl('p', {
       cls: 'self-sync-intro',
-      text: `${capital(scopeName(this.folder))} is back to how it was ${momentLabel(this.past!.commit.time, Date.now())}. ${stepSummary(countSteps(out.done), true)}`,
+      text: `${capital(this.scopeText())} is back to how it was ${momentLabel(this.past!.commit.time, Date.now())}. ${stepSummary(countSteps(out.done), true)}`,
     });
     if (out.failed.length) message(c, `These files could not be restored:\n${out.failed.map((f) => `${f.path}: ${f.message}`).join('\n')}`);
     const p = out.sent?.problem;
@@ -790,6 +818,7 @@ export class RestoreEarlierModal extends Modal {
 /** Checks what storage holds, quickly or by downloading everything, and says what it found in plain words. */
 export class VerifyModal extends Modal {
   private plugin: SelfSyncPlugin;
+  private share?: Share;
   private deep = false;
   private running = false;
   private report?: VerifyReport;
@@ -799,9 +828,10 @@ export class VerifyModal extends Modal {
   private progressEl?: HTMLElement;
   private closed = false;
 
-  constructor(app: App, plugin: SelfSyncPlugin) {
+  constructor(app: App, plugin: SelfSyncPlugin, share?: Share) {
     super(app);
     this.plugin = plugin;
+    this.share = share;
   }
 
   onOpen(): void {
@@ -823,9 +853,9 @@ export class VerifyModal extends Modal {
     this.error = '';
     this.render();
     try {
-      this.report = await this.plugin.getEngine().verify({ deep, onProgress: (p) => this.progressEl?.setText(verifyProgress(p)) });
+      this.report = await this.plugin.getEngine(this.share).verify({ deep, onProgress: (p) => this.progressEl?.setText(verifyProgress(p)) });
       if (!deep && this.stored === undefined) {
-        const look = await this.plugin.look();
+        const look = await this.plugin.look(this.share);
         this.stored = [...look.remote.values()].reduce((n, e) => n + e.size, 0);
       }
     } catch (e) {
@@ -838,6 +868,7 @@ export class VerifyModal extends Modal {
   private render(): void {
     const c = this.contentEl;
     c.empty();
+    placeLine(c, this.plugin, this.share);
     c.createEl('p', {
       cls: 'self-sync-intro',
       text: this.deep

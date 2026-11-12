@@ -33,6 +33,12 @@ export interface Commit {
    * anyone made, so it is not a moment or a version in history and does not count as activity.
    */
   moved?: boolean;
+  /**
+   * Every deletion in it is one the user confirmed on the device that made it, as by restoring an earlier
+   * time (`allowDeletes`), never one that device only saw happen. Other devices do not count these
+   * deletions toward their guard against mass deletion.
+   */
+  confirmed?: boolean;
 }
 
 export interface Version {

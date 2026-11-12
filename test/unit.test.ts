@@ -5,6 +5,7 @@ import { compileExcludes } from '../src/core/config.ts';
 import { chunkId, createKeys, open, seal, unlockKeys, WrongPassphraseError } from '../src/core/crypto.ts';
 import { merge3, mergeJson } from '../src/core/merge.ts';
 import { conflictCopyName, conflictOriginal, ext, vaultKey } from '../src/core/paths.ts';
+import { plural } from '../src/core/text.ts';
 import { checkStore } from '../src/stores/doctor.ts';
 import { uncachedHeaders } from '../src/stores/http.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
@@ -213,4 +214,11 @@ test('a conflict copy leads back to the file it was made from', () => {
     assert.equal(conflictOriginal(conflictCopyName(key, 'mobile-103c', at, 3)), key);
   }
   assert.equal(conflictOriginal('plain.md'), 'plain.md');
+});
+
+test('a count reads with its noun in the singular only for one', () => {
+  assert.equal(plural(1, 'file'), '1 file');
+  assert.equal(plural(0, 'file'), '0 files');
+  assert.equal(plural(2, 'conflict copy', 'conflict copies'), '2 conflict copies');
+  assert.equal(plural(1204, 'change'), `${(1204).toLocaleString()} changes`);
 });

@@ -436,3 +436,51 @@ details.self-sync-plan > summary { cursor: pointer; padding: var(--size-2-3) 0; 
 .self-sync-device.is-critical .self-sync-device-status { color: var(--text-error); }
 .self-sync-device > button { flex: none; width: auto; }
 .is-mobile .self-sync-device > button { min-height: 44px; min-width: 44px; }
+
+/* Shared folders block of the settings screen: each folder with its status, where it syncs, and what can be done. */
+.self-sync-shares { margin-bottom: var(--size-4-4); }
+.self-sync-share {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--size-4-2) var(--size-4-3);
+  padding: var(--size-4-3) 0;
+  border-top: 1px solid var(--background-modifier-border);
+}
+.self-sync-share-text { flex: 1 1 14em; min-width: 0; }
+.self-sync-share-name { font-weight: var(--font-semibold); overflow-wrap: anywhere; }
+.self-sync-share-meta { color: var(--text-muted); font-size: var(--font-ui-small); overflow-wrap: anywhere; }
+.self-sync-share-status {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--size-4-2);
+  margin: var(--size-2-1) 0;
+  font-size: var(--font-ui-small);
+  overflow-wrap: anywhere;
+}
+.self-sync-share-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin-top: 0.45em;
+  border-radius: 50%;
+  background: var(--color-green);
+}
+.self-sync-share.is-warning .self-sync-share-dot { background: var(--color-orange); }
+.self-sync-share.is-critical .self-sync-share-dot { background: var(--color-red); }
+.self-sync-share.is-critical .self-sync-share-status { color: var(--text-error); }
+.self-sync-share-actions { display: flex; flex-wrap: wrap; gap: var(--size-4-2); }
+.self-sync-share-actions > button { flex: 1 1 auto; }
+body.is-phone .self-sync-share-actions { flex-basis: 100%; }
+.is-mobile .self-sync-share-actions > button,
+.is-mobile .self-sync-shares .self-sync-buttons > button,
+.is-mobile .self-sync-share-modal button { min-height: 44px; }
+
+/* Which synced place a screen is about, once the vault has shared folders. */
+.self-sync-place {
+  margin-bottom: var(--size-4-2);
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  font-weight: var(--font-semibold);
+  overflow-wrap: anywhere;
+}

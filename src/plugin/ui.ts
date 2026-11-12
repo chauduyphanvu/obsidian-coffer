@@ -1,5 +1,30 @@
 // Small building blocks for the plugin's screens, laid out to work at phone width.
-import { ButtonComponent, TFile, type App } from 'obsidian';
+import { ButtonComponent, FuzzySuggestModal, TFile, type App, type TFolder } from 'obsidian';
+
+/** Picks one of the vault's folders, leaving out those `skip` refuses (given as "path/"). */
+export class FolderSuggest extends FuzzySuggestModal<TFolder> {
+  private skip: (path: string) => boolean;
+  private chosen: (folder: TFolder) => void;
+
+  constructor(app: App, placeholder: string, skip: (path: string) => boolean, chosen: (folder: TFolder) => void) {
+    super(app);
+    this.skip = skip;
+    this.chosen = chosen;
+    this.setPlaceholder(placeholder);
+  }
+
+  getItems(): TFolder[] {
+    return this.app.vault.getAllFolders(false).filter((f) => !this.skip(`${f.path}/`));
+  }
+
+  getItemText(folder: TFolder): string {
+    return folder.path;
+  }
+
+  onChooseItem(folder: TFolder): void {
+    this.chosen(folder);
+  }
+}
 
 export interface FieldOptions {
   value?: string;

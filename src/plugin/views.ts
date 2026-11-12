@@ -2,9 +2,10 @@ import { Modal, Notice, PluginSettingTab, Setting, type App } from 'obsidian';
 import { conflictOriginal } from '../core/paths.ts';
 import type SelfSyncPlugin from './main.ts';
 import { resolveConflict } from './resolve.ts';
-import { describeStorage, hasStorageAddress, parseNumberSetting, type Settings } from './settings.ts';
+import { describeStorage, hasStorageAddress, parseNumberSetting, type Settings, type Share } from './settings.ts';
 import { SetupModal } from './setup.ts';
 import { renderDevices } from './devices.ts';
+import { confirmStopSharing, downloadAgain, renderShares } from './sharing.ts';
 import type { Problem } from './status.ts';
 import { button, buttonRow, field, message, openLink, statusLine } from './ui.ts';
 
@@ -60,7 +61,11 @@ export class SettingsTab extends PluginSettingTab {
       }
     };
     renderCard();
-    this.unsubscribe = plugin.onChange(renderCard);
+    let drawShares: (() => void) | undefined;
+    this.unsubscribe = plugin.onChange(() => {
+      renderCard();
+      drawShares?.();
+    });
 
     const section = (id: string, title: string, summary = '') => {
       const d = containerEl.createEl('details', { cls: 'self-sync-section' });
@@ -122,6 +127,7 @@ export class SettingsTab extends PluginSettingTab {
         );
     }
     renderDevices(containerEl, plugin);
+    if (plugin.configured()) drawShares = renderShares(containerEl, plugin);
 
     const storage = section('storage', 'Storage and passphrase', hasStorageAddress(s) ? describeStorage(s) : 'Not set up');
     new Setting(storage)
@@ -255,6 +261,9 @@ export class ProblemsModal extends Modal {
 
   private problem(parent: HTMLElement, p: Problem): void {
     const plugin = this.plugin;
+    // Its actions act on the shared folder it is about, or on the vault.
+    const share = p.share ? plugin.settings.shares.find((s) => s.id === p.share) : undefined;
+    if (p.share && !share) return;
     const card = parent.createDiv({ cls: `self-sync-problem is-${p.severity}` });
     card.createDiv({ cls: 'self-sync-problem-title', text: p.title });
     card.createDiv({ cls: 'self-sync-problem-detail', text: p.detail });
@@ -283,11 +292,16 @@ export class ProblemsModal extends Modal {
         });
         break;
       case 'passphrase':
-        button(row, 'Enter the passphrase', () => new EnterPassphraseModal(this.app, plugin).open(), 'cta');
+        button(row, 'Enter the passphrase', () => new EnterPassphraseModal(this.app, plugin, share).open(), 'cta');
         break;
       case 'resolve-deletes':
-        button(row, 'Keep all files', () => plugin.keepAllFiles(), 'cta');
-        button(row, 'Delete them everywhere', () => plugin.sync(true, true), 'warning');
+        button(row, 'Keep all files', () => plugin.keepAllFiles(share), 'cta');
+        button(row, 'Delete them everywhere', () => plugin.sync(true, share ? share.id : true), 'warning');
+        break;
+      case 'missing-folder':
+        if (!share) break;
+        button(row, 'Download it again', () => downloadAgain(plugin, share), 'cta');
+        button(row, 'Stop sharing on this device', () => confirmStopSharing(plugin, share));
         break;
       case 'retry':
         button(row, 'Try again', () => plugin.sync(true));
@@ -296,15 +310,17 @@ export class ProblemsModal extends Modal {
   }
 }
 
-/** After "wrong passphrase": the one this device should use. */
+/** After "wrong passphrase": the one this device should use, for the vault or for one shared folder. */
 class EnterPassphraseModal extends Modal {
   private plugin: SelfSyncPlugin;
+  private share?: Share;
   private value = '';
   private error = '';
 
-  constructor(app: App, plugin: SelfSyncPlugin) {
+  constructor(app: App, plugin: SelfSyncPlugin, share?: Share) {
     super(app);
     this.plugin = plugin;
+    this.share = share;
   }
 
   onOpen(): void {
@@ -315,15 +331,21 @@ class EnterPassphraseModal extends Modal {
   private render(): void {
     const c = this.contentEl;
     c.empty();
-    this.setTitle('Enter the passphrase');
-    c.createEl('p', { cls: 'self-sync-intro', text: 'Use the passphrase your other devices use now. If it was changed elsewhere, that is the new one.' });
+    const share = this.share;
+    this.setTitle(share ? `Passphrase of “${share.folder}”` : 'Enter the passphrase');
+    c.createEl('p', {
+      cls: 'self-sync-intro',
+      text: share
+        ? 'Use the passphrase this shared folder was shared with. Whoever shared it can tell you.'
+        : 'Use the passphrase your other devices use now. If it was changed elsewhere, that is the new one.',
+    });
     field(c, 'Passphrase', { value: this.value, password: true }, (v) => (this.value = v));
     message(c, this.error);
     button(buttonRow(c), 'Save and sync', async () => {
       if (!this.value) return;
-      await this.plugin.setSecret('passphraseSecret', 'self-sync-passphrase', this.value);
+      await this.plugin.setSecret('passphraseSecret', 'self-sync-passphrase', this.value, share);
       const out = await this.plugin.sync(true, false, true);
-      if (out.problem?.id === 'passphrase') {
+      if ((share ? out.shares?.get(share.id) : out)?.problem?.id === 'passphrase') {
         this.error = 'That is not it either.';
         this.render();
       } else this.close();

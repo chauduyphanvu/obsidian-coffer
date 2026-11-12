@@ -4,6 +4,7 @@ import { pool, utf8 } from './bytes.ts';
 import type { RepoView } from './engine.ts';
 import type { Repo } from './repo.ts';
 import { DAY } from './retention.ts';
+import { plural } from './text.ts';
 
 const PREFIX = 'dev/';
 const QUIET_AFTER = 7 * DAY;
@@ -94,15 +95,13 @@ export async function forgetDevice(view: RepoView, name: string): Promise<void> 
 /** `lastWritten` is when this app session last wrote one, 0 when it has not. */
 export const heartbeatDue = (lastWritten: number, now: number): boolean => !lastWritten || now - lastWritten > HEARTBEAT_EVERY;
 
-const count = (n: number, one: string, many = `${one}s`) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
-
 /** How long ago, in words. Another device's clock can run ahead of this one, so a negative span reads as now. */
 export function agoText(ms: number): string {
   const minutes = Math.floor(Math.max(0, ms) / 60_000);
   if (minutes < 1) return 'just now';
-  if (minutes < 60) return `${count(minutes, 'minute')} ago`;
-  if (minutes < 24 * 60) return `${count(Math.floor(minutes / 60), 'hour')} ago`;
-  return `${count(Math.floor(minutes / (24 * 60)), 'day')} ago`;
+  if (minutes < 60) return `${plural(minutes, 'minute')} ago`;
+  if (minutes < 24 * 60) return `${plural(Math.floor(minutes / 60), 'hour')} ago`;
+  return `${plural(Math.floor(minutes / (24 * 60)), 'day')} ago`;
 }
 
 export function statusText(d: DeviceStatus, now: number): string {
@@ -110,9 +109,9 @@ export function statusText(d: DeviceStatus, now: number): string {
     case 'current':
       return 'Up to date';
     case 'behind':
-      return `${count(d.behind, 'change')} behind`;
+      return `${plural(d.behind, 'change')} behind`;
     case 'quiet':
-      return `Not seen for ${count(Math.floor((now - d.lastSeen) / DAY), 'day')}`;
+      return `Not seen for ${plural(Math.floor((now - d.lastSeen) / DAY), 'day')}`;
     case 'diverged':
       return `This device and ${d.name} disagree about the sync history. Run "Check synced data for damage".`;
   }

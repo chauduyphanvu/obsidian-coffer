@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { WrongPassphraseError } from '../src/core/crypto.ts';
 import { SafetyError, type SyncResult } from '../src/core/engine.ts';
-import { describeFailure, plural, resultProblems, staleProblem, summarize } from '../src/plugin/status.ts';
+import { MissingFolderError } from '../src/core/scopedfs.ts';
+import { describeFailure, inShare, keysMissingProblem, missingProblem, plural, resultProblems, staleProblem, statusText, summarize, targetProblems, type Problem } from '../src/plugin/status.ts';
 
 const result = (over: Partial<SyncResult> = {}): SyncResult => ({
   pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0, conflictCopies: [], skipped: 0, tooLarge: [], errors: [], commits: 0, rounds: 1, ...over,
@@ -56,4 +57,44 @@ test('a day without a successful sync is a problem; never having synced is not t
   assert.equal(staleProblem(0, now), undefined);
   assert.equal(staleProblem(now - 3_600_000, now), undefined);
   assert.equal(staleProblem(now - 2 * 86_400_000, now)?.severity, 'critical');
+});
+
+test('a missing shared folder is a critical problem that offers to download it again or stop', () => {
+  const p = describeFailure(new MissingFolderError('Projects/Team'));
+  assert.deepEqual([p.id, p.severity, p.action], ['missing-folder', 'critical', 'missing-folder']);
+  assert.match(p.detail, /“Projects\/Team”/);
+  assert.match(p.detail, /Nothing was deleted for the others/);
+  assert.deepEqual(missingProblem('Projects/Team'), p);
+  assert.equal(keysMissingProblem().severity, 'critical');
+});
+
+test("a shared folder's problems say which folder, stay apart from the vault's, and keep what they act on", () => {
+  const vault = describeFailure(new WrongPassphraseError());
+  const p = inShare(vault, { id: 'w1', folder: 'Work' });
+  assert.deepEqual([p.id, p.title, p.share, p.action, p.severity], ['share:w1:passphrase', 'Shared folder “Work”: Wrong passphrase', 'w1', 'passphrase', 'critical']);
+  assert.notEqual(inShare(vault, { id: 'w2', folder: 'Other' }).id, p.id);
+  assert.equal(vault.share, undefined);
+  const conflicts = resultProblems(result(), ['Work/n (conflict phone 20261111-1200).md'], 200).map((x) => inShare(x, { id: 'w1', folder: 'Work' }));
+  assert.deepEqual(conflicts[0].files, ['Work/n (conflict phone 20261111-1200).md']);
+});
+
+test('one place\'s problems: offline only once it lasts a day, and conflict copies as they are now', () => {
+  const now = 1_800_000_000_000;
+  const offline = describeFailure(new Error('fetch failed'));
+  const found = resultProblems(result(), ['a (conflict x 20261111-1200).md'], 200);
+  assert.deepEqual(targetProblems({ failure: offline, found: [], conflictCopies: [], lastSuccess: now - 3_600_000 }, now), []);
+  assert.deepEqual(targetProblems({ failure: offline, found: [], conflictCopies: [], lastSuccess: now - 2 * 86_400_000 }, now).map((x) => x.id), ['stale']);
+  assert.deepEqual(targetProblems({ found, conflictCopies: [], lastSuccess: now }, now), [], 'resolved since the sync');
+  const failure: Problem = describeFailure(new Error('odd'));
+  assert.deepEqual(targetProblems({ failure, found, conflictCopies: ['a (conflict x 20261111-1200).md'], lastSuccess: now }, now).map((x) => x.severity), ['critical', 'warning']);
+});
+
+test('a status line names the worst problem, or when it synced and how much is left to review', () => {
+  const critical = describeFailure(new WrongPassphraseError());
+  const warning = resultProblems(result({ tooLarge: ['v.mov'] }), [], 200);
+  assert.deepEqual(statusText([critical], 0, false), { text: 'Wrong passphrase', tone: 'critical' });
+  assert.deepEqual(statusText([critical, critical], 0, false), { text: '2 problems need attention', tone: 'critical' });
+  assert.deepEqual(statusText(warning, 0, false), { text: 'Not synced yet · 1 thing to review', tone: 'warning' });
+  assert.deepEqual(statusText([], 0, true), { text: 'Not synced yet · offline', tone: 'ok' });
+  assert.match(statusText([], 1_800_000_000_000, false).text, /^Synced /);
 });

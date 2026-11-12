@@ -2,25 +2,40 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { DEFAULT_CONFIG } from '../src/core/config.ts';
 import { openWithPassphrase } from '../src/core/crypto.ts';
+import { compileExcludes } from '../src/core/config.ts';
 import {
+  besideVault,
   cleanupDue,
+  codeKind,
+  decodeInvite,
   decodeSetupCode,
   defaultSettings,
   describeStorage,
   encodeSetupCode,
   folderFor,
+  folderProblem,
   hasStorageAddress,
   isConfigured,
+  loadSettings,
+  normalFolder,
   parseNumberSetting,
   providerOf,
   regionFromEndpoint,
   remoteSpec,
+  sameKeys,
   secretName,
   setupCodeFrom,
   setupLink,
+  shareConfig,
+  shareSecretName,
+  shareWith,
+  statePath,
+  storageLocation,
+  storageProblem,
   storageSettings,
   syncConfig,
   type Settings,
+  type Share,
   type StorageForm,
 } from '../src/plugin/settings.ts';
 
@@ -173,4 +188,120 @@ test('a setup link carries the setup code, and either can be pasted', () => {
   assert.equal(setupCodeFrom(setupLink(code)), code);
   assert.equal(setupCodeFrom(`  ${code}\n`), code);
   assert.match(setupLink(code), /^obsidian:\/\/self-sync\?setup=selfsync1\.abc%2B%2F%3Ddef$/);
+});
+
+const share = (over: Partial<Share> & Pick<Share, 'id' | 'folder'>): Share =>
+  shareWith({ endpoint: 'https://s3.example.com', bucket: 'bkt', prefix: `team-${over.id}`, accessKeySecret: 'ak', secretKeySecret: 'sk', passphraseSecret: 'pp', ...over });
+
+test('settings saved before shared folders load unchanged, and a saved share gets every field', () => {
+  const old = { ...s3(), deviceName: 'laptop', exclude: 'Private/', lastSuccess: 5 } as Partial<Settings>;
+  delete old.shares;
+  const loaded = loadSettings(JSON.parse(JSON.stringify(old)), false);
+  assert.deepEqual(loaded, { ...old, shares: [] });
+  assert.deepEqual(loadSettings(null, true), defaultSettings(true));
+  const [s] = loadSettings({ shares: [{ id: 'x1', folder: 'Work', bucket: 'b' } as Share] }, false).shares;
+  assert.deepEqual(s, { ...shareWith({ id: 'x1', folder: 'Work' }), bucket: 'b' });
+  assert.deepEqual([s.lastSuccess, s.lastCleanup, s.conflictCopies, s.missing, s.storageType, s.region], [0, 0, [], false, 's3', 'auto']);
+  assert.notEqual(loadSettings(null, false).shares, loadSettings(null, false).shares, 'no two loads share one list');
+});
+
+test('the vault leaves out every shared folder and its state, and a shared folder never holds the settings folder', () => {
+  const s = s3({ exclude: 'Private/\n*.tmp\nWork/drafts/\nWork/*.bak\n**/cache/\nOther/x.md', shares: [share({ id: 'w1', folder: 'Work' }), share({ id: 'n2', folder: 'Café/Notes' })] });
+  const c = syncConfig(s, '.obsidian', '.obsidian/plugins/self-sync');
+  assert.deepEqual(c.exclude.slice(-4), ['Work/', '.obsidian/plugins/self-sync/state-w1.json', 'Café/Notes/', '.obsidian/plugins/self-sync/state-n2.json']);
+  const vault = compileExcludes(c.exclude);
+  assert.ok(vault('Work/a.md') && vault('Work/deep/b.md') && vault('Café/Notes/c.md'));
+  assert.ok(!vault('Work notes/a.md') && !vault('Workshop.md') && !vault('Café/other.md'), 'a sibling whose name starts the same still syncs');
+  assert.ok(vault('Café/Notes/c.md'.normalize('NFC')));
+  assert.equal(statePath('p'), 'p/state.json');
+  assert.equal(statePath('p', 'w1'), 'p/state-w1.json');
+
+  const w = shareConfig(s, s.shares[0], '.obsidian');
+  assert.deepEqual(w.exclude, ['.DS_Store', '*.tmp', 'drafts/', '*.bak', '**/cache/']);
+  assert.equal(w.deviceName, s.deviceName);
+  const inside = compileExcludes(w.exclude);
+  assert.ok(inside('drafts/a.md') && inside('x.tmp') && inside('a/cache/b') && !inside('a.md') && !inside('x.md'));
+  // A share moved inside another leaves the inner one to its own sync.
+  const nested = s3({ shares: [share({ id: 'o', folder: 'Outer' }), share({ id: 'i', folder: 'Outer/Inner' })] });
+  assert.deepEqual(shareConfig(nested, nested.shares[0], '.obsidian').exclude, ['.DS_Store', 'Inner/']);
+});
+
+test('a shared folder must be a real folder of the vault, outside the others, the settings folder and what is left out', () => {
+  const s = s3({ exclude: 'Private/\n*.tmp', shares: [share({ id: 'w', folder: 'Work' }), share({ id: 'f', folder: 'Family/Photos' })] });
+  const problem = (folder: string, id = '') => folderProblem(s, folder, '.obsidian', '.obsidian/plugins/self-sync', id);
+  assert.equal(problem('Notes'), '');
+  assert.equal(problem('Work notes'), '', 'only starts like a shared folder');
+  assert.equal(problem('Family'), 'The shared folder “Family/Photos” is inside it. Shared folders can not be inside each other.');
+  assert.equal(problem('Work/Sub'), 'That is inside the shared folder “Work”. Shared folders can not be inside each other.');
+  assert.equal(problem('Work'), '“Work” is already a shared folder.');
+  assert.equal(problem('work'), '“Work” is already a shared folder.', 'case does not tell folders apart everywhere');
+  assert.equal(problem('Work', 'w'), '', 'a share does not stand in its own way');
+  assert.match(problem(''), /whole vault/);
+  assert.match(problem('.obsidian'), /settings folder/);
+  assert.match(problem('.obsidian/plugins'), /settings folder/);
+  assert.match(problem('.hidden'), /dot/);
+  assert.match(problem('Private'), /left out of sync/);
+  assert.match(problem('Private/Sub'), /left out of sync/);
+  assert.match(problem('a/../b'), /not a folder name/);
+  assert.match(problem('/Notes'), /not a folder name/);
+  assert.match(problem('What?'), /can not contain/);
+  assert.equal(normalFolder(' /Notes//Sub/ '), 'Notes/Sub');
+  assert.equal(normalFolder('Notes\\Sub'), 'Notes/Sub');
+});
+
+test('a storage location is used once: not where the vault syncs, and not by two shared folders', () => {
+  const s = s3({ prefix: 'vault', shares: [share({ id: 'w', folder: 'Work', prefix: 'team' })] });
+  assert.match(storageProblem(s, share({ id: 'n', folder: 'N', endpoint: 'https://S3.example.com/', prefix: '/vault/' })), /where this vault itself syncs/);
+  assert.match(storageProblem(s, share({ id: 'n', folder: 'N', prefix: 'team' })), /“Work” already syncs with that location/);
+  assert.equal(storageProblem(s, share({ id: 'w', folder: 'Work', prefix: 'team' }), 'w'), '');
+  assert.equal(storageProblem(s, share({ id: 'n', folder: 'N', prefix: 'vault/shared-n' })), '');
+  assert.equal(storageProblem(s, share({ id: 'n', folder: 'N', bucket: 'other', prefix: 'team' })), '');
+  assert.notEqual(storageLocation(dav()), storageLocation({ ...dav(), webdavUrl: 'https://dav.example.com/me/other' }));
+});
+
+test('"same storage as this vault" is a new place inside the vault\'s own, and invites for it are told apart', () => {
+  const s = s3({ prefix: '/vault/' });
+  const beside = besideVault(s, 'My Work', 'x7k2q9');
+  assert.deepEqual([beside.endpoint, beside.bucket, beside.prefix, beside.accessKeySecret], [s.endpoint, s.bucket, 'vault/shared-My-Work-x7k2q9', 'ak']);
+  assert.ok(!('deviceName' in beside), 'only storage settings come along');
+  assert.equal(besideVault(s3({ prefix: '' }), 'W', 't').prefix, 'shared-W-t');
+  assert.equal(besideVault(dav({ webdavUrl: 'https://dav.example.com/me/vault/' }), 'W', 't').webdavUrl, 'https://dav.example.com/me/vault/shared-W-t');
+  assert.notEqual(storageLocation(beside), storageLocation(s));
+
+  const keys: Record<string, string> = { ak: 'AKID', other: 'AKID2' };
+  const look = (n: string) => keys[n] ?? '';
+  assert.ok(sameKeys(beside, s, look));
+  assert.ok(!sameKeys({ ...beside, accessKeySecret: 'other' }, s, look), 'keys of their own');
+  assert.ok(!sameKeys({ ...beside, bucket: 'elsewhere' }, s, look));
+  assert.ok(sameKeys(dav({ webdavUrl: 'https://DAV.example.com/x' }), dav(), look));
+  assert.ok(!sameKeys(dav({ webdavUser: 'friend' }), dav(), look));
+});
+
+test('an invite to a shared folder is a setup code of its own kind, opened with the share\'s passphrase', async () => {
+  const lookup = (n: string) => ({ ak: 'AKID', sk: 'SECRET', sp: 'share pass', pp: 'vault pass' })[n] ?? '';
+  const work = share({ id: 'w1', folder: 'Projects/Work', prefix: 'team', passphraseSecret: 'sp' });
+  const invite = await encodeSetupCode(work, lookup, 'Work');
+  const vault = await encodeSetupCode(s3(), lookup);
+  assert.equal(codeKind(invite), 'share');
+  assert.equal(codeKind(` ${vault}`), 'vault');
+  assert.equal(codeKind('hello'), undefined);
+  assert.ok(!invite.includes('SECRET'));
+  assert.match(setupLink(invite), /^obsidian:\/\/self-sync\?share=selfshare1\./);
+  assert.equal(setupCodeFrom(setupLink(invite)), invite);
+  assert.match(setupLink(vault), /\?setup=/);
+
+  const { storage, secrets, folder } = await decodeInvite(`${invite}\n`, 'share pass', 'My Notes', 'j9');
+  const id = (base: string) => shareSecretName(base, 'My Notes', 'j9');
+  assert.equal(folder, 'Work');
+  assert.deepEqual([storage.endpoint, storage.bucket, storage.prefix, storage.accessKeySecret, storage.passphraseSecret], ['https://s3.example.com', 'bkt', 'team', id('self-sync-access-key'), id('self-sync-passphrase')]);
+  assert.deepEqual(secrets, [[id('self-sync-access-key'), 'AKID'], [id('self-sync-secret-key'), 'SECRET'], [id('self-sync-passphrase'), 'share pass']]);
+  for (const [name] of secrets) assert.match(name, /^[a-z0-9-]{1,64}$/);
+  assert.notEqual(id('self-sync-passphrase'), secretName('self-sync-passphrase', 'My Notes'), "a share's secrets never replace the vault's");
+  assert.notEqual(id('self-sync-passphrase'), shareSecretName('self-sync-passphrase', 'My Notes', 'k1'));
+
+  await assert.rejects(decodeInvite(invite, 'vault pass', 'My Notes', 'j9'), /Wrong passphrase/);
+  await assert.rejects(decodeInvite(vault, 'vault pass', 'My Notes', 'j9'), /setup link for a whole vault/);
+  await assert.rejects(decodeSetupCode(invite, 'share pass', 'My Notes'), /invite link to a shared folder/);
+  const sneaky = await encodeSetupCode(work, lookup, '../../.obsidian/x');
+  assert.equal((await decodeInvite(sneaky, 'share pass', 'V', 'q')).folder, 'x', "only the last part of the sender's folder name is used");
 });

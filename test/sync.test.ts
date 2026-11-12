@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { SafetyError, SyncEngine } from '../src/core/engine.ts';
+import { SafetyError, SyncEngine, deleteLimit } from '../src/core/engine.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
 import { rng, SimStore } from '../src/testing/netsim.ts';
 import { Device } from './helpers.ts';
@@ -629,4 +629,136 @@ test('after a paused mass delete, keeping all files brings them back on both sid
   assert.equal(b.fs.files.size, 30);
   await a.sync();
   assert.equal(a.fs.files.size, 30);
+});
+
+test('a commit lists its files in the order they were planned, whichever is prepared first', async () => {
+  const { devices: [a] } = setup(['A']);
+  for (const name of ['a.bin', 'b.bin', 'c.bin']) a.fs.put(name, random(20_000, name.charCodeAt(0)));
+  const read = a.fs.read.bind(a.fs);
+  const delay: Record<string, number> = { 'a.bin': 30, 'b.bin': 15, 'c.bin': 0 };
+  a.fs.read = async (path) => {
+    await new Promise((r) => setTimeout(r, delay[path] ?? 0));
+    return read(path);
+  };
+  await a.sync();
+  const { repo } = await a.engine.view();
+  assert.deepEqual((await repo.readCommit(1))!.changes.map((c) => c.path), ['a.bin', 'b.bin', 'c.bin']);
+});
+
+test('the delete limit is the larger of a count and a share of the files last synced', () => {
+  const cfg = { maxDeleteCount: 10, maxDeleteFraction: 0.5 };
+  assert.equal(deleteLimit(13, cfg), 10);
+  assert.equal(deleteLimit(45, cfg), 22.5);
+  assert.equal(deleteLimit(0, { maxDeleteCount: 3, maxDeleteFraction: 2 }), 3);
+});
+
+async function thirty() {
+  const env = setup(['A', 'B', 'C']);
+  const [a, b, c] = env.devices;
+  for (let i = 0; i < 30; i++) a.fs.put(`n${i}.md`, `${i}\n`);
+  await a.sync();
+  await b.sync();
+  await c.sync();
+  return { ...env, a, b, c };
+}
+
+const names = (from: number, to: number) => Array.from({ length: to - from }, (_, i) => `n${from + i}.md`);
+
+test('deletions the user confirmed get past the guard, here and on other devices', async () => {
+  const { a, b } = await thirty();
+  const restored = names(0, 20);
+  for (const p of [...restored, 'n20.md', 'n21.md']) a.fs.files.delete(p);
+  const r = await a.engine.sync({ allowDeletes: restored });
+  assert.equal(r.deletedRemote, 22);
+  const got = await b.sync();
+  assert.equal(got.deletedLocal, 22);
+  assert.deepEqual(b.snapshot(), a.snapshot());
+});
+
+test('deletions nobody confirmed still count in full, beside confirmed ones and from other devices', async () => {
+  const { a, b, c } = await thirty();
+  for (const p of names(0, 21)) a.fs.files.delete(p);
+  const e = await a.engine.sync({ allowDeletes: names(0, 5) }).then(() => assert.fail('expected a refusal'), (x: unknown) => x);
+  assert.ok(e instanceof SafetyError);
+  assert.deepEqual([e.localDeletes, e.remoteDeletes], [0, 16], 'only the deletions nobody confirmed are counted and reported');
+  assert.equal((await b.sync()).deletedLocal, 0, 'nothing was deleted');
+
+  // A restore on A, while C deletes many others without asking: B pauses for C's only.
+  for (const [p, f] of b.fs.files) a.fs.files.set(p, f);
+  await a.sync();
+  for (const p of names(0, 10)) a.fs.files.delete(p);
+  await a.engine.sync({ allowDeletes: names(0, 10) });
+  await c.sync();
+  for (const p of names(10, 26)) c.fs.files.delete(p);
+  await c.sync(true);
+  const paused = await b.sync().then(() => assert.fail('expected a refusal'), (x: unknown) => x);
+  assert.ok(paused instanceof SafetyError);
+  assert.deepEqual([paused.localDeletes, paused.remoteDeletes], [16, 0]);
+  assert.equal((await b.sync(true)).deletedLocal, 26);
+});
+
+test('only deletions the sync finds and was told of are marked, in a commit of their own', async () => {
+  const { a, b } = await thirty();
+  for (const p of names(0, 20)) a.fs.files.delete(p);
+  a.fs.files.delete('n29.md');
+  a.fs.put('n28.md', 'edited\n');
+  const r = await a.engine.sync({ allowDeletes: [...names(0, 20), 'n25.md', 'never existed.md'] });
+  assert.deepEqual([r.deletedRemote, r.pushed], [21, 1]);
+  const { repo, st } = await a.engine.view();
+  assert.ok(st.remote.has('n25.md'), 'named, but still there: not deleted');
+  const commits = await Promise.all([2, 3].map((seq) => repo.readCommit(seq)));
+  const marked = commits.filter((c) => c!.confirmed);
+  assert.equal(marked.length, 1);
+  assert.deepEqual(marked[0]!.changes.map((c) => [c.path, c.entry]), names(0, 20).map((p) => [p, null]));
+  const other = commits.find((c) => !c!.confirmed)!;
+  assert.deepEqual(other.changes.map((c) => [c.path, !!c.entry]).sort(), [['n28.md', true], ['n29.md', false]]);
+  await b.sync();
+  assert.deepEqual(b.snapshot(), a.snapshot());
+});
+
+test('a device that restarts before it could delete confirmed files still does not count them', async () => {
+  const { a, b } = await thirty();
+  for (const p of names(0, 20)) a.fs.files.delete(p);
+  a.fs.put('n25.md', 'restored version\n');
+  await a.engine.sync({ allowDeletes: names(0, 20) });
+  const remove = b.fs.remove.bind(b.fs);
+  b.fs.remove = async () => {
+    throw new Error('EBUSY');
+  };
+  const r = await b.sync();
+  assert.deepEqual([r.pulled, r.deletedLocal, r.errors.length], [1, 0, 20]);
+  b.fs.remove = remove;
+  b.restart();
+  assert.equal((await b.sync()).deletedLocal, 20);
+  assert.deepEqual(b.snapshot(), a.snapshot());
+});
+
+test('a sync writes the state file once, and not at all when nothing changed', async () => {
+  const { devices: [a, b] } = setup();
+  a.fs.put('a.md', 'a\n');
+  await a.sync();
+  await b.sync();
+  const saves = (d: typeof a) => {
+    let n = 0;
+    const save = d.state.save.bind(d.state);
+    d.state.save = async (data) => {
+      n++;
+      return save(data);
+    };
+    return () => n;
+  };
+  const [savedA, savedB] = [saves(a), saves(b)];
+  await a.sync();
+  assert.equal(savedA(), 0, 'nothing to do');
+  a.fs.put('a.md', 'a\nb\n');
+  a.fs.put('c.md', 'c\n');
+  await a.sync();
+  assert.equal(savedA(), 1, 'one commit');
+  await b.sync();
+  assert.equal(savedB(), 1, 'two files received');
+  b.fs.put('a.md', 'a\nb\nfrom B\n');
+  a.fs.put('a.md', 'from A\na\nb\n');
+  await a.sync();
+  await b.sync();
+  assert.equal(savedB(), 2, 'a merge received and sent: once, after its commit');
 });

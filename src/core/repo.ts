@@ -25,17 +25,20 @@ interface WireCommit {
   h?: string;
   /** Set on a commit that only moves data (`Commit.moved`). Older versions ignore it and see entries with unchanged content. */
   m?: 1;
+  /** Set on a commit whose deletions the user confirmed (`Commit.confirmed`). Older versions ignore it and count them like any deletion. */
+  a?: 1;
 }
 
 function encCommit(c: Commit): WireCommit {
   const pt = new PackTable();
   const changes = c.changes.map((ch): [string, WireEntry | null] => [ch.path, ch.entry && encEntry(ch.entry, pt)]);
-  return { d: c.device, t: c.time, p: pt.list, c: changes, h: c.prev, ...(c.moved && { m: 1 as const }) };
+  return { d: c.device, t: c.time, p: pt.list, c: changes, h: c.prev, ...(c.moved && { m: 1 as const }), ...(c.confirmed && { a: 1 as const }) };
 }
 
 function decCommit(seq: number, w: WireCommit, hash?: string): Commit {
   const c: Commit = { seq, device: w.d, time: w.t, changes: w.c.map(([path, e]) => ({ path, entry: e && decEntry(e, w.p) })), prev: w.h, hash };
   if (w.m) c.moved = true;
+  if (w.a) c.confirmed = true;
   return c;
 }
 

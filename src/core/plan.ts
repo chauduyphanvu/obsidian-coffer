@@ -22,6 +22,7 @@ export interface Plan {
  * Where nothing needs doing it brings that agreed version up to date in `st`.
  * `tooLargeHere` holds paths whose local file is over the size limit: they are missing from
  * `local`, but must not be mistaken for local deletions.
+ * With `keys`, compares only those paths, and `local` need only hold those of them that exist.
  */
 export function planChanges(
   local: Map<string, Local>,
@@ -29,6 +30,7 @@ export function planChanges(
   excluded: (path: string) => boolean,
   maxSize: number,
   tooLargeHere: Set<string> = new Set(),
+  keys?: Set<string>,
 ): Plan {
   const pushes: Local[] = [];
   const pushDeletes: string[] = [];
@@ -62,10 +64,14 @@ export function planChanges(
     else if (!r) pushes.push(l); // edited here, deleted elsewhere: the edit wins
     else conflicts.push(key);
   };
-  for (const key of local.keys()) plan(key);
-  for (const key of st.synced.keys()) if (!local.has(key)) plan(key);
-  for (const key of st.remote.keys()) if (!local.has(key) && !st.synced.has(key)) plan(key);
-  for (const key of tooLargeHere) if (!st.synced.has(key) && !st.remote.has(key)) plan(key);
+  if (keys) {
+    for (const key of keys) plan(key);
+  } else {
+    for (const key of local.keys()) plan(key);
+    for (const key of st.synced.keys()) if (!local.has(key)) plan(key);
+    for (const key of st.remote.keys()) if (!local.has(key) && !st.synced.has(key)) plan(key);
+    for (const key of tooLargeHere) if (!st.synced.has(key) && !st.remote.has(key)) plan(key);
+  }
   return { pushes, pushDeletes, pulls, pullDeletes, conflicts, tooLarge };
 }
 

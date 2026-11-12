@@ -318,3 +318,34 @@ test('a folder restore plan leaves other folders alone, skips identical files, a
   v = await view(a);
   assert.deepEqual(planRestore(v.remote, target, 'notes'), { write: [], remove: [] }, 'the folder now matches the moment');
 });
+
+test('paging by sequence number lists every moment once, even moments that share a millisecond', async () => {
+  const { devices: [a], clock } = setup();
+  for (let i = 0; i < 9; i++) {
+    if (i % 3 === 0) clock.now += 60_000; // three commits in each millisecond
+    a.fs.put(`n${i}.md`, `${i}\n`);
+    await a.sync();
+  }
+  const v = await view(a);
+  const all = await commits(v);
+  assert.equal(all.length, 9);
+  const page = async (o: { beforeSeq?: number; before?: number }) => listCommits(v.repo, v.lastSeq, v.cfg, v.now, { limit: 2, ...o });
+  const bySeq = [];
+  for (let beforeSeq: number | undefined; ; ) {
+    const p = await page({ beforeSeq });
+    if (!p.length) break;
+    bySeq.push(...p);
+    beforeSeq = p.at(-1)!.seq;
+  }
+  assert.deepEqual(bySeq, all);
+  const byTime = [];
+  for (let before: number | undefined; ; ) {
+    const p = await page({ before });
+    if (!p.length) break;
+    byTime.push(...p);
+    before = p.at(-1)!.time;
+  }
+  assert.ok(byTime.length < all.length, 'a time cannot tell moments in the same millisecond apart');
+  assert.deepEqual(await page({ beforeSeq: 1 }), []);
+  assert.deepEqual((await page({ beforeSeq: 100 })).map((c) => c.seq), [9, 8]);
+});

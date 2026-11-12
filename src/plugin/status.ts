@@ -5,6 +5,7 @@ import { SafetyError, type SyncResult } from '../core/engine.ts';
 import { lineDiff, type DiffRegion } from '../core/merge.ts';
 import { ext } from '../core/paths.ts';
 import { DAY } from '../core/retention.ts';
+import { MissingFolderError } from '../core/scopedfs.ts';
 
 export const plural = (n: number, one: string, many = `${one}s`) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
 
@@ -20,7 +21,7 @@ export function summarize(r: SyncResult): string {
   return parts.length ? parts.join(', ') : 'everything is up to date';
 }
 
-export type Action = 'settings' | 'passphrase' | 'resolve-deletes' | 'files' | 'retry';
+export type Action = 'settings' | 'passphrase' | 'resolve-deletes' | 'files' | 'retry' | 'missing-folder';
 
 export interface Problem {
   /** A notice is shown once per id, so the same problem does not nag on every sync. */
@@ -31,6 +32,61 @@ export interface Problem {
   detail: string;
   action?: Action;
   files?: string[];
+  /** The id of the shared folder it is about; its actions act on that one. None for the vault's own. */
+  share?: string;
+}
+
+/** A shared folder's folder is gone from this vault. */
+export function missingProblem(folder: string): Problem {
+  return {
+    id: 'missing-folder',
+    severity: 'critical',
+    title: 'Folder missing from this vault',
+    detail:
+      `There is no folder “${folder}” in this vault now, so this shared folder stopped syncing here. Nothing was deleted for the others who share it. ` +
+      `Download it again to bring its files back into “${folder}”, or stop sharing it on this device.`,
+    action: 'missing-folder',
+  };
+}
+
+/** A shared folder whose storage keys or passphrase this device no longer has, as after its keychain was reset. */
+export function keysMissingProblem(): Problem {
+  return {
+    id: 'share-keys',
+    severity: 'critical',
+    title: 'Keys missing on this device',
+    detail: 'This device no longer has the storage keys or the passphrase for this shared folder, so it does not sync here. Stop sharing it on this device, then join again with the invite link.',
+    action: 'settings',
+  };
+}
+
+/** A shared folder's problem, told apart from the vault's: its own id, and a title that names the folder. */
+export function inShare(p: Problem, share: { id: string; folder: string }): Problem {
+  return { ...p, id: `share:${share.id}:${p.id}`, title: `Shared folder “${share.folder}”: ${p.title}`, share: share.id };
+}
+
+/** What one synced place (the vault, or a shared folder) has to report, worst first. */
+export function targetProblems(t: { failure?: Problem; found: Problem[]; conflictCopies: string[]; lastSuccess: number }, now: number): Problem[] {
+  const out: Problem[] = [];
+  // A temporary failure (offline) only counts once it has gone on for a day.
+  if (t.failure && t.failure.id !== 'offline') out.push(t.failure);
+  if (t.failure) {
+    const stale = staleProblem(t.lastSuccess, now);
+    if (stale) out.push(stale);
+  }
+  out.push(...withConflicts(t.found, t.conflictCopies));
+  return out.sort((a, b) => (a.severity === b.severity ? 0 : a.severity === 'critical' ? -1 : 1));
+}
+
+export type Tone = 'ok' | 'busy' | 'warning' | 'critical' | 'off';
+
+/** One line for a synced place: its worst problem, or when it last synced and how much there is to review. */
+export function statusText(problems: Problem[], lastSuccess: number, offline: boolean): { text: string; tone: Tone } {
+  const critical = problems.filter((p) => p.severity === 'critical');
+  if (critical.length) return { text: critical.length === 1 ? critical[0].title : `${plural(critical.length, 'problem')} need attention`, tone: 'critical' };
+  const when = lastSuccess ? `Synced ${new Date(lastSuccess).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : 'Not synced yet';
+  if (problems.length) return { text: `${when} · ${plural(problems.length, 'thing', 'things')} to review`, tone: 'warning' };
+  return { text: offline ? `${when} · offline` : when, tone: 'ok' };
 }
 
 /** Probably temporary: no network, or the storage is busy. Not worth an alarm until it lasts. */
@@ -40,6 +96,7 @@ export const isTransient = (message: string) =>
 /** A sync that threw, described. */
 export function describeFailure(e: unknown): Problem {
   const message = e instanceof Error ? e.message : String(e);
+  if (e instanceof MissingFolderError) return missingProblem(e.folder);
   if (e instanceof SafetyError) {
     return {
       id: `deletes:${e.localDeletes}:${e.remoteDeletes}`,
