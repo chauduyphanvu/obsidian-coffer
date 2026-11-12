@@ -310,6 +310,8 @@ export default class SelfSyncPlugin extends Plugin {
       this.registerInterval(this.timer);
     }
     this.armPoll();
+    // The timer just replaced may have held the sync an edit is owed, as when resolving a conflict saves settings.
+    if (this.dirty && !this.running) this.schedule();
   }
 
   private stopPoll(): void {
@@ -860,6 +862,9 @@ export default class SelfSyncPlugin extends Plugin {
       await this.saveSettings();
     });
     this.report();
+    // Its files are the vault's to sync now, and no vault event says so.
+    this.dirty = true;
+    this.schedule();
   }
 
   /**

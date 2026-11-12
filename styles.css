@@ -380,7 +380,8 @@ details.self-sync-plan > summary { cursor: pointer; padding: var(--size-2-3) 0; 
 .is-mobile .self-sync-past .self-sync-check-row { align-items: center; }
 .is-mobile .self-sync-past .self-sync-check-row > input { width: 22px; height: 22px; margin: 0; }
 .is-mobile .self-sync-past details.self-sync-plan > summary { padding: var(--size-4-3) 0; }
-.is-mobile .self-sync-past .self-sync-open { display: inline-flex; align-items: center; min-height: 44px; }
+.is-mobile .self-sync-open { display: inline-flex; align-items: center; min-height: 44px; min-width: 44px; justify-content: center; }
+.is-mobile .self-sync-search { min-height: 44px; }
 
 /* Loud notices: they stay until tapped. */
 .notice.self-sync-notice { cursor: pointer; }

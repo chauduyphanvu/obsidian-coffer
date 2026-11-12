@@ -75,6 +75,8 @@ const STATE_DIR = '.self-sync';
 const FORCE_HINT = 'to delete them anyway, run sync --force';
 const ACCEPT_HINT = 'if storage was put back to a backup or an older copy on purpose, run accept-storage to carry on from it as it is now';
 const WATCH_SETTLE_MS = 3000;
+/** Node's names for systems, as the devices list shows them. */
+const SYSTEMS: Record<string, string> = { darwin: 'macOS', win32: 'Windows', linux: 'Linux' };
 
 const env = (name: string) => {
   const v = process.env[name];
@@ -231,7 +233,7 @@ async function main(): Promise<number> {
   const heartbeat = async () => {
     try {
       const { version } = JSON.parse(await readFile(new URL('../../manifest.json', import.meta.url), 'utf8')) as { version: string };
-      await writeHeartbeat(await engine.view(), { platform: `CLI on ${process.platform}`, version });
+      await writeHeartbeat(await engine.view(), { platform: `CLI on ${SYSTEMS[process.platform] ?? process.platform}`, version });
     } catch (e) {
       console.error(`could not record this device's heartbeat: ${errorText(e)}`);
     }

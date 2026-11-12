@@ -5,7 +5,9 @@ import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { SafetyError, type SyncResult } from '../src/core/engine.ts';
+import { resolveConfig } from '../src/core/config.ts';
+import { listDevices } from '../src/core/devices.ts';
+import { SafetyError, SyncEngine, type SyncResult } from '../src/core/engine.ts';
 import type { RemoteStore } from '../src/core/types.ts';
 import { FolderStore, NodeFS } from '../src/node/nodefs.ts';
 import { SyncLoop, watchVault, type LoopOptions } from '../src/node/watch.ts';
@@ -765,6 +767,26 @@ test('cli watch: --poll and --interval must be positive numbers of seconds', () 
     const r = t.run('watch', '--poll=0');
     assert.equal(r.status, 1);
     assert.match(r.stderr, /--poll must be a number of seconds above 0/);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli: the devices list names the system the CLI runs on in plain words', async () => {
+  const t = setup({ deviceName: 'server' });
+  try {
+    put(t.vault, 'note.md', 'hello\n');
+    t.cli('sync');
+    const reader = new SyncEngine({
+      fs: new NodeFS(t.vault),
+      store: new FolderStore(join(t.dir, 'remote')),
+      stateStore: { load: async () => null, save: async () => {} },
+      passphrase: 'pw',
+      config: resolveConfig({ deviceName: 'reader', kdfIterations: 1000 }),
+    });
+    const [server] = await listDevices(await reader.view());
+    const expected = { darwin: 'CLI on macOS', win32: 'CLI on Windows', linux: 'CLI on Linux' }[process.platform as string] ?? `CLI on ${process.platform}`;
+    assert.equal(server.platform, expected);
   } finally {
     t.done();
   }
