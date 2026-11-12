@@ -151,14 +151,16 @@ test('an old moment, a recent one, the newest commits and the window each cost a
     await f();
     return net.stats.get + net.stats.list;
   };
-  // The snapshot listing, commit 40 (the earliest, and the snapshot's own), snapshot 40 and the digest of 41-50.
-  assert.equal(await cost(() => at(v, times[45] + 1)), 5);
-  // The listing, commit 40, commits 91-95 in one batch, and snapshot 90 to show new.md did not exist yet.
-  assert.equal(await cost(() => at(v, times[92] + 1)), 8);
+  // The earliest moment is the last commit up to the floor snapshot (40) that ends its day, which takes
+  // commit 41 to tell. The snapshot listing, the digests of 31-40 and 41-50 (read once, for the earliest
+  // moment and the replay alike), and snapshot 40.
+  assert.equal(await cost(() => at(v, times[45] + 1)), 4);
+  // The listing, the digests of 31-40 and 41-50 for the earliest moment, commits 91-95 in one batch, and snapshot 90 to show new.md did not exist yet.
+  assert.equal(await cost(() => at(v, times[92] + 1)), 9);
   assert.equal((await at(v, times[92] + 1)).files.has('new.md'), false);
   assert.equal(await cost(() => commits(v, { limit: 3 })), 7);
-  // The listing, commits 91-95, the digests of 41-90, and snapshot 40 for gone.md's last version.
-  assert.equal(await cost(() => deleted(v)), 12);
+  // The listing, commits 91-95, the digests of 31-90 (commit 40 itself shows it ends its day), and snapshot 40 for gone.md's last version.
+  assert.equal(await cost(() => deleted(v)), 13);
   assert.deepEqual((await deleted(v)).map((d) => [d.path, d.seq]), [['gone.md', 60]]);
   // The listing, commits 91-95, the digests of 31-90, and snapshot 30 to show new.md did not exist before 93.
   assert.equal(await cost(() => commits(v)), 13);

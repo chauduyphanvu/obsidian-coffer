@@ -229,6 +229,155 @@ body:not(.is-phone) .modal.self-sync-resolve { --dialog-width: 720px; }
 .is-mobile .self-sync-file > button { min-height: 44px; }
 .is-mobile .self-sync-resolve-nav > button { min-width: 44px; }
 
+/* The past: a file's versions, deleted files, earlier times, the storage check. */
+body:not(.is-phone) .modal.self-sync-wide { --dialog-width: 920px; }
+.self-sync-past .modal-title { overflow-wrap: anywhere; }
+
+/* Versions beside the one picked; on a phone, one at a time. */
+.self-sync-panes {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
+  gap: var(--size-4-4);
+  align-items: start;
+}
+.self-sync-pane { min-width: 0; }
+body:not(.is-phone) .self-sync-pane { max-height: 70vh; overflow-y: auto; overscroll-behavior: contain; }
+.self-sync-back { display: none; }
+body.is-phone .self-sync-panes { display: block; }
+body.is-phone .self-sync-panes.is-picked .self-sync-pane-list,
+body.is-phone .self-sync-panes:not(.is-picked) .self-sync-pane-preview { display: none; }
+body.is-phone .self-sync-past button.self-sync-back { display: inline-flex; width: auto; margin-bottom: var(--size-4-2); }
+
+.self-sync-list { display: flex; flex-direction: column; gap: 2px; }
+.self-sync-day {
+  margin-top: var(--size-4-3);
+  padding: 0 var(--size-4-3) var(--size-2-2);
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+  color: var(--text-muted);
+}
+.self-sync-list > .self-sync-day:first-child { margin-top: 0; }
+.self-sync-past .self-sync-row {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  height: auto;
+  min-height: 0;
+  padding: var(--size-4-2) var(--size-4-3);
+  border: none;
+  border-inline-start: 3px solid transparent;
+  border-radius: var(--radius-m);
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-normal);
+  font-size: var(--font-ui-medium);
+  font-weight: var(--font-normal);
+  text-align: start;
+  white-space: normal;
+}
+.self-sync-past button.self-sync-row { cursor: pointer; }
+.self-sync-past button.self-sync-row:hover { background: var(--background-modifier-hover); }
+.self-sync-past button.self-sync-row:focus-visible { box-shadow: 0 0 0 2px var(--background-modifier-border-focus); }
+.self-sync-past button.self-sync-row.is-selected { background: var(--background-modifier-active-hover); border-inline-start-color: var(--interactive-accent); }
+.self-sync-row.is-deleted { color: var(--text-faint); }
+.self-sync-row-title { font-weight: var(--font-medium); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.self-sync-row-sub { color: var(--text-muted); font-size: var(--font-ui-small); margin-top: var(--size-2-1); overflow-wrap: anywhere; }
+.self-sync-row.is-deleted .self-sync-row-sub { color: var(--text-faint); }
+.self-sync-tag {
+  margin-inline-start: var(--size-4-2);
+  padding: 0 var(--size-4-1);
+  border-radius: var(--radius-s);
+  background: var(--background-modifier-hover);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+.self-sync-counts { margin-inline-start: var(--size-4-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.self-sync-counts > span + span { margin-inline-start: var(--size-4-1); }
+.self-sync-counts > .is-added { color: var(--text-success); }
+.self-sync-counts > .is-removed { color: var(--text-error); }
+
+.self-sync-preview-title { font-weight: var(--font-semibold); font-size: var(--font-ui-medium); overflow-wrap: anywhere; }
+.self-sync-summary { font-weight: var(--font-semibold); margin: var(--size-4-3) 0 var(--size-4-1); }
+
+/* Changes: a mark column, so added and removed lines read apart without colour. */
+.self-sync-diff {
+  margin-top: var(--size-4-2);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  overflow: hidden;
+  font-family: var(--font-text);
+  font-size: var(--font-ui-small);
+  line-height: var(--line-height-normal);
+}
+.self-sync-diff-line { display: flex; min-height: calc(var(--line-height-normal) * 1em); }
+.self-sync-diff-mark { flex: none; width: 1.8em; text-align: center; font-weight: var(--font-bold); user-select: none; }
+.self-sync-diff-text { flex: 1 1 auto; min-width: 0; padding-inline-end: var(--size-4-2); white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4; }
+.self-sync-diff-line.is-same { color: var(--text-muted); }
+.self-sync-diff-line.is-added { background: rgba(var(--color-green-rgb), 0.14); }
+.self-sync-diff-line.is-removed { background: rgba(var(--color-red-rgb), 0.12); }
+.self-sync-diff-line.is-added > .self-sync-diff-mark { color: var(--text-success); }
+.self-sync-diff-line.is-removed > .self-sync-diff-mark { color: var(--text-error); }
+.self-sync-diff-gap {
+  padding: var(--size-2-2) var(--size-4-2);
+  background: var(--background-secondary);
+  color: var(--text-faint);
+  font-family: var(--font-interface);
+  font-size: var(--font-ui-smaller);
+  text-align: center;
+}
+.self-sync-whole {
+  margin-top: var(--size-4-2);
+  padding: var(--size-4-2) var(--size-4-3);
+  border-radius: var(--radius-m);
+  background: var(--background-secondary);
+  font-family: var(--font-text);
+  font-size: var(--font-ui-small);
+  line-height: var(--line-height-normal);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  tab-size: 4;
+}
+
+.self-sync-search { box-sizing: border-box; width: 100%; margin-bottom: var(--size-4-2); font-size: var(--font-ui-medium); }
+.self-sync-check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--size-4-3);
+  padding: var(--size-4-2) var(--size-4-3);
+  border-radius: var(--radius-m);
+  cursor: pointer;
+}
+.self-sync-check-row:hover { background: var(--background-modifier-hover); }
+.self-sync-check-row > input { flex: none; margin: 0.2em 0 0; }
+.self-sync-check-body { flex: 1 1 auto; min-width: 0; }
+.self-sync-foot {
+  position: sticky;
+  bottom: 0;
+  padding-bottom: var(--size-4-2);
+  background: var(--modal-background, var(--background-primary));
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+details.self-sync-plan { margin-top: var(--size-4-2); }
+details.self-sync-plan > summary { cursor: pointer; padding: var(--size-2-3) 0; font-weight: var(--font-medium); }
+.self-sync-what { margin: var(--size-4-3) 0 0; padding-inline-start: 1.2em; color: var(--text-muted); font-size: var(--font-ui-small); }
+.self-sync-what > li + li { margin-top: var(--size-2-2); }
+.self-sync-note {
+  margin: var(--size-4-2) 0;
+  padding: var(--size-4-2) var(--size-4-3);
+  border-radius: var(--radius-s);
+  background: rgba(var(--color-orange-rgb), 0.15);
+  overflow-wrap: anywhere;
+}
+
+.is-mobile .self-sync-past button,
+.is-mobile .self-sync-past .self-sync-row,
+.is-mobile .self-sync-past .self-sync-check-row { min-height: 44px; }
+.is-mobile .self-sync-past .self-sync-check-row { align-items: center; }
+.is-mobile .self-sync-past .self-sync-check-row > input { width: 22px; height: 22px; margin: 0; }
+.is-mobile .self-sync-past details.self-sync-plan > summary { padding: var(--size-4-3) 0; }
+.is-mobile .self-sync-past .self-sync-open { display: inline-flex; align-items: center; min-height: 44px; }
+
 /* Loud notices: they stay until tapped. */
 .notice.self-sync-notice { cursor: pointer; }
 .notice.self-sync-notice.is-critical {
@@ -242,3 +391,48 @@ body:not(.is-phone) .modal.self-sync-resolve { --dialog-width: 720px; }
 .status-bar-item.self-sync-status.is-critical { color: var(--text-error); font-weight: var(--font-semibold); }
 .status-bar-item.self-sync-status.is-warning { color: var(--color-orange); }
 .self-sync-alert { color: var(--color-red); }
+
+/* Devices block of the settings screen: who else syncs this vault, and whether they keep up. */
+.self-sync-devices { margin-bottom: var(--size-4-4); }
+.self-sync-device {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--size-4-2) var(--size-4-3);
+  padding: var(--size-4-3) 0;
+  border-top: 1px solid var(--background-modifier-border);
+}
+.self-sync-device-text { flex: 1 1 14em; min-width: 0; }
+.self-sync-device-name { font-weight: var(--font-semibold); overflow-wrap: anywhere; }
+.self-sync-device-tag {
+  margin-inline-start: var(--size-4-2);
+  padding: 0 var(--size-4-2);
+  border-radius: var(--radius-s);
+  background: var(--background-modifier-hover);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-medium);
+  white-space: nowrap;
+}
+.self-sync-device-meta { color: var(--text-muted); font-size: var(--font-ui-small); overflow-wrap: anywhere; }
+.self-sync-device-status {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--size-4-2);
+  margin-top: var(--size-2-2);
+  font-size: var(--font-ui-small);
+  overflow-wrap: anywhere;
+}
+.self-sync-device-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin-top: 0.45em;
+  border-radius: 50%;
+  background: var(--color-green);
+}
+.self-sync-device.is-warning .self-sync-device-dot { background: var(--color-orange); }
+.self-sync-device.is-critical .self-sync-device-dot { background: var(--color-red); }
+.self-sync-device.is-critical .self-sync-device-status { color: var(--text-error); }
+.self-sync-device > button { flex: none; width: auto; }
+.is-mobile .self-sync-device > button { min-height: 44px; min-width: 44px; }

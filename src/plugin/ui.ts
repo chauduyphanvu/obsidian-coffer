@@ -59,9 +59,9 @@ export function message(parent: HTMLElement, text: string, cls = 'self-sync-erro
   if (text) parent.createDiv({ cls, text });
 }
 
-/** A coloured dot and one line, the same on every screen that shows sync status. */
-export function statusLine(parent: HTMLElement, text: string, tone: string): void {
+/** A coloured dot and one line, the same on every screen that shows sync status. Returns the line's text, to update in place. */
+export function statusLine(parent: HTMLElement, text: string, tone: string): HTMLElement {
   const line = parent.createDiv({ cls: `self-sync-status-line is-${tone}` });
   line.createSpan({ cls: 'self-sync-dot' });
-  line.createSpan({ text });
+  return line.createSpan({ text });
 }

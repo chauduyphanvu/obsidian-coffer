@@ -1,8 +1,7 @@
-import { pool } from './bytes.ts';
 import type { SyncConfig } from './config.ts';
 import { vaultKey } from './paths.ts';
 import type { Repo } from './repo.ts';
-import { DAY } from './retention.ts';
+import { Backward, Forward, HOUR, Reads, Thinning, floorSnapshot, keptState, type Snapshot } from './retention.ts';
 import { sameContent, type Commit, type Entry } from './types.ts';
 
 /** A commit seen as a point in time: the vault right after it. */
@@ -13,7 +12,11 @@ export interface Moment {
 }
 
 export interface PastVault {
-  /** The last commit made at or before the moment asked for; `files` is the vault right after it. */
+  /**
+   * The kept moment used: the last one at or before the time asked for. States between kept moments
+   * are thinned away (see `keptState`), so a time inside such a stretch gets the kept moment before it.
+   * `files` is the vault at that moment.
+   */
   commit: Moment;
   files: Map<string, Entry>;
   /** The earliest moment that can still be restored. Cleanup may already have removed data older than it. */
@@ -23,11 +26,12 @@ export interface PastVault {
 /** A file that no longer exists. `seq`, `time` and `device` are those of the commit that deleted it. */
 export interface DeletedFile extends Moment {
   path: string;
-  /** Its last version, to restore it from. */
+  /** Its last kept version, to restore it from. */
   entry: Entry;
 }
 
 export interface CommitSummary extends Moment {
+  /** Files added, changed and deleted since the kept moment before this one (for the earliest, by its own commit). */
   added: number;
   changed: number;
   deleted: number;
@@ -47,54 +51,26 @@ export class TooOldError extends Error {
   }
 }
 
-type Snapshot = { seq: number; modified: number };
-
-/** What cleanup still keeps, as of one moment. */
+/** What cleanup keeps, as of one moment: the same rule `collectGarbage` applies. */
 interface Kept {
-  /** The first commit whose vault is still whole. Nothing older is offered, so no walk looks further back for it. */
-  from: number;
+  /** Cleanup's floor snapshot, 0 for none. */
+  floor: number;
+  now: number;
+}
+
+function kept(snaps: Snapshot[], cfg: SyncConfig, now: number): Kept {
+  return { floor: floorSnapshot(snaps, cfg, now)?.seq ?? 0, now };
 }
 
 /**
- * Cleanup keeps the data of the newest snapshot older than the retention window and of every commit
- * after it (`collectGarbage`). That snapshot only moves forward as time passes, so the vault at its
- * commit or any later one is whole. An older one may already be missing data.
+ * Says, for commits seen newest first, which are kept moments. Every moment and version offered passes
+ * through here. `next`: the time of the first user commit after where the walk starts, if not the newest.
  */
-function kept(snaps: Snapshot[], cfg: SyncConfig, now: number): Kept {
-  const cutoff = now - cfg.retentionDays * DAY;
-  return { from: snaps.filter((s) => s.modified <= cutoff).pop()?.seq ?? 1 };
-}
-
-/** Whether the vault as it stood right after commit `seq` can still be restored. Every moment and version offered passes through here. */
-function restorable(k: Kept, seq: number): boolean {
-  return seq >= k.from;
+function restorable(k: Kept, next?: number): Thinning {
+  return new Thinning(k.floor, k.now, next);
 }
 
 const moment = (c: Moment): Moment => ({ seq: c.seq, time: c.time, device: c.device });
-
-async function readMoment(repo: Repo, seq: number): Promise<Moment> {
-  const c = await repo.readCommit(seq);
-  if (!c) throw new Error(`Commit ${seq} cannot be read`);
-  return moment(c);
-}
-
-/** Commits `lo` to `hi`, in order. */
-async function readCommits(repo: Repo, concurrency: number, lo: number, hi: number): Promise<Commit[]> {
-  const out: Commit[] = new Array(hi - lo + 1);
-  await pool(out, concurrency, async (_, i) => {
-    const c = await repo.readCommit(lo + i);
-    if (!c) throw new Error(`Commit ${lo + i} cannot be read`);
-    out[i] = c;
-  });
-  return out;
-}
-
-/** Commits `lo` to `hi`, in order: one request when they are exactly one snapshot interval and its digest exists. */
-async function readRange(repo: Repo, cfg: SyncConfig, lo: number, hi: number): Promise<Commit[]> {
-  const n = cfg.snapshotEvery;
-  const all = hi % n === 0 && hi - lo + 1 === n ? await repo.readDigest(hi, n) : null;
-  return all ?? readCommits(repo, cfg.concurrency, lo, hi);
-}
 
 function apply(files: Map<string, Entry>, path: string, entry: Entry | null): void {
   if (entry) files.set(path, entry);
@@ -107,213 +83,258 @@ function inFolder(folder: string): (path: string) => boolean {
   return prefix ? (path) => path.startsWith(`${prefix}/`) : () => true;
 }
 
-/**
- * Reads the log newest first: a whole snapshot interval in one request where its digest exists,
- * otherwise a few commits at a time, so a caller that stops early has not read the whole interval.
- */
-class Backward {
-  private repo: Repo;
-  private cfg: SyncConfig;
-  private snaps: Set<number>;
-  /** Fetched and not yet returned, oldest first. */
-  private buf: Commit[] = [];
-  /** The newest commit not yet fetched. */
-  private hi: number;
+/** The first user commit after `seq`, if any. */
+async function userAfter(reads: Reads, seq: number, lastSeq: number): Promise<Commit | undefined> {
+  const fwd = new Forward(reads, seq + 1, lastSeq);
+  for (let c: Commit | undefined; (c = await fwd.next()); ) if (!c.moved) return c;
+  return undefined;
+}
 
-  constructor(repo: Repo, cfg: SyncConfig, snaps: Snapshot[], from: number) {
-    this.repo = repo;
-    this.cfg = cfg;
-    this.snaps = new Set(snaps.map((s) => s.seq));
-    this.hi = from;
-  }
-
-  /** The commit `next` returns; 0 once the log is exhausted. */
-  get seq(): number {
-    return this.buf.length ? this.buf[this.buf.length - 1].seq : this.hi;
-  }
-
-  async peek(): Promise<Commit | undefined> {
-    if (!this.buf.length && this.hi > 0) await this.fill();
-    return this.buf[this.buf.length - 1];
-  }
-
-  async next(): Promise<Commit | undefined> {
-    const c = await this.peek();
-    this.buf.pop();
-    return c;
-  }
-
-  private async fill(): Promise<void> {
-    const n = this.cfg.snapshotEvery;
-    const hi = this.hi;
-    if (hi % n === 0) {
-      const all = await this.repo.readDigest(hi, n);
-      if (all) {
-        this.buf = all;
-        this.hi = hi - n;
-        return;
-      }
+/** The earliest kept moment: back from the floor to the last commit that ends its day, or the first kept state of the log. */
+async function earliestMoment(reads: Reads, snaps: Snapshot[], k: Kept, lastSeq: number): Promise<Moment> {
+  if (k.floor) {
+    const thin = restorable(k, (await userAfter(reads, k.floor, lastSeq))?.time);
+    const walk = new Backward(reads, snaps, k.floor);
+    for (let c: Commit | undefined; (c = await walk.next()); ) {
+      thin.see(c);
+      if (thin.done) return moment(c);
     }
-    // Never past the start of the interval, so the interval below can still come from its digest.
-    const lo = Math.max(hi - ((hi - 1) % n), hi - this.cfg.concurrency + 1);
-    this.buf = await readCommits(this.repo, this.cfg.concurrency, lo, hi);
-    this.hi = lo - 1;
   }
-
-  /** Each of `paths` in the vault right after commit `seq` (null when absent): from older commits, or the first snapshot reached. */
-  async entries(paths: Iterable<string>): Promise<Map<string, Entry | null>> {
-    const open = new Set(paths);
-    const out = new Map<string, Entry | null>();
-    while (open.size && this.seq > 0) {
-      if (this.snaps.has(this.seq)) {
-        const files = await this.repo.readSnapshot(this.seq);
-        if (files) {
-          for (const p of open) out.set(p, files.get(p) ?? null);
-          return out;
-        }
-      }
-      const c = (await this.next())!;
-      for (const { path, entry } of c.changes) if (open.delete(path)) out.set(path, entry);
-    }
-    for (const p of open) out.set(p, null);
-    return out;
+  let prev: Commit | undefined;
+  const fwd = new Forward(reads, 1, lastSeq);
+  for (let c: Commit | undefined; (c = await fwd.next()); ) {
+    if (c.moved) continue;
+    if (prev && keptState(prev.time, c.time, k.now)) return moment(prev);
+    prev = c;
   }
+  if (!prev) throw new Error('Nothing has been synced yet');
+  return moment(prev);
 }
 
 interface Found {
-  commit?: Moment;
+  commit: Moment;
   files: Map<string, Entry>;
 }
 
-/** From the current table, undoing the commits made after `at`. */
-async function backward(repo: Repo, cfg: SyncConfig, snaps: Snapshot[], remote: Map<string, Entry>, lastSeq: number, at: number): Promise<Found> {
-  const walk = new Backward(repo, cfg, snaps, lastSeq);
+/**
+ * From the current table, undoing the commits made after the moment. The vault at a moment is the
+ * vault just before the next user commit: moves made in between belong to it.
+ */
+async function backward(reads: Reads, snaps: Snapshot[], k: Kept, remote: Map<string, Entry>, lastSeq: number, at: number): Promise<Found | undefined> {
+  const walk = new Backward(reads, snaps, lastSeq);
+  const thin = restorable(k);
   const later = new Set<string>();
-  let c: Commit | undefined;
-  while ((c = await walk.peek()) && c.time > at) {
+  let moved = new Map<string, Entry | null>();
+  for (let c: Commit | undefined; (c = await walk.peek()); await walk.next()) {
+    if (c.moved) {
+      for (const ch of c.changes) if (!moved.has(ch.path)) moved.set(ch.path, ch.entry);
+      continue;
+    }
+    if (thin.see(c) && c.time <= at) {
+      const files = new Map(remote);
+      const open = [...later].filter((p) => !moved.has(p));
+      for (const [path, entry] of moved) if (later.has(path)) apply(files, path, entry);
+      for (const [path, entry] of await walk.entries(open)) apply(files, path, entry);
+      return { commit: moment(c), files };
+    }
+    if (thin.done) return undefined;
+    for (const path of moved.keys()) later.add(path);
     for (const ch of c.changes) later.add(ch.path);
-    await walk.next();
+    moved = new Map();
   }
-  const files = new Map(remote);
-  if (!c) return { files };
-  for (const [path, entry] of await walk.entries(later)) apply(files, path, entry);
-  return { commit: moment(c), files };
-}
-
-/** From the newest kept snapshot taken by `at`, replaying the commits after it. */
-async function forward(repo: Repo, cfg: SyncConfig, snaps: Snapshot[], k: Kept, lastSeq: number, at: number): Promise<Found> {
-  // Judged by the commit's own time too: the store's clock and the devices' can disagree.
-  let base: Moment | undefined;
-  for (const s of snaps.filter((x) => x.seq >= k.from && (x.modified <= at || x.seq === k.from)).reverse()) {
-    const m = await readMoment(repo, s.seq);
-    if (m.time <= at) {
-      base = m;
-      break;
-    }
-  }
-  // Starting from an empty vault is only sound when no commit's data has been cleaned up.
-  if (!base && k.from > 1) return { files: new Map() };
-  const n = cfg.snapshotEvery;
-  const scan = async () => {
-    const out: Commit[] = [];
-    for (let lo = (base?.seq ?? 0) + 1; lo <= lastSeq; ) {
-      const hi = Math.min(lastSeq, lo - 1 - ((lo - 1) % n) + n);
-      for (const c of await readRange(repo, cfg, lo, hi)) {
-        if (c.time > at) return out;
-        out.push(c);
-      }
-      lo = hi + 1;
-    }
-    return out;
-  };
-  const [files, commits] = await Promise.all([base ? repo.readSnapshot(base.seq) : new Map<string, Entry>(), scan()]);
-  if (!files) throw new Error(`Snapshot ${base!.seq} cannot be read`);
-  for (const c of commits) for (const { path, entry } of c.changes) apply(files, path, entry);
-  const last = commits[commits.length - 1];
-  return { commit: last ? moment(last) : base, files };
+  return undefined;
 }
 
 /**
- * The vault as it was at `at`: every file right after the last commit made at or before it.
+ * From snapshot `base` (0: an empty vault), replaying commits up to the last kept moment made at or
+ * before `at`. Undefined when no kept moment from `from` on falls between `base` and `at`.
+ */
+async function replay(reads: Reads, k: Kept, from: number, base: number, lastSeq: number, at: number): Promise<Found | undefined> {
+  const seen: Commit[] = [];
+  let prev: Commit | undefined = base ? await reads.get(base) : undefined;
+  if (prev?.moved) prev = undefined;
+  let best: { c: Commit; end: number } | undefined;
+  const consider = (u: Commit, next: Commit | undefined, end: number) => {
+    if (u.seq >= from && u.time <= at && keptState(u.time, next?.time, k.now)) best = { c: u, end };
+  };
+  let stopped = false;
+  const fwd = new Forward(reads, base + 1, lastSeq);
+  for (let c: Commit | undefined; (c = await fwd.next()); ) {
+    if (!c.moved) {
+      if (prev) consider(prev, c, c.seq - 1);
+      if (c.time > at) {
+        stopped = true;
+        break;
+      }
+      prev = c;
+    }
+    seen.push(c);
+  }
+  if (!stopped && prev) consider(prev, undefined, lastSeq);
+  if (!best) return undefined;
+  const snap = base ? await reads.snapshot(base) : new Map<string, Entry>();
+  if (!snap) throw new Error(`Snapshot ${base} cannot be read`);
+  const files = new Map(snap);
+  for (const c of seen) {
+    if (c.seq > best.end) break;
+    for (const { path, entry } of c.changes) apply(files, path, entry);
+  }
+  return { commit: moment(best.c), files };
+}
+
+/** From the newest snapshot stored by `at`, or an older one when no kept moment follows it by then. */
+async function forward(reads: Reads, snaps: Snapshot[], k: Kept, from: number, lastSeq: number, at: number): Promise<Found | undefined> {
+  const bases = snaps.filter((s) => s.modified <= at).map((s) => s.seq);
+  for (let i = bases.length - 1; ; i--) {
+    const base = i >= 0 ? bases[i] : 0;
+    const found = await replay(reads, k, from, base, lastSeq, at);
+    if (found || base <= from) return found;
+  }
+}
+
+/**
+ * The vault as it was at `at`: every file at the last kept moment made at or before it.
  * Commit times are taken to rise with their sequence numbers. A moment after the newest snapshot is
- * worked out backward from `remote`, an older one forward from the snapshot before it. Throws
- * TooOldError for a moment before `earliest`, whose files may no longer all be stored.
+ * worked out backward from `remote`, an older one forward from a snapshot before it. Throws
+ * TooOldError for a time before `earliest`, whose files may no longer all be stored.
  */
 export async function tableAt(repo: Repo, remote: Map<string, Entry>, lastSeq: number, cfg: SyncConfig, now: number, at: number): Promise<PastVault> {
   if (!lastSeq) throw new Error('Nothing has been synced yet');
   const all = await repo.snapshots();
   const k = kept(all, cfg, now);
   const snaps = all.filter((s) => s.seq <= lastSeq);
+  const reads = new Reads(repo, cfg);
+  const earliest = await earliestMoment(reads, snaps, k, lastSeq);
+  if (at < earliest.time) throw new TooOldError(earliest);
   const newest = snaps[snaps.length - 1];
-  const [earliest, found] = await Promise.all([
-    readMoment(repo, k.from),
-    !newest || at >= newest.modified ? backward(repo, cfg, snaps, remote, lastSeq, at) : forward(repo, cfg, snaps, k, lastSeq, at),
-  ]);
-  if (!found.commit || !restorable(k, found.commit.seq)) throw new TooOldError(earliest);
+  const found = !newest || at >= newest.modified
+    ? await backward(reads, snaps, k, remote, lastSeq, at)
+    : await forward(reads, snaps, k, earliest.seq, lastSeq, at);
+  if (!found || found.commit.seq < earliest.seq) throw new TooOldError(earliest);
   return { commit: found.commit, files: found.files, earliest };
 }
 
 /**
- * Files deleted while their last version can still be restored, and not re-created since, newest
+ * Files deleted whose last version before the deletion is kept, and not re-created since, newest
  * deletion first. With `folder`, only the files in it and its subfolders.
  */
 export async function listDeleted(repo: Repo, lastSeq: number, cfg: SyncConfig, now: number, folder = ''): Promise<DeletedFile[]> {
   const snaps = await repo.snapshots();
-  const k = kept(snaps, cfg, now);
+  const thin = restorable(kept(snaps, cfg, now));
   const inside = inFolder(folder);
-  const walk = new Backward(repo, cfg, snaps, lastSeq);
+  const walk = new Backward(new Reads(repo, cfg), snaps, lastSeq);
   const seen = new Set<string>();
-  const found = new Map<string, Moment & { path: string; entry?: Entry }>();
-  for (let c: Commit | undefined; walk.seq > k.from && (c = await walk.peek()); await walk.next()) {
-    // A file's last version is restorable when the vault just before its deletion is.
-    const offered = restorable(k, c.seq - 1);
+  // A deleted file waits for a kept moment between its last version and its deletion ('moment'),
+  // then for the entry that moment holds ('entry').
+  const found = new Map<string, Moment & { path: string; entry?: Entry; wait?: 'moment' | 'entry' }>();
+  let moved = new Map<string, Entry>();
+  for (let c: Commit | undefined; (c = await walk.peek()); await walk.next()) {
+    if (c.moved) {
+      for (const { path, entry } of c.changes) {
+        if (!inside(path) || !entry) continue;
+        const d = found.get(path);
+        if (d?.wait === 'entry') {
+          d.entry = entry;
+          d.wait = undefined;
+        }
+        if (!moved.has(path)) moved.set(path, entry);
+        seen.add(path);
+      }
+      continue;
+    }
+    if (thin.see(c)) {
+      for (const d of found.values()) {
+        if (d.wait !== 'moment') continue;
+        d.entry = moved.get(d.path);
+        d.wait = d.entry ? undefined : 'entry';
+      }
+    }
+    moved = new Map();
     for (const { path, entry } of c.changes) {
       if (!inside(path)) continue;
       const d = found.get(path);
-      if (d) {
-        if (!d.entry && entry) d.entry = entry;
-      } else if (!seen.has(path)) {
+      if (d?.wait === 'entry') {
+        if (entry) d.entry = entry;
+        d.wait = undefined;
+      } else if (d?.wait === 'moment') {
+        found.delete(path); // its last version was never current at a kept moment
+      } else if (!d && !seen.has(path)) {
         // The newest change to a path says whether it exists now.
         seen.add(path);
-        if (!entry && offered) found.set(path, { path, ...moment(c) });
+        if (!entry) found.set(path, { path, ...moment(c), wait: 'moment' });
       }
     }
+    if (thin.done) break;
   }
-  const open = [...found.values()].filter((d) => !d.entry).map((d) => d.path);
-  for (const [path, entry] of await walk.entries(open)) if (entry) found.get(path)!.entry = entry;
-  return [...found.values()].filter((d): d is DeletedFile => !!d.entry);
+  const open = [...found.values()].filter((d) => d.wait === 'entry').map((d) => d.path);
+  for (const [path, entry] of await walk.entries(open)) {
+    const d = found.get(path)!;
+    if (entry) d.entry = entry;
+  }
+  const out: DeletedFile[] = [];
+  for (const { wait, entry, ...d } of found.values()) if (entry && wait !== 'moment') out.push({ ...d, entry });
+  return out;
 }
 
 /**
- * The commits whose vault can still be restored, newest first, each with how many files it added,
- * changed and deleted. Stops after `limit` commits, or at the first one made before `since`.
+ * The kept moments, newest first, each with how many files were added, changed and deleted since the
+ * kept moment before it. Stops after `limit` moments, or at the first one made before `since`. With
+ * `before`, starts at the newest moment made before then, reading from a snapshot near it rather than
+ * from the newest commit.
  */
-export async function listCommits(repo: Repo, lastSeq: number, cfg: SyncConfig, now: number, opts: { limit?: number; since?: number } = {}): Promise<CommitSummary[]> {
-  const { limit = Infinity, since = -Infinity } = opts;
+export async function listCommits(
+  repo: Repo,
+  lastSeq: number,
+  cfg: SyncConfig,
+  now: number,
+  opts: { limit?: number; since?: number; before?: number } = {},
+): Promise<CommitSummary[]> {
+  const { limit = Infinity, since = -Infinity, before = Infinity } = opts;
   const snaps = await repo.snapshots();
   const k = kept(snaps, cfg, now);
-  const walk = new Backward(repo, cfg, snaps, lastSeq);
-  const out: CommitSummary[] = [];
-  // Files a listed commit wrote, until an older commit or a snapshot shows whether each existed before it.
-  const open = new Map<string, CommitSummary>();
-  const settle = (path: string, existed: boolean) => {
-    const s = open.get(path);
-    if (!s) return;
-    if (existed) s.changed++;
-    else s.added++;
-    open.delete(path);
-  };
-  for (let c: Commit | undefined; out.length < limit && walk.seq >= k.from && (c = await walk.peek()) && c.time >= since; await walk.next()) {
-    for (const { path, entry } of c.changes) settle(path, !!entry);
-    if (!restorable(k, c.seq)) continue;
-    const s: CommitSummary = { ...moment(c), added: 0, changed: 0, deleted: 0 };
-    for (const { path, entry } of c.changes) {
-      if (entry) open.set(path, s);
-      else s.deleted++;
+  const reads = new Reads(repo, cfg);
+  let from = lastSeq;
+  let next: number | undefined;
+  if (before !== Infinity) {
+    // Stored an hour after `before`, so commits after it were made after `before` even by a clock that runs behind the storage's.
+    const start = snaps.find((s) => s.seq <= lastSeq && s.modified >= before + HOUR);
+    if (start) {
+      from = start.seq;
+      next = (await userAfter(reads, from, lastSeq))?.time;
     }
-    out.push(s);
   }
-  for (const [path, entry] of await walk.entries(open.keys())) settle(path, !!entry);
+  const walk = new Backward(reads, snaps, from);
+  const thin = restorable(k, next);
+  const out: CommitSummary[] = [];
+  // Files a listed moment changed, with their entry then, until an older commit or a snapshot shows
+  // what they were at the moment before it.
+  const open = new Map<string, { s: CommitSummary; after: Entry | null }>();
+  const settle = (path: string, was: Entry | null) => {
+    const o = open.get(path);
+    if (!o) return;
+    open.delete(path);
+    if (o.after && !was) o.s.added++;
+    else if (!o.after && was) o.s.deleted++;
+    else if (o.after && was && !sameContent(o.after, was)) o.s.changed++;
+  };
+  let cur: CommitSummary | undefined;
+  for (let c: Commit | undefined; (c = await walk.peek()); await walk.next()) {
+    if (thin.see(c)) {
+      if (out.length >= limit || c.time < since) break;
+      cur = c.time < before ? { ...moment(c), added: 0, changed: 0, deleted: 0 } : undefined;
+      if (cur) out.push(cur);
+    }
+    for (const { path, entry } of c.changes) {
+      const o = open.get(path);
+      if (o && o.s !== cur) settle(path, entry);
+      if (cur && !open.has(path)) open.set(path, { s: cur, after: entry });
+    }
+    if (thin.done) {
+      await walk.next();
+      break;
+    }
+  }
+  for (const [path, entry] of await walk.entries([...open.keys()])) settle(path, entry);
   return out;
 }
 

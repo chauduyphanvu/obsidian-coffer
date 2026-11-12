@@ -1,41 +1,12 @@
-import { Modal, Notice, PluginSettingTab, Setting, SuggestModal, type App } from 'obsidian';
+import { Modal, Notice, PluginSettingTab, Setting, type App } from 'obsidian';
 import { conflictOriginal } from '../core/paths.ts';
-import type { Version } from '../core/types.ts';
 import type SelfSyncPlugin from './main.ts';
 import { resolveConflict } from './resolve.ts';
 import { describeStorage, hasStorageAddress, parseNumberSetting, type Settings } from './settings.ts';
 import { SetupModal } from './setup.ts';
+import { renderDevices } from './devices.ts';
 import type { Problem } from './status.ts';
 import { button, buttonRow, field, message, openLink, statusLine } from './ui.ts';
-
-export class HistoryModal extends SuggestModal<Version> {
-  private plugin: SelfSyncPlugin;
-  private path: string;
-  private versions: Version[];
-
-  constructor(app: App, plugin: SelfSyncPlugin, path: string, versions: Version[]) {
-    super(app);
-    this.plugin = plugin;
-    this.path = path;
-    this.versions = versions;
-    this.setPlaceholder('Pick a version to restore (the current one stays in history)');
-  }
-
-  getSuggestions(query: string): Version[] {
-    const q = query.toLowerCase();
-    return this.versions.filter((v) => `${new Date(v.time).toLocaleString()} ${v.device}`.toLowerCase().includes(q));
-  }
-
-  renderSuggestion(v: Version, el: HTMLElement): void {
-    el.createDiv({ text: new Date(v.time).toLocaleString() });
-    el.createEl('small', { text: v.entry ? `${v.device} · ${v.entry.size.toLocaleString()} bytes` : `${v.device} · deleted` });
-  }
-
-  onChooseSuggestion(v: Version): void {
-    if (!v.entry) new Notice('That entry records a deletion; pick the version before it.');
-    else void this.plugin.restore(this.path, v);
-  }
-}
 
 type SecretKey = 'accessKeySecret' | 'secretKeySecret' | 'passphraseSecret' | 'webdavPasswordSecret';
 
@@ -150,6 +121,7 @@ export class SettingsTab extends PluginSettingTab {
           }),
         );
     }
+    renderDevices(containerEl, plugin);
 
     const storage = section('storage', 'Storage and passphrase', hasStorageAddress(s) ? describeStorage(s) : 'Not set up');
     new Setting(storage)

@@ -23,13 +23,17 @@ export interface FuzzReport {
   conflictCopies: number;
   files: number;
   tokens: number;
+  cleanups: number;
+  /** Packs whose current data cleanups copied into fuller ones. */
+  packsCombined: number;
 }
 
 /**
- * Random edits, deletes, moves and syncs on several devices, with injected network failures and
- * crashes, then a quiet period. Afterwards every device and a brand-new device must hold the same
- * vault, and every line anyone wrote must still exist somewhere unless a device that had seen that
- * line deleted it.
+ * Random edits, deletes, moves, syncs, cleanups (thinning old versions and compacting packs, some
+ * racing other devices' syncs) and jumps of hours or days, with injected network failures and crashes,
+ * then a quiet period. Afterwards every device and a brand-new device must hold the same vault, a deep
+ * verify must find nothing wrong, and every line anyone wrote must still exist somewhere unless a
+ * device that had seen that line deleted it.
  */
 export async function fuzz(seed: number, o: FuzzOptions): Promise<FuzzReport> {
   const rand = rng(seed);
@@ -44,6 +48,8 @@ export async function fuzz(seed: number, o: FuzzOptions): Promise<FuzzReport> {
       packTargetBytes: 16 << 10,
       packMaxBlobBytes: 6 << 10,
       snapshotEvery: 7,
+      retentionDays: 2,
+      compactMaxBytes: 24 << 10,
       maxDeleteFraction: 2,
       maxDeleteCount: 1e9,
     });
@@ -71,13 +77,25 @@ export async function fuzz(seed: number, o: FuzzOptions): Promise<FuzzReport> {
 
   let nextToken = 0;
   const allowedLost = new Set<string>();
-  const report: FuzzReport = { seed, ok: true, problems: [], syncs: 0, failedSyncs: 0, merges: 0, conflictCopies: 0, files: 0, tokens: 0 };
+  const report: FuzzReport = {
+    seed, ok: true, problems: [], syncs: 0, failedSyncs: 0, merges: 0, conflictCopies: 0, files: 0, tokens: 0, cleanups: 0, packsCombined: 0,
+  };
+  const cleanup = async (x: (typeof devices)[number]) => {
+    report.cleanups++;
+    try {
+      report.packsCombined += (await x.engine.gc()).packsCombined;
+    } catch {
+      x.restart();
+    }
+  };
   const token = () => `tok${nextToken++}`;
   const tokensIn = (text: string) => text.match(/tok\d+/g) ?? [];
   const paths = Array.from({ length: 10 }, (_, i) => `${['', 'dir/', 'dir/sub/'][i % 3]}n${i}.md`);
 
   for (let step = 0; step < o.steps; step++) {
     clock.now += 1000 + pick(60_000);
+    // Now and then hours or days pass, so versions age into thinning and out of the window.
+    if (pick(40) === 0) clock.now += pick(2) ? pick(30) * 3_600_000 : pick(4) * 86_400_000;
     const d = devices[pick(devices.length)];
     const existing = [...d.fs.files.keys()].filter((p) => p.endsWith('.md'));
     const op = pick(10);
@@ -86,6 +104,7 @@ export async function fuzz(seed: number, o: FuzzOptions): Promise<FuzzReport> {
       const group = pick(3) ? [d] : devices.filter((x) => x === d || pick(2));
       await Promise.all(
         group.map(async (x) => {
+          if (pick(8) === 0) return cleanup(x);
           report.syncs++;
           try {
             const r = await x.engine.sync();
@@ -123,12 +142,14 @@ export async function fuzz(seed: number, o: FuzzOptions): Promise<FuzzReport> {
     if (pick(25) === 0) d.fs.put(`bin${pick(3)}.dat`, Uint8Array.from({ length: 500 + pick(20_000) }, () => pick(256)));
   }
 
-  // Quiet period: no faults, sync until a full pass over all devices changes nothing.
+  // Quiet period: no faults; a cleanup a few days on, then sync until a full pass over all devices changes nothing.
   for (const d of devices) {
     d.store.rate = 0;
     d.crash = 0;
     d.restart();
   }
+  clock.now += 3 * 86_400_000;
+  await cleanup(devices[pick(devices.length)]);
   let settled = false;
   for (let pass = 0; pass < 12 && !settled; pass++) {
     settled = true;
@@ -146,6 +167,9 @@ export async function fuzz(seed: number, o: FuzzOptions): Promise<FuzzReport> {
     JSON.stringify([...fs.files].sort(([a], [b]) => (a < b ? -1 : 1)).map(([p, f]) => [p.normalize('NFC'), Buffer.from(f.data).toString('base64')]));
   const reference = view(devices[0].fs);
   for (const d of devices.slice(1)) if (view(d.fs) !== reference) report.problems.push(`${d.name} differs from D0`);
+
+  const problems = (await devices[0].engine.verify({ deep: true })).problems;
+  for (const p of problems.slice(0, 3)) report.problems.push(`verify: ${p.message}`);
 
   const fresh = new MemFS();
   await new SyncEngine({ fs: fresh, store: mem, stateStore: new MemState(), passphrase: 'pw', config: config('fresh'), now: () => clock.now }).sync();

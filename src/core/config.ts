@@ -24,6 +24,8 @@ export interface SyncConfig {
   snapshotEvery: number;
   /** How long old versions stay restorable. At least 1. */
   retentionDays: number;
+  /** Cleanup copies at most this many bytes of live data into fuller packs per run. */
+  compactMaxBytes: number;
   /** A sync that would delete more than both of these is refused unless forced. */
   maxDeleteCount: number;
   maxDeleteFraction: number;
@@ -47,6 +49,7 @@ export const DEFAULT_CONFIG: SyncConfig = {
   rangeGapBytes: 128 << 10,
   snapshotEvery: 100,
   retentionDays: 30,
+  compactMaxBytes: 8 << 20,
   maxDeleteCount: 10,
   maxDeleteFraction: 0.5,
   kdfIterations: 600_000,

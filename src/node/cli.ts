@@ -1,10 +1,15 @@
 import { readFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { join, resolve } from 'node:path';
+import { pool } from '../core/bytes.ts';
 import { DEFAULT_CONFIG, resolveConfig, type SyncConfig } from '../core/config.ts';
+import { heartbeatDue, writeHeartbeat } from '../core/devices.ts';
 import { SafetyError, SyncEngine, type SyncResult } from '../core/engine.ts';
 import { vaultKey } from '../core/paths.ts';
+import { TooOldError, listCommits, listDeleted, planRestore, tableAt } from '../core/timeline.ts';
 import type { RemoteStore } from '../core/types.ts';
+import { countSteps, deleteLimitCrossed, keepOut, restoreSteps, type Step } from '../plugin/restore.ts';
+import { plural } from '../plugin/status.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
 import type { S3Config } from '../stores/s3.ts';
@@ -28,6 +33,13 @@ const USAGE = `Usage: node src/node/cli.ts <command> [--config=selfsync.json]
   check                  test that the remote storage supports everything sync needs
   history <path>         list stored versions of a file
   restore <path> <seq>   write a stored version back into the vault
+  deleted [folder]       list deleted files that can still be restored, newest first
+  log [--limit=20]       list the times the vault can be restored to, newest first
+  restore-at <time> [folder] [--dry-run]
+                         bring the vault, or one folder, back to how it was at <time> (ISO 8601,
+                         like 2026-11-10T14:30); syncs first, prints what changes, then changes it
+  verify [--deep]        check the stored data end to end without changing it; --deep also
+                         downloads and checks everything the current files are stored in
   clean                  delete versions older than the retention window from storage
   change-passphrase      re-protect the vault key with SELFSYNC_NEW_PASSPHRASE
 
@@ -60,6 +72,68 @@ function report(r: SyncResult, at = ''): void {
 
 const didSomething = (r: SyncResult) =>
   r.pushed + r.pulled + r.deletedLocal + r.deletedRemote + r.merged + r.conflictCopies.length + r.errors.length > 0;
+
+const iso = (time: number) => new Date(time).toISOString();
+const STEP = { add: 'bring back', change: 'change', remove: 'remove' } as const;
+
+/**
+ * Brings the vault, or `folder`, back to how it was at `when`, removals first. Syncs first, so edits not yet synced
+ * are kept in history and the plan matches the files here. With `dry`, only prints the plan.
+ */
+async function restoreAt(engine: SyncEngine, fs: NodeFS, when: string, folder: string, dry: boolean): Promise<number> {
+  const at = Date.parse(when);
+  if (Number.isNaN(at)) throw new Error(`"${when}" is not a time; use ISO 8601, like 2026-11-10T14:30`);
+  if (!dry) {
+    const r = await engine.sync();
+    report(r, 'synced first: ');
+    if (r.errors.length) {
+      console.error('not restoring: some files could not sync, and restoring could overwrite their changes');
+      return 1;
+    }
+  }
+  const v = await engine.view();
+  const past = await tableAt(v.repo, v.st.remote, v.st.lastSeq, v.cfg, v.now, at).catch((e: unknown) => {
+    throw e instanceof TooOldError ? new Error(`${when} is too far back; the earliest time that can be restored is ${iso(e.earliest.time)}`) : e;
+  });
+  const { steps } = restoreSteps(planRestore(v.st.remote, past.files, folder), v.st.remote, keepOut(v.cfg.exclude, []));
+  const scope = folder ? `${vaultKey(folder).replace(/\/+$/, '')}/` : 'the vault';
+  console.log(`${scope} as of ${iso(past.commit.time)}, synced by ${past.commit.device}:`);
+  for (const s of steps) console.log(`  ${STEP[s.kind].padEnd(10)}  ${s.path}`);
+  const c = countSteps(steps);
+  if (!steps.length) {
+    console.log('nothing to do: it already matches');
+    return 0;
+  }
+  if (dry) {
+    console.log(`dry run: would bring back ${c.add}, change ${c.change} and remove ${c.remove}; nothing changed`);
+    return 0;
+  }
+
+  const here = new Map((await fs.list()).map((f) => [vaultKey(f.path), f.path]));
+  const done = { add: 0, change: 0, remove: 0 };
+  let failed = 0;
+  const run = async (s: Step) => {
+    try {
+      if (s.kind === 'remove') await fs.remove(here.get(s.path) ?? s.path);
+      else await fs.write(here.get(s.path) ?? s.path, await engine.readVersion(s.entry!));
+      done[s.kind]++;
+    } catch (e) {
+      failed++;
+      console.error(`failed: ${s.path}: ${e instanceof Error ? e.message : e}`);
+    }
+  };
+  for (const s of steps.filter((x) => x.kind === 'remove')) await run(s);
+  await pool(steps.filter((x) => x.kind !== 'remove'), v.cfg.concurrency, run);
+  console.log(`restored ${scope} as of ${iso(past.commit.time)}: brought back ${done.add}, changed ${done.change}, removed ${done.remove}; run sync to send it to other devices`);
+  const limit = deleteLimitCrossed(done.add + done.change, done.remove, v.st.synced.size, v.cfg);
+  if (limit !== undefined) {
+    console.log(
+      `that sync needs --force: it deletes ${done.remove} files from storage, and a plain sync stops before deleting more than ${limit} in case files vanished by mistake; ` +
+        'other devices stop the same way when the deletions reach them, so sync them with --force too',
+    );
+  }
+  return failed ? 1 : 0;
+}
 
 async function main(): Promise<number> {
   const argv = process.argv.slice(2);
@@ -94,9 +168,19 @@ async function main(): Promise<number> {
     log: console.error,
   });
 
+  const heartbeat = async () => {
+    try {
+      const { version } = JSON.parse(await readFile(new URL('../../manifest.json', import.meta.url), 'utf8')) as { version: string };
+      await writeHeartbeat(await engine.view(), { platform: `CLI on ${process.platform}`, version });
+    } catch (e) {
+      console.error(`could not record this device's heartbeat: ${e instanceof Error ? e.message : e}`);
+    }
+  };
+
   if (command === 'sync') {
     const r = await engine.sync({ force: flags.has('force') });
     report(r);
+    await heartbeat();
     return r.errors.length ? 1 : 0;
   }
   if (command === 'watch') {
@@ -108,8 +192,16 @@ async function main(): Promise<number> {
     const pollMs = seconds('poll', 30);
     const intervalMs = seconds('interval', 300);
     const stamp = () => new Date().toISOString();
+    let lastBeat = 0;
     const loop = new SyncLoop({
-      sync: () => engine.sync(),
+      sync: async () => {
+        const r = await engine.sync();
+        if (heartbeatDue(lastBeat, Date.now())) {
+          lastBeat = Date.now();
+          await heartbeat();
+        }
+        return r;
+      },
       remoteChanged: () => engine.remoteChanged(),
       onResult: (r) => {
         if (didSomething(r)) report(r, `${stamp()} `);
@@ -145,6 +237,31 @@ async function main(): Promise<number> {
     await new NodeFS(vault).write(rest[0], await engine.readVersion(version.entry));
     console.log(`restored ${rest[0]} as of ${new Date(version.time).toISOString()}; run sync to send it to other devices`);
     return 0;
+  }
+  if (command === 'deleted') {
+    const v = await engine.view();
+    for (const d of await listDeleted(v.repo, v.st.lastSeq, v.cfg, v.now, rest[0] ?? '')) console.log(`${iso(d.time)}  ${d.device.padEnd(16)} ${d.path}`);
+    return 0;
+  }
+  if (command === 'log') {
+    const limit = flags.has('limit') ? Number(flags.get('limit')) : 20;
+    if (!Number.isInteger(limit) || limit < 1) throw new Error('--limit must be a whole number above 0');
+    const v = await engine.view();
+    for (const c of await listCommits(v.repo, v.st.lastSeq, v.cfg, v.now, { limit })) {
+      console.log(`${iso(c.time)}  ${c.device.padEnd(16)} ${c.added} added, ${c.changed} changed, ${c.deleted} deleted`);
+    }
+    return 0;
+  }
+  if (command === 'restore-at' && rest[0]) return restoreAt(engine, fs, rest[0], rest[1] ?? '', flags.has('dry-run'));
+  if (command === 'verify') {
+    const r = await engine.verify({ deep: flags.has('deep') });
+    for (const p of r.problems) {
+      console.log(`problem: ${p.message}${p.object ? ` (${p.object})` : ''}`);
+      for (const path of p.paths ?? []) console.log(`  affects ${path}`);
+    }
+    const deep = r.deep ? `, ${plural(r.chunks, 'chunk')} (${(r.bytes / 1e6).toFixed(1)} MB downloaded)` : '';
+    console.log(`checked ${plural(r.commits, 'commit')}, ${plural(r.files, 'file')}, ${plural(r.packs, 'pack')}${deep}: ${r.problems.length ? plural(r.problems.length, 'problem') : 'no problems'}`);
+    return r.problems.length ? 1 : 0;
   }
   if (command === 'change-passphrase') {
     await engine.changePassphrase(env('SELFSYNC_NEW_PASSPHRASE'));

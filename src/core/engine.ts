@@ -1,14 +1,15 @@
 import { pool } from './bytes.ts';
 import { worthCompressing } from './compress.ts';
+import { copyChunks, placeKey, planCompaction } from './compact.ts';
 import { compileExcludes, type SyncConfig } from './config.ts';
 import { merge3, mergeJson } from './merge.ts';
 import { Packer } from './packer.ts';
 import { conflictCopyName, ext, vaultKey } from './paths.ts';
 import { nothingToDo, planChanges, type Local, type Plan } from './plan.ts';
 import { Repo } from './repo.ts';
-import { collectGarbage, listVersions } from './retention.ts';
+import { collectGarbage, listVersions, type CleanupResult } from './retention.ts';
 import { LocalState } from './state.ts';
-import { hasChunks, type Change, type ChunkRef, type Commit, type Entry, type FileStat, type LocalFS, type RemoteStore, type StateStore, type Version } from './types.ts';
+import { hasChunks, sameContent, type Change, type ChunkRef, type Commit, type Entry, type FileStat, type LocalFS, type RemoteStore, type StateStore, type Version } from './types.ts';
 import { verifyRepo, type VerifyOptions, type VerifyReport } from './verify.ts';
 
 export type { VerifyOptions, VerifyProblem, VerifyReport } from './verify.ts';
@@ -46,6 +47,19 @@ export interface RepoView {
   st: LocalState;
   cfg: SyncConfig;
   now: number;
+}
+
+export interface GcResult extends CleanupResult {
+  /** Packs whose current data was copied into fewer, fuller ones. */
+  packsCombined: number;
+  /** New packs that data went into. */
+  packsWritten: number;
+  bytesMoved: number;
+  /**
+   * The size of the packs combined. Older moments still read them, so a later cleanup frees them once
+   * no kept moment does: at the latest when the moments before the move have left the retention window.
+   */
+  bytesFreedLater: number;
 }
 
 /** Thrown instead of syncing when a sync would delete a suspiciously large share of the vault. */
@@ -156,7 +170,15 @@ export class SyncEngine {
       if (c.prev !== undefined && st.head !== undefined && c.prev !== st.head) {
         throw new Error(`Remote commit ${c.seq} does not follow the commit before it as this device saw it: the log was tampered with or forked`);
       }
-      st.apply(c).forEach((p) => touched.add(p));
+      // A move changes no content, so work prepared against the file before it is still valid. It
+      // moves this device's merge base too, whose old place goes once no kept version records it.
+      for (const { path, entry } of c.changes) {
+        const was = st.remote.get(path);
+        if (!c.moved || !entry || !was || !sameContent(was, entry)) touched.add(path);
+        const s = c.moved && entry && st.synced.get(path);
+        if (s && sameContent(s.entry, entry)) s.entry = entry;
+      }
+      st.apply(c);
       this.headSeen = this.now();
     };
     const loadSnapshot = async () => {
@@ -555,9 +577,10 @@ export class SyncEngine {
 
   /**
    * Chunks a commit may refer to without uploading them again: those of the file table it is
-   * written on top of, and those this sync uploaded. Cleanup keeps the data of every version current
-   * inside the retention window, and every recent pack, but nothing else: a chunk known only from a
-   * table that went out of date long ago, as on a device that was away, may be in a deleted pack.
+   * written on top of, and those this sync uploaded. Cleanup keeps the data of every kept version
+   * (current at a kept moment, or now) and every recent pack, but nothing else: a chunk known only from
+   * a table that went out of date, as on a device that was away, may be in a pack deleted because its
+   * version was thinned or left the window. That table is replaced before anything is committed on it.
    */
   private reusable(st: LocalState): Map<string, ChunkRef> {
     const m = new Map(this.uploaded);
@@ -658,11 +681,7 @@ export class SyncEngine {
         res.pushed += prepared.length;
         res.deletedRemote += deletes.length;
         res.commits++;
-        if (seq % this.cfg.snapshotEvery === 0) {
-          await repo.writeSnapshot(seq, st.remote, hash);
-          await this.writeDigest(seq);
-        }
-        await this.save();
+        await this.committed(seq, hash);
         return contended;
       }
       // Lost the race for this sequence number. Changes to files the winner did not touch are
@@ -675,6 +694,16 @@ export class SyncEngine {
       deletes = deletes.filter((path) => !touched.has(path));
     }
     return contended;
+  }
+
+  /** Writes the snapshot and digest that are due after commit `seq`, and saves the state. */
+  private async committed(seq: number, hash: string): Promise<void> {
+    const { repo, st } = await this.open();
+    if (seq % this.cfg.snapshotEvery === 0) {
+      await repo.writeSnapshot(seq, st.remote, hash);
+      await this.writeDigest(seq);
+    }
+    await this.save();
   }
 
   /** Best effort: history works without a digest, only slower. */
@@ -694,7 +723,6 @@ export class SyncEngine {
     }
   }
 
-  /** True when another device has committed since this one last synced. One tiny request, no local scan. */
   /**
    * The safe answer to a paused mass delete: every file present on only one side is copied back to
    * the other on the next sync, instead of being deleted. Returns how many files that covers.
@@ -713,6 +741,7 @@ export class SyncEngine {
     return kept;
   }
 
+  /** True when another device has committed since this one last synced. One tiny request, no local scan. */
   async remoteChanged(): Promise<boolean> {
     const { repo, st } = await this.open();
     return repo.hasCommit(st.lastSeq + 1);
@@ -740,29 +769,127 @@ export class SyncEngine {
     });
   }
 
-  /** Every version of one file still within the retention window, newest first. */
+  /** Every kept version of one file, newest first: those current at a kept moment, and the current one. */
   async history(path: string): Promise<Version[]> {
     const { repo, st, cfg, now } = await this.view();
     return listVersions(repo, st.lastSeq, path, cfg, now);
   }
 
+  /**
+   * A version's content. Each chunk is read where the current files keep it, if they use it, since
+   * cleanup may have moved it there: the place recorded with an old version, like a merge base saved
+   * before the move, stays readable only while some kept version still records it.
+   */
   async readVersion(entry: Entry): Promise<Uint8Array> {
+    const { st } = await this.open();
+    const here = this.placed(st);
+    const chunks = entry.chunks.map((c) => here.get(c.id) ?? c);
     const out = new Uint8Array(entry.size);
     const at = new Map<string, number[]>();
     let pos = 0;
-    for (const c of entry.chunks) {
+    for (const c of chunks) {
       at.set(c.id, [...(at.get(c.id) ?? []), pos]);
       pos += c.size;
     }
-    await this.fetchChunks(entry.chunks, (ref, plain) => {
+    await this.fetchChunks(chunks, (ref, plain) => {
       for (const p of at.get(ref.id)!) out.set(plain, p);
     });
     return out;
   }
 
-  /** Deletes stored data that no version inside the retention window needs. */
-  async gc(): Promise<{ packsDeleted: number; bytesFreed: number; snapshotsDeleted: number }> {
+  private placedFor?: { seq: number; remote: Map<string, Entry>; refs: Map<string, ChunkRef> };
+
+  /** Where the current files keep each chunk, by id. */
+  private placed(st: LocalState): Map<string, ChunkRef> {
+    const p = this.placedFor;
+    if (p && p.seq === st.lastSeq && p.remote === st.remote) return p.refs;
+    const refs = new Map<string, ChunkRef>();
+    for (const e of st.remote.values()) for (const c of e.chunks) refs.set(c.id, c);
+    this.placedFor = { seq: st.lastSeq, remote: st.remote, refs };
+    return refs;
+  }
+
+  /**
+   * Deletes stored data that no kept version needs, then copies the current data of small or mostly
+   * dead packs into fuller ones, at most `compactMaxBytes` a run. Every version keeps reading its data
+   * where it was recorded, so the packs it came from stay until no kept moment reads them: no reader,
+   * older plugin versions included, has to know about the move.
+   */
+  async gc(): Promise<GcResult> {
     const { repo, st, cfg, now } = await this.view();
-    return collectGarbage(repo, st, cfg, now);
+    const { result, packs } = await collectGarbage(repo, st, cfg, now);
+    const out: GcResult = { ...result, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0 };
+    const plan = planCompaction(packs, st.remote, cfg, now);
+    if (!plan) return out;
+    const moved = await copyChunks(repo, plan, cfg);
+    if (!moved.size || !(await this.relocate(moved))) return out;
+    const used = new Set<string>();
+    for (const e of st.remote.values()) for (const c of e.chunks) used.add(c.pack);
+    const written = new Set<string>();
+    for (const ref of moved.values()) {
+      if (!used.has(ref.pack) || written.has(ref.pack)) continue;
+      written.add(ref.pack);
+      out.packsWritten++;
+    }
+    for (const p of plan.packs) {
+      if (used.has(p.id)) continue;
+      out.packsCombined++;
+      out.bytesFreedLater += p.size;
+    }
+    for (const c of plan.chunks) if (used.has(moved.get(placeKey(c))?.pack ?? '')) out.bytesMoved += c.len;
+    return out;
+  }
+
+  /**
+   * Commits copied chunks' new places, marked as a move. Against whatever table is current when the
+   * commit goes in: after losing a race it looks again, and only rewrites references that still point
+   * at a place it copied from. False when nothing was committed; the copies are then left to cleanup.
+   */
+  private async relocate(moved: Map<string, ChunkRef>): Promise<boolean> {
+    const { repo, st } = await this.open();
+    for (let round = 0; round < MAX_ROUNDS; round++) {
+      const changes: Change[] = [];
+      for (const [path, e] of st.remote) {
+        let hit = false;
+        const chunks = e.chunks.map((c) => {
+          const to = moved.get(placeKey(c));
+          if (!to || to.id !== c.id) return c;
+          hit = true;
+          return to;
+        });
+        if (hit) changes.push({ path, entry: { size: e.size, mtime: e.mtime, chunks } });
+      }
+      if (!changes.length) return false;
+      const seq = st.lastSeq + 1;
+      const hash = await repo.writeCommit({ seq, device: this.cfg.deviceName, time: this.now(), changes, prev: st.head, moved: true });
+      if (hash) {
+        st.apply({ seq, device: this.cfg.deviceName, time: 0, changes, hash, moved: true });
+        for (const { path, entry } of changes) {
+          const s = st.synced.get(path);
+          if (s && sameContent(s.entry, entry!)) s.entry = entry!;
+        }
+        await this.committed(seq, hash);
+        return true;
+      }
+      await this.fetchRemote();
+    }
+    return false;
+  }
+
+  /**
+   * Accepts storage as it is now, for when this device found the log cut back or replaced, as after
+   * the bucket was restored from a backup. Forgets what it knew of storage and anchors on the log as
+   * stored. The next sync then treats every file that differs between this device and storage as
+   * changed on both sides: nothing is deleted or overwritten, differing files are merged or kept as
+   * conflict copies, and identical ones are matched up.
+   */
+  async acceptStorage(): Promise<void> {
+    const { repo } = await this.open();
+    const st = new LocalState();
+    st.vaultId = repo.id;
+    this.st = st;
+    this.headSeen = -Infinity;
+    await this.fetchRemote();
+    await this.save();
   }
 }

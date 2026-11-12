@@ -144,7 +144,7 @@ export interface Snapshot {
   data?: Uint8Array;
 }
 
-const sameBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
+export const sameBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
 
 /** Whether a file is still as it was shown; undefined stands for no file. */
 export function unchangedSince(before: Snapshot | undefined, now: Snapshot | undefined): boolean {
@@ -162,7 +162,7 @@ export type Comparison = { kind: 'lines'; regions: DiffRegion[] } | { kind: 'who
 const STRUCTURED = new Set(['json', 'canvas']);
 
 /** Text with its byte order mark kept, so writing it back changes nothing; undefined for anything that is not text. */
-function asText(data: Uint8Array): string | undefined {
+export function asText(data: Uint8Array): string | undefined {
   try {
     const s = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(data);
     return s.includes('\0') ? undefined : s;

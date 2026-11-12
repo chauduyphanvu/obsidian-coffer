@@ -386,9 +386,13 @@ test('cleanup removes only data that no version inside the retention window need
 
   a.fs.put('fresh.bin', random(10_000, 3));
   await a.sync();
+  const fresh = (await a.engine.view()).st.remote.get('fresh.bin')!.chunks.map((c) => `pack/${c.pack}`);
   a.fs.files.delete('fresh.bin');
   await a.sync();
-  assert.equal((await a.engine.gc()).packsDeleted, 0, 'recent packs are never collected');
+  // The cleanup above copied the current data of the small packs into one; the next frees the old ones.
+  assert.ok(r.packsCombined >= 2, JSON.stringify(r));
+  assert.equal((await a.engine.gc()).packsDeleted, r.packsCombined, 'recent packs are never collected');
+  assert.ok(fresh.every((k) => mem.objects.has(k)));
 });
 
 test('remote corruption is detected, not written into the vault', async () => {

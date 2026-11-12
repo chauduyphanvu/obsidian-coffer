@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { SafetyError, type SyncResult } from '../src/core/engine.ts';
@@ -31,6 +31,20 @@ function setup(sync: object, other?: { dir: string }) {
   return { dir, vault, config, run, cli, done: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
+function put(vault: string, path: string, text: string): void {
+  mkdirSync(dirname(join(vault, path)), { recursive: true });
+  writeFileSync(join(vault, path), text);
+}
+
+/** Every file in a vault but the CLI's own state, with its text. */
+function files(vault: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const p of (readdirSync(vault, { recursive: true }) as string[]).sort()) {
+    if (!p.startsWith('.self-sync') && statSync(join(vault, p)).isFile()) out[p.split(sep).join('/')] = readFileSync(join(vault, p), 'utf8');
+  }
+  return out;
+}
+
 test("cli: a custom exclude list never syncs the CLI's own state", () => {
   const t = setup({ exclude: ['*.tmp'] });
   try {
@@ -50,6 +64,169 @@ test('cli: history finds a file whichever Unicode form its name is typed in', ()
     t.cli('sync');
     assert.match(t.cli('history', name.normalize('NFC')), /2 bytes/);
     assert.match(t.cli('history', name.normalize('NFD')), /2 bytes/);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli: deleted lists files deleted on another device, newest first, and narrows to a folder', () => {
+  const a = setup({ deviceName: 'laptop' });
+  const b = setup({ deviceName: 'phone' }, a);
+  try {
+    put(a.vault, 'notes/a.md', 'a\n');
+    put(a.vault, 'other/b.md', 'b\n');
+    put(a.vault, 'kept.md', 'kept\n');
+    a.cli('sync');
+    b.cli('sync');
+    rmSync(join(b.vault, 'notes', 'a.md'));
+    b.cli('sync');
+    rmSync(join(b.vault, 'other', 'b.md'));
+    b.cli('sync');
+    const lines = a.cli('deleted').trim().split('\n');
+    assert.deepEqual(lines.map((l) => l.split(/\s+/).slice(1)), [['phone', 'other/b.md'], ['phone', 'notes/a.md']]);
+    assert.ok(lines.every((l) => /^\d{4}-\d\d-\d\dT[\d:.]+Z /.test(l)));
+    assert.ok(Date.parse(lines[0].split(' ')[0]) >= Date.parse(lines[1].split(' ')[0]));
+    assert.deepEqual(a.cli('deleted', 'notes/').trim().split('\n').map((l) => l.split(/\s+/).at(-1)), ['notes/a.md']);
+    assert.equal(a.cli('deleted', 'nowhere'), '');
+  } finally {
+    a.done();
+  }
+});
+
+test('cli: restore-at brings a folder back exactly, leaves other folders alone, and the next sync carries it to the other device', async () => {
+  const a = setup({ deviceName: 'laptop' });
+  const b = setup({ deviceName: 'phone' }, a);
+  try {
+    put(a.vault, 'notes/a.md', 'a1\n');
+    put(a.vault, 'notes/b.md', 'b1\n');
+    put(a.vault, 'notes/same.md', 'same\n');
+    put(a.vault, 'other/x.md', 'x1\n');
+    a.cli('sync');
+    const then = new Date().toISOString();
+    await sleep(20);
+    put(a.vault, 'notes/a.md', 'a2\n');
+    rmSync(join(a.vault, 'notes', 'b.md'));
+    put(a.vault, 'notes/sub/new.md', 'new\n');
+    put(a.vault, 'other/x.md', 'x2\n');
+    a.cli('sync');
+    b.cli('sync');
+    const before = files(a.vault);
+
+    const dry = a.run('restore-at', then, 'notes', '--dry-run');
+    assert.equal(dry.status, 0, dry.stderr);
+    const out = dry.stdout.trim().split('\n');
+    const used = /^notes\/ as of (\S+), synced by laptop:$/.exec(out[0]);
+    assert.ok(used && Date.parse(used[1]) < Date.parse(then), 'it names the moment it used, the last sync before the time asked for');
+    assert.deepEqual(out.slice(1, -1), ['  remove      notes/sub/new.md', '  change      notes/a.md', '  bring back  notes/b.md']);
+    assert.match(out.at(-1)!, /^dry run: would bring back 1, change 1 and remove 1; nothing changed$/);
+    assert.deepEqual(files(a.vault), before);
+
+    const r = a.run('restore-at', then, 'notes');
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /^synced first: sent 0, received 0/);
+    assert.match(r.stdout, /brought back 1, changed 1, removed 1; run sync to send it to other devices/);
+    assert.doesNotMatch(r.stdout, /--force/);
+    const expected = { 'notes/a.md': 'a1\n', 'notes/b.md': 'b1\n', 'notes/same.md': 'same\n', 'other/x.md': 'x2\n' };
+    assert.deepEqual(files(a.vault), expected);
+    assert.equal(existsSync(join(a.vault, 'notes', 'sub')), false);
+
+    assert.match(a.cli('sync'), /^sent 2, received 0, deleted 0 here and 1 remotely/);
+    assert.match(a.cli('restore-at', then, 'notes', '--dry-run'), /nothing to do: it already matches/);
+    assert.match(b.cli('sync'), /^sent 0, received 2, deleted 1 here/);
+    assert.deepEqual(files(b.vault), expected);
+  } finally {
+    a.done();
+  }
+});
+
+test('cli: restore-at says when the sync after it needs --force, and why', async () => {
+  const t = setup({ deviceName: 'laptop' });
+  try {
+    put(t.vault, 'keep.md', 'keep\n');
+    t.cli('sync');
+    const then = new Date().toISOString();
+    await sleep(20);
+    for (let i = 0; i < 12; i++) put(t.vault, `drafts/${i}.md`, `${i}\n`);
+    t.cli('sync');
+    const r = t.run('restore-at', then);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /brought back 0, changed 0, removed 12; run sync/);
+    assert.match(r.stdout, /that sync needs --force: it deletes 12 files from storage, and a plain sync stops before deleting more than 10/);
+    const plain = t.run('sync');
+    assert.equal(plain.status, 1);
+    assert.match(plain.stderr, /Refusing to sync/);
+    assert.match(t.cli('sync', '--force'), /deleted 0 here and 12 remotely/);
+    assert.deepEqual(files(t.vault), { 'keep.md': 'keep\n' });
+  } finally {
+    t.done();
+  }
+});
+
+test('cli: restore-at needs a time it can read, and one not before the earliest that can be restored', () => {
+  const t = setup({});
+  try {
+    put(t.vault, 'a.md', 'a\n');
+    t.cli('sync');
+    let r = t.run('restore-at', 'yesterday');
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /"yesterday" is not a time; use ISO 8601/);
+    r = t.run('restore-at', '2000-01-01T00:00:00Z', '--dry-run');
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /too far back; the earliest time that can be restored is \d{4}-\d\d-\d\dT/);
+    assert.deepEqual(files(t.vault), { 'a.md': 'a\n' });
+  } finally {
+    t.done();
+  }
+});
+
+test('cli: log lists the times the vault can go back to, newest first, with what each sync changed', () => {
+  const t = setup({ deviceName: 'laptop' });
+  try {
+    put(t.vault, 'a.md', 'a\n');
+    t.cli('sync');
+    put(t.vault, 'a.md', 'a2\n');
+    put(t.vault, 'b.md', 'b\n');
+    t.cli('sync');
+    rmSync(join(t.vault, 'a.md'));
+    t.cli('sync');
+    const lines = t.cli('log').trim().split('\n');
+    assert.deepEqual(lines.map((l) => l.split(/\s+/).slice(1).join(' ')), [
+      'laptop 0 added, 0 changed, 1 deleted',
+      'laptop 1 added, 1 changed, 0 deleted',
+      'laptop 1 added, 0 changed, 0 deleted',
+    ]);
+    const times = lines.map((l) => Date.parse(l.split(' ')[0]));
+    assert.ok(times[0] >= times[1] && times[1] >= times[2]);
+    assert.deepEqual(t.cli('log', '--limit=1').trim().split('\n'), [lines[0]]);
+    const bad = t.run('log', '--limit=0');
+    assert.equal(bad.status, 1);
+    assert.match(bad.stderr, /--limit must be a whole number above 0/);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli: verify exits 0 on a healthy remote, and 1 naming the files affected after a pack is removed by hand', () => {
+  const t = setup({});
+  try {
+    put(t.vault, 'a.md', 'a\n');
+    put(t.vault, 'b.md', 'b\n');
+    t.cli('sync');
+    const ok = t.run('verify');
+    assert.equal(ok.status, 0, ok.stderr);
+    assert.equal(ok.stdout, 'checked 1 commit, 2 files, 1 pack: no problems\n');
+    const deep = t.run('verify', '--deep');
+    assert.equal(deep.status, 0, deep.stderr);
+    assert.match(deep.stdout, /^checked 1 commit, 2 files, 1 pack, 2 chunks \([\d.]+ MB downloaded\): no problems\n$/);
+
+    const packs = readdirSync(join(t.dir, 'remote', 'pack'));
+    assert.equal(packs.length, 1);
+    rmSync(join(t.dir, 'remote', 'pack', packs[0]));
+    const bad = t.run('verify');
+    assert.equal(bad.status, 1);
+    assert.match(bad.stdout, new RegExp(`^problem: Pack ${packs[0]} is missing \\(pack/${packs[0]}\\)$`, 'm'));
+    assert.match(bad.stdout, /^ {2}affects a\.md\n {2}affects b\.md$/m);
+    assert.match(bad.stdout, /: 1 problem\n$/);
   } finally {
     t.done();
   }

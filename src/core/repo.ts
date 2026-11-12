@@ -23,16 +23,20 @@ interface WireCommit {
   c: [string, WireEntry | null][];
   /** Older versions ignore it, so adding it needed no format change. */
   h?: string;
+  /** Set on a commit that only moves data (`Commit.moved`). Older versions ignore it and see entries with unchanged content. */
+  m?: 1;
 }
 
 function encCommit(c: Commit): WireCommit {
   const pt = new PackTable();
   const changes = c.changes.map((ch): [string, WireEntry | null] => [ch.path, ch.entry && encEntry(ch.entry, pt)]);
-  return { d: c.device, t: c.time, p: pt.list, c: changes, h: c.prev };
+  return { d: c.device, t: c.time, p: pt.list, c: changes, h: c.prev, ...(c.moved && { m: 1 as const }) };
 }
 
 function decCommit(seq: number, w: WireCommit, hash?: string): Commit {
-  return { seq, device: w.d, time: w.t, changes: w.c.map(([path, e]) => ({ path, entry: e && decEntry(e, w.p) })), prev: w.h, hash };
+  const c: Commit = { seq, device: w.d, time: w.t, changes: w.c.map(([path, e]) => ({ path, entry: e && decEntry(e, w.p) })), prev: w.h, hash };
+  if (w.m) c.moved = true;
+  return c;
 }
 
 export const seqKey = (prefix: 'log' | 'snap' | 'idx', seq: number) => `${prefix}/${String(seq).padStart(12, '0')}`;

@@ -1,6 +1,6 @@
 import { pool } from './bytes.ts';
 import { seqKey, type Repo } from './repo.ts';
-import type { ChunkRef, Commit, Entry } from './types.ts';
+import { sameContent, type ChunkRef, type Commit, type Entry } from './types.ts';
 
 export interface VerifyOptions {
   /** Also download and decrypt every chunk the current files use, and check its content against its id. */
@@ -55,9 +55,9 @@ export async function verifyRepo(repo: Repo, o: Context): Promise<VerifyReport> 
     report.problems.push({ message, ...(object && { object }), ...(paths && { paths: [...new Set(paths)].sort() }) });
   };
   const [seqs, snaps, packs] = await Promise.all([repo.commitSeqsAfter(0), repo.snapshots(), repo.listPacks()]);
-  const files = await replayLog(repo, o, seqs, snaps.at(-1)?.seq ?? 0, report, problem);
+  const { files, movedBy } = await replayLog(repo, o, seqs, snaps.at(-1)?.seq ?? 0, report, problem);
   report.files = files.size;
-  const bad = checkPacks(files, packs, report, problem);
+  const bad = checkPacks(files, movedBy, packs, report, problem);
   if (o.deep) await checkChunks(repo, o, files, bad, report, problem);
   return report;
 }
@@ -65,11 +65,14 @@ export async function verifyRepo(repo: Repo, o: Context): Promise<VerifyReport> 
 type Problem = (message: string, object?: string, paths?: Iterable<string>) => void;
 
 /**
- * Replays the log, checking that it is contiguous and chained, and compares the newest snapshot
- * with the table at its commit. Returns the current table: the log's, or where the log cannot be
- * replayed, the snapshot's with the commits after it, as a new device would see it.
+ * Replays the log, checking that it is contiguous and chained, that commits marked as moves change no
+ * content, and compares the newest snapshot with the table at its commit. Returns the current table:
+ * the log's, or where the log cannot be replayed, the snapshot's with the commits after it, as a new
+ * device would see it; and for files whose current entry a move wrote, that move's commit.
  */
-async function replayLog(repo: Repo, o: Context, seqs: number[], snapSeq: number, report: VerifyReport, problem: Problem): Promise<Map<string, Entry>> {
+async function replayLog(
+  repo: Repo, o: Context, seqs: number[], snapSeq: number, report: VerifyReport, problem: Problem,
+): Promise<{ files: Map<string, Entry>; movedBy: Map<string, number> }> {
   const last = seqs.at(-1) ?? 0;
   const listed = new Set(seqs);
   let expected = 1;
@@ -97,6 +100,7 @@ async function replayLog(repo: Repo, o: Context, seqs: number[], snapSeq: number
   }
 
   let table = new Map<string, Entry>();
+  const movedBy = new Map<string, number>();
   // Digest of the commit before the next one; unknown after a commit that is missing or unreadable.
   let prev: string | undefined = '';
   let intact = true;
@@ -127,10 +131,16 @@ async function replayLog(repo: Repo, o: Context, seqs: number[], snapSeq: number
         if (o.seen?.seq === seq && o.seen.head !== undefined && o.seen.head !== c.hash) {
           problem(`Commit ${seq} is not the one this device saw: the log was tampered with or forked`, key);
         }
+        const changed: string[] = [];
         for (const ch of c.changes) {
+          const was = table.get(ch.path);
+          if (c.moved && intact && !(ch.entry && was && sameContent(was, ch.entry))) changed.push(ch.path);
           if (ch.entry) table.set(ch.path, ch.entry);
           else table.delete(ch.path);
+          if (c.moved) movedBy.set(ch.path, seq);
+          else movedBy.delete(ch.path);
         }
+        if (changed.length) problem(`Commit ${seq} is marked as only moving data but changes what files contain`, key, changed);
         prev = c.hash;
       }
       if (seq === snapSeq && snap) {
@@ -149,7 +159,7 @@ async function replayLog(repo: Repo, o: Context, seqs: number[], snapSeq: number
       o.onProgress?.({ phase: 'log', done: seq, total: last });
     }
   }
-  return snap && snapSeq > last ? snap.files : table;
+  return snap && snapSeq > last ? { files: snap.files, movedBy: new Map() } : { files: table, movedBy };
 }
 
 function sameEntry(a: Entry, b: Entry): boolean {
@@ -171,7 +181,9 @@ function differences(a: Map<string, Entry>, b: Map<string, Entry>): string[] {
 }
 
 /** Every pack the files use is listed and long enough. Returns the packs found wanting. */
-function checkPacks(files: Map<string, Entry>, listing: { id: string; size: number }[], report: VerifyReport, problem: Problem): Set<string> {
+function checkPacks(
+  files: Map<string, Entry>, movedBy: Map<string, number>, listing: { id: string; size: number }[], report: VerifyReport, problem: Problem,
+): Set<string> {
   const size = new Map(listing.map((p) => [p.id, p.size]));
   const need = new Map<string, { end: number; paths: string[] }>();
   for (const [path, e] of files) {
@@ -186,8 +198,10 @@ function checkPacks(files: Map<string, Entry>, listing: { id: string; size: numb
   const bad = new Set<string>();
   for (const [pack, n] of need) {
     const have = size.get(pack);
-    if (have === undefined) problem(`Pack ${pack} is missing`, `pack/${pack}`, n.paths);
-    else if (have < n.end) problem(`Pack ${pack} is ${have} bytes, shorter than the ${n.end} its chunks need: corrupted`, `pack/${pack}`, n.paths);
+    const seqs = [...new Set(n.paths.map((p) => movedBy.get(p)).filter((s) => s !== undefined))].sort((a, b) => a - b);
+    const move = seqs.length ? `, though ${seqs.length > 1 ? 'commits' : 'commit'} ${seqs.join(', ')} moved data there` : '';
+    if (have === undefined) problem(`Pack ${pack} is missing${move}`, `pack/${pack}`, n.paths);
+    else if (have < n.end) problem(`Pack ${pack} is ${have} bytes, shorter than the ${n.end} its chunks need${move}: corrupted`, `pack/${pack}`, n.paths);
     else continue;
     bad.add(pack);
   }

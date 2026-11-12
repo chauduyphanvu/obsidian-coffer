@@ -28,6 +28,11 @@ export interface Commit {
   prev?: string;
   /** Digest of this commit as stored. Known for commits read from or written to the log. */
   hash?: string;
+  /**
+   * Only moves stored data: every entry has the content it had before, at new locations. Not a change
+   * anyone made, so it is not a moment or a version in history and does not count as activity.
+   */
+  moved?: boolean;
 }
 
 export interface Version {
