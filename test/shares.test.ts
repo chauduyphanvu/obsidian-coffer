@@ -4,6 +4,7 @@ import { WrongPassphraseError } from '../src/core/crypto.ts';
 import type { SyncEngine } from '../src/core/engine.ts';
 import { Repo } from '../src/core/repo.ts';
 import { MissingFolderError, ScopedFS, type FolderFS } from '../src/core/scopedfs.ts';
+import { ChangeLog, type Why } from '../src/plugin/changes.ts';
 import { defaultSettings, shareWith, statePath, type Settings, type Share } from '../src/plugin/settings.ts';
 import { followRename, goneWith, inVault, makeEngine, placeOf, syncAll, vaultPath, type EngineHost } from '../src/plugin/shares.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
@@ -313,6 +314,72 @@ test('a shared folder renamed in the vault is followed: nothing is deleted, and 
   assert.deepEqual(await a.remote(), ['Shared notes/n.md', 'a.md']);
   assert.deepEqual(await a.remote(sa), before);
   assert.deepEqual(b.paths().filter((p) => p.startsWith('Projects/Team/')).length, 3);
+});
+
+test('hinted syncs of the vault and a shared folder: a file moved into it leaves the vault unlisted, a renamed or vanished shared folder is listed', async () => {
+  const { a, b, sa } = await sharing();
+  const log = new ChangeLog(() => a.settings.shares);
+  let listed: string[] = [];
+  const list = a.fs.list.bind(a.fs);
+  const listFolder = a.fs.listFolder.bind(a.fs);
+  let inFolder = false;
+  a.fs.list = () => {
+    if (!inFolder) listed.push('the vault');
+    return list();
+  };
+  a.fs.listFolder = async (folder) => {
+    listed.push(folder);
+    inFolder = true;
+    try {
+      return await listFolder(folder);
+    } finally {
+      inFolder = false;
+    }
+  };
+  // As the plugin does it, from the vault's events.
+  const run = (why: Why) =>
+    syncAll(a.settings, a.host.secret, (s) => {
+      const changed = log.take(s, why, s && { folderMissing: !a.fs.folders.has(s.folder) });
+      return a.engine(s).sync({ changed }).catch((e: unknown) => {
+        log.failed(s);
+        throw e;
+      });
+    });
+  ok(await run('start'));
+  assert.deepEqual(listed, ['the vault', 'Shared']);
+  listed = [];
+
+  a.fs.move('a.md', 'Shared/a.md');
+  log.file('a.md');
+  log.file('Shared/a.md');
+  a.fs.put('Shared/sub/s2.md', 'edited by A');
+  log.file('Shared/sub/s2.md');
+  let out = await run('edit');
+  ok(out);
+  assert.deepEqual(listed, []);
+  assert.deepEqual([out[0].result!.deletedRemote, out[1].result!.pushed], [1, 2]);
+  ok(await b.syncAll());
+  assert.equal(b.fs.text('Projects/Team/a.md'), 'only in A');
+  assert.equal(b.fs.text('Projects/Team/sub/s2.md'), 'edited by A');
+  assert.deepEqual(await a.remote(), ['Shared notes/n.md']);
+
+  a.fs.moveFolder('Shared', 'Work/Shared');
+  log.folder('Shared', 'Work/Shared');
+  followRename(a.settings.shares, 'Shared', 'Work/Shared');
+  a.fs.put('Work/Shared/t1.md', 'edited after the move');
+  log.file('Work/Shared/t1.md');
+  out = await run('edit');
+  ok(out);
+  assert.deepEqual(listed, ['the vault', 'Work/Shared']);
+  assert.deepEqual([out[1].result!.pushed, out[1].result!.deletedRemote], [1, 0]);
+  const before = await a.remote(sa);
+
+  // Gone without a folder event, as when deleted outside Obsidian: an event for one file must not delete it for everyone.
+  a.fs.dropFolder('Work/Shared');
+  log.file('Work/Shared/t1.md');
+  out = await run('edit');
+  assert.ok(out[1].error instanceof MissingFolderError);
+  assert.deepEqual(await a.remote(sa), before);
 });
 
 test('one shared folder failing (wrong passphrase) does not stop the vault or the shared folder after it', async () => {

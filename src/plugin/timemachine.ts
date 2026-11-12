@@ -3,6 +3,7 @@
 import { Modal, Notice, Platform, TFile, type App } from 'obsidian';
 import { fileName, vaultKey } from '../core/paths.ts';
 import { listVersions } from '../core/retention.ts';
+import { plural } from '../core/text.ts';
 import { TooOldError, listCommits, listDeleted, planRestore, tableAt, type CommitSummary, type DeletedFile, type PastVault } from '../core/timeline.ts';
 import { sameContent, type Version } from '../core/types.ts';
 import type { VerifyReport } from '../core/verify.ts';
@@ -30,7 +31,7 @@ import {
   type Preview,
   type Step,
 } from './restore.ts';
-import { MAX_COMPARE_BYTES, describeFailure, plural } from './status.ts';
+import { MAX_COMPARE_BYTES, describeFailure } from './status.ts';
 import { FolderSuggest, button, buttonRow, message, openLink, statusLine } from './ui.ts';
 
 /** Rows drawn at most in one list; typing narrows it. */
@@ -613,12 +614,10 @@ export class RestoreEarlierModal extends Modal {
     this.render();
     try {
       const l = (this.look ??= await this.plugin.look(this.share));
-      const page = await listCommits(l.repo, l.lastSeq, l.cfg, l.now, { limit: PAGE, before: this.moments.at(-1)?.time });
+      const page = await listCommits(l.repo, l.lastSeq, l.cfg, l.now, { limit: PAGE, beforeSeq: this.moments.at(-1)?.seq });
       if (generation !== this.generation) return;
-      const seen = new Set(this.moments.map((m) => m.seq));
-      const fresh = page.filter((m) => !seen.has(m.seq));
-      this.moments.push(...fresh);
-      this.more = page.length === PAGE && fresh.length > 0;
+      this.moments.push(...page);
+      this.more = page.length === PAGE;
     } catch (e) {
       if (generation !== this.generation) return;
       this.error = `Could not load earlier times: ${failure(e)}`;
@@ -804,10 +803,10 @@ export class RestoreEarlierModal extends Modal {
     const p = out.sent?.problem;
     if (p) message(c, `It is not sent to your other devices yet. ${p.title}. ${p.detail}`);
     else c.createDiv({ cls: 'self-sync-hint', text: 'Sent to storage. Your other devices get it when they next sync.' });
-    if (out.othersPause) {
+    if (out.olderPause) {
       message(
         c,
-        'Your other devices will pause before removing these files, as they do whenever many files go at once. Choose “Delete them everywhere” there to finish; “Keep all files” would bring the removed files back.',
+        'Your other devices remove these files too when they next sync. One with an older version of Self Sync, or one that has been away for many syncs, may pause first, as it does whenever many files go at once: choose “Delete them everywhere” there to finish. “Keep all files” would bring the removed files back.',
         'self-sync-note',
       );
     }

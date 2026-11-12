@@ -306,7 +306,68 @@ export class ProblemsModal extends Modal {
       case 'retry':
         button(row, 'Try again', () => plugin.sync(true));
         break;
+      case 'accept-storage':
+        button(row, 'Carry on from storage as it is…', () => new AcceptStorageModal(this.app, plugin, share).open(), 'warning');
+        break;
     }
+  }
+}
+
+/** After the history in storage turned out not to be the one this device saw: what carrying on means, and a confirmation. */
+class AcceptStorageModal extends Modal {
+  private plugin: SelfSyncPlugin;
+  private share?: Share;
+  private busy = false;
+  private error = '';
+
+  constructor(app: App, plugin: SelfSyncPlugin, share?: Share) {
+    super(app);
+    this.plugin = plugin;
+    this.share = share;
+  }
+
+  onOpen(): void {
+    this.modalEl.addClass('self-sync-modal');
+    this.render();
+  }
+
+  private render(): void {
+    const c = this.contentEl;
+    c.empty();
+    this.setTitle(this.share ? `Carry on with “${this.share.folder}” from storage as it is?` : 'Carry on from storage as it is?');
+    c.createEl('p', {
+      cls: 'self-sync-intro',
+      text: 'What storage holds is not what this device last saw there: part of the sync history was taken back or replaced.',
+    });
+    const what = c.createEl('ul', { cls: 'self-sync-what' });
+    what.createEl('li', { text: 'That is expected right after storage was restored from a backup or an older copy on purpose. Then carry on.' });
+    what.createEl('li', { text: 'If nobody did that, someone else may have changed what is stored. Cancel, leave sync stopped, and find out who can reach your storage.' });
+    what.createEl('li', {
+      text: "Carrying on, this device takes storage as it is now and syncs with it. Nothing is deleted. Where a file differs, both versions are kept: storage's under the name, this device's beside it with “(conflict …)” in its name. Settings are combined instead.",
+    });
+    message(c, this.error);
+    const row = buttonRow(c);
+    button(row, 'Cancel', () => this.close());
+    button(row, this.busy ? 'Carrying on…' : 'Carry on from storage', () => this.accept(), 'warning').setDisabled(this.busy);
+  }
+
+  private async accept(): Promise<void> {
+    if (this.busy) return;
+    this.busy = true;
+    this.error = '';
+    this.render();
+    try {
+      await this.plugin.acceptStorage(this.share);
+      this.close();
+    } catch (e) {
+      this.busy = false;
+      this.error = `Could not carry on: ${e instanceof Error ? e.message : e}`;
+      this.render();
+    }
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
   }
 }
 

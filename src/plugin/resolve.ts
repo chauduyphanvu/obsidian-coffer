@@ -2,8 +2,9 @@
 import { Modal, Notice, TFile, type App } from 'obsidian';
 import { applyChoices, hunks, type Choice, type Hunk } from '../core/merge.ts';
 import { conflictOriginal, fileName } from '../core/paths.ts';
+import { plural } from '../core/text.ts';
 import type SelfSyncPlugin from './main.ts';
-import { MAX_COMPARE_BYTES, compareConflict, plural, unchangedSince, type Comparison, type Snapshot, type WholeReason } from './status.ts';
+import { MAX_COMPARE_BYTES, compareConflict, unchangedSince, type Comparison, type Snapshot, type WholeReason } from './status.ts';
 import { button, buttonRow, choice, message, openLink } from './ui.ts';
 
 /** Shared lines shown above and below a change. */

@@ -117,7 +117,7 @@ test('a device notices when the newest commit it saw is gone from storage', asyn
   b.restart(); // checked at start
   const e = await failure(b.sync());
   assert.match(e.message, /commit 3, the newest this device has seen, is missing/);
-  assert.equal(describeFailure(e).id, 'damaged');
+  assert.equal(describeFailure(e).id, 'history');
 
   // A device that keeps running and sees nothing new checks again within the hour,
   // before an edit of its own would be committed on top of the gap.
@@ -151,7 +151,7 @@ test('a device notices when storage shows devices different versions of the log'
   toB.target = mem;
   const e = await failure(b.sync());
   assert.match(e.message, /commit 3 does not follow the commit before it/);
-  assert.equal(describeFailure(e).id, 'damaged');
+  assert.equal(describeFailure(e).id, 'history');
   assert.equal(b.fs.text('a.md'), undefined, 'nothing from the other version was written');
 
   // Shown B's commit 2 in place of A's, C notices at its next start.
@@ -159,7 +159,7 @@ test('a device notices when storage shows devices different versions of the log'
   c.restart();
   const e2 = await failure(c.sync());
   assert.match(e2.message, /commit 2 is not the one this device saw/);
-  assert.equal(describeFailure(e2).id, 'damaged');
+  assert.equal(describeFailure(e2).id, 'history');
 });
 
 test('a commit from a version that does not chain the log is accepted, and the chain picks up after it', async () => {

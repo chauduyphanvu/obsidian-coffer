@@ -1,12 +1,14 @@
 // What a restore does, and how the past reads to a person. No Obsidian import, so it runs under plain Node tests.
 import { compileExcludes, type SyncConfig } from '../core/config.ts';
+import { deleteLimit, type GcResult } from '../core/engine.ts';
 import { diffCounts, lineDiff, type DiffRegion } from '../core/merge.ts';
 import { ext, vaultKey } from '../core/paths.ts';
 import { DAY } from '../core/retention.ts';
+import { plural } from '../core/text.ts';
 import type { RestorePlan } from '../core/timeline.ts';
 import type { Entry } from '../core/types.ts';
 import type { VerifyReport } from '../core/verify.ts';
-import { MAX_COMPARE_BYTES, asText, plural, sameBytes } from './status.ts';
+import { MAX_COMPARE_BYTES, asText, sameBytes } from './status.ts';
 
 /** `add` brings back a file that is not there now, `change` replaces one that is, `remove` takes one away. */
 export interface Step {
@@ -76,21 +78,13 @@ export function placeRestored(paths: string[], taken: Set<string>): Map<string, 
 }
 
 /**
- * Whether every file this device last synced (`synced`) that is gone from it now was removed by a restore
- * (`restored`): then a sync that deletes them from storage only carries out what the user confirmed.
- */
-export function goneOnlyByRestore(synced: Iterable<string>, present: Set<string>, excluded: (path: string) => boolean, restored: Set<string>): boolean {
-  for (const path of synced) if (!present.has(path) && !excluded(path) && !restored.has(path)) return false;
-  return true;
-}
-
-/**
- * A sync carrying out a restore that wrote `write` files and removed `remove`, here or on a device receiving it, is
- * refused for deleting many files when they shrink by more than the larger of `maxDeleteCount` and that share of the
- * `synced` files, as `SyncEngine` checks. Returns that limit when it is crossed.
+ * Whether a restore that wrote `write` files and removed `remove`, out of `synced`, shrinks the files by more than the
+ * guard against mass deletion allows (`deleteLimit`). The sync that sends it marks the removals as confirmed, so it
+ * passes, and so do devices on this version receiving it; a device on an older version pauses. Returns the limit
+ * when it is crossed.
  */
 export function deleteLimitCrossed(write: number, remove: number, synced: number, cfg: Pick<SyncConfig, 'maxDeleteCount' | 'maxDeleteFraction'>): number | undefined {
-  const limit = Math.max(cfg.maxDeleteCount, synced * cfg.maxDeleteFraction);
+  const limit = deleteLimit(synced, cfg);
   return remove - write > limit ? Math.floor(limit) : undefined;
 }
 
@@ -261,6 +255,23 @@ export function describeVerify(r: VerifyReport): { ok: boolean; title: string; d
     detail: `${checked} Nothing was changed. Keep the files on your devices: they may be the only good copies.`,
     findings,
   };
+}
+
+/** What a clean-up of storage did, in plain words, including when there was nothing to do. */
+export function describeCleanup(r: GcResult): string {
+  const said: string[] = [];
+  if (r.packsDeleted || r.snapshotsDeleted) {
+    const objects = r.packsDeleted ? `${plural(r.packsDeleted, 'storage object')} (${sizeLabel(r.bytesFreed)})` : '';
+    const overviews = r.snapshotsDeleted ? `${plural(r.snapshotsDeleted, 'old overview')} of the vault` : '';
+    said.push(`Deleted ${[objects, overviews].filter(Boolean).join(' and ')} that no version you can restore needs.`);
+  }
+  if (r.packsCombined) {
+    said.push(
+      `Copied the data still in use out of ${plural(r.packsCombined, 'small or mostly unused storage object')} into ${plural(r.packsWritten, 'new one')} (${sizeLabel(r.bytesMoved)}). ` +
+        `The old ones (${sizeLabel(r.bytesFreedLater)}) are deleted by a later clean-up, once no version you can restore reads them.`,
+    );
+  }
+  return said.length ? said.join(' ') : 'Nothing needed cleaning up: no stored version has expired, and the stored data is already packed tightly.';
 }
 
 export const verifyProgress = (p: { phase: 'log' | 'chunks'; done: number; total: number }) =>

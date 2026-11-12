@@ -12,10 +12,10 @@ import {
   countable,
   dayLabel,
   deleteLimitCrossed,
+  describeCleanup,
   describeVerify,
   deviceLabel,
   diffLines,
-  goneOnlyByRestore,
   keepOut,
   lineChanges,
   matchesQuery,
@@ -95,14 +95,6 @@ test('a deleted file comes back where it was, or beside what has its name now, n
   assert.equal(placeRestored([nfd], new Set(['ý.md'.normalize('NFC')])).get(nfd), `${nfd.slice(0, -3)} (restored).md`);
 });
 
-test('a refused sync is the restore\'s own only when every file gone from this device was removed by it', () => {
-  const synced = ['a.md', 'b.md', 'c.md', 'Private/p.md'];
-  const excluded = keepOut(['Private/'], []);
-  assert.ok(goneOnlyByRestore(synced, new Set(['a.md']), excluded, new Set(['b.md', 'c.md'])));
-  assert.ok(!goneOnlyByRestore(synced, new Set(['a.md']), excluded, new Set(['b.md'])), 'c.md went missing on its own');
-  assert.ok(goneOnlyByRestore(synced, new Set(['a.md', 'b.md', 'c.md']), excluded, new Set()), 'excluded files are not deletions');
-});
-
 test('the delete limit predicted after a restore is the one the engine enforces', async () => {
   for (const [files, remove, write] of [[13, 12, 0], [13, 10, 0], [40, 20, 0], [40, 21, 0], [40, 25, 4], [40, 25, 5]]) {
     const a = new Device('A', new MemoryStore(), { now: 1_800_000_000_000 });
@@ -118,7 +110,7 @@ test('the delete limit predicted after a restore is the one the engine enforces'
   assert.equal(deleteLimitCrossed(0, 30, 45, { maxDeleteCount: 10, maxDeleteFraction: 0.5 }), 22);
 });
 
-test('restoring the vault to an earlier time: protected paths stay, and only the restore\'s own deletions get past the guard', async () => {
+test('restoring the vault to an earlier time: protected paths stay, only the restore\'s own deletions get past the guard, and the other device carries them out', async () => {
   const clock = { now: 1_800_000_000_000 };
   const store = new MemoryStore(() => clock.now);
   const a = new Device('A', store, clock, { exclude: ['Private/'] });
@@ -150,26 +142,32 @@ test('restoring the vault to an earlier time: protected paths stay, and only the
     for (const s of steps) if (s.entry) a.fs.put(s.path, await a.engine.readVersion(s.entry));
   };
   await apply();
-  const removed = new Set(steps.filter((s) => s.kind === 'remove').map((s) => s.path));
-  const present = async () => new Set((await a.fs.list()).map((f) => f.path));
-  await assert.rejects(a.sync(), SafetyError);
-  const synced = async () => (await a.engine.view()).st.synced.keys();
-  assert.ok(goneOnlyByRestore(await synced(), await present(), kept, removed));
-
-  // Had the user also deleted a file of their own, the refusal is not the restore's to wave through.
-  const own = a.fs.files.get('notes/0.md')!;
-  a.fs.files.delete('notes/0.md');
-  assert.ok(!goneOnlyByRestore(await synced(), await present(), kept, removed));
-  a.fs.files.set('notes/0.md', own);
-
-  await a.sync(true);
+  const removed = steps.filter((s) => s.kind === 'remove').map((s) => s.path);
+  await assert.rejects(a.sync(), SafetyError, 'a plain sync takes them for files that vanished');
+  await assert.rejects(a.engine.sync({ allowDeletes: removed.slice(0, 3) }), SafetyError, 'the deletions not named still count');
+  assert.equal((await a.engine.sync({ allowDeletes: removed })).deletedRemote, 15);
   clock.now += 60_000;
-  // Storage does not say the deletions came from a restore, so the other device's guard pauses on them too.
-  await assert.rejects(b.sync(), SafetyError);
-  await b.sync(true);
+  // The commit says the deletions were confirmed, so the other device carries them out without pausing.
+  await b.sync();
   assert.deepEqual(
     Object.fromEntries([...b.fs.files.keys()].sort().map((p) => [p, b.fs.text(p)])),
     { 'Private/p.md': 'only synced by B\n', 'keep.md': 'keep v1\n', 'notes/0.md': 'note 0\n', 'notes/1.md': 'note 1\n', 'notes/2.md': 'note 2\n' },
+  );
+});
+
+test('a clean-up says what it deleted and what it packed tighter, or that nothing needed doing', () => {
+  const none = { packsDeleted: 0, bytesFreed: 0, snapshotsDeleted: 0, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0 };
+  assert.equal(describeCleanup(none), 'Nothing needed cleaning up: no stored version has expired, and the stored data is already packed tightly.');
+  assert.equal(
+    describeCleanup({ ...none, packsDeleted: 3, bytesFreed: 2_500_000, snapshotsDeleted: 1 }),
+    'Deleted 3 storage objects (2.5 MB) and 1 old overview of the vault that no version you can restore needs.',
+  );
+  assert.equal(describeCleanup({ ...none, snapshotsDeleted: 2 }), 'Deleted 2 old overviews of the vault that no version you can restore needs.');
+  assert.equal(
+    describeCleanup({ ...none, packsDeleted: 1, bytesFreed: 400, packsCombined: 5, packsWritten: 1, bytesMoved: 1_200_000, bytesFreedLater: 9_000_000 }),
+    'Deleted 1 storage object (400 bytes) that no version you can restore needs. ' +
+      'Copied the data still in use out of 5 small or mostly unused storage objects into 1 new one (1.2 MB). ' +
+      'The old ones (9.0 MB) are deleted by a later clean-up, once no version you can restore reads them.',
   );
 });
 

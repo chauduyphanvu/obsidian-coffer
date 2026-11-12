@@ -20,10 +20,15 @@ export class NodeFS implements LocalFS {
   /** Whether a change event for `path` is the echo of this FS's own latest write or removal, with nothing since by anyone else. */
   async isOwnChange(path: string): Promise<boolean> {
     if (path.endsWith(TMP)) return true;
-    const left = await this.own.get(path);
-    if (left === undefined) return false;
-    const now = await this.stat(path);
-    return left === null ? now === null : !!now && now.size === left.size && now.mtime === left.mtime;
+    // An operation that starts meanwhile, as a removal beside it changing a folder, replaces what to compare with.
+    for (;;) {
+      const pending = this.own.get(path);
+      const left = await pending;
+      const now = left === undefined ? undefined : await this.stat(path);
+      if (this.own.get(path) !== pending) continue;
+      if (left === undefined) return false;
+      return left === null ? now === null : !!now && now.size === left.size && now.mtime === left.mtime;
+    }
   }
 
   /** Starts remembering what `path` and its folders look like once `done` settles. A watcher can report the effects before the operation returns, so this runs as it starts. */

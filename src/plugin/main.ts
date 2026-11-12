@@ -1,15 +1,17 @@
 import { Notice, Platform, Plugin, TFile, TFolder, debounce, setIcon } from 'obsidian';
 import { pool } from '../core/bytes.ts';
-import { compileExcludes, type SyncConfig } from '../core/config.ts';
+import type { SyncConfig } from '../core/config.ts';
 import { heartbeatDue, writeHeartbeat } from '../core/devices.ts';
-import { SafetyError, type SyncEngine, type SyncResult } from '../core/engine.ts';
+import { SafetyError, type GcResult, type SyncEngine, type SyncResult } from '../core/engine.ts';
 import { fileName, vaultKey } from '../core/paths.ts';
 import type { Repo } from '../core/repo.ts';
 import type { ScopedFS } from '../core/scopedfs.ts';
+import { plural } from '../core/text.ts';
 import { planRestore, type DeletedFile } from '../core/timeline.ts';
 import type { Entry, Version } from '../core/types.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
+import { ChangeLog, fromEvents, type Why } from './changes.ts';
 import { ObsidianFS, PluginState, obsidianHttp } from './obsidianfs.ts';
 import { nextPollDelay } from './polling.ts';
 import {
@@ -36,13 +38,12 @@ import { SetupModal } from './setup.ts';
 import { followRename, goneWith, inVault, makeEngine, placeOf, syncAll, syncable, targetsOf, vaultPath, type EngineHost, type Outcome, type Place } from './shares.ts';
 import { ShareModal, pickTarget } from './sharing.ts';
 import { resolveFirstConflict } from './resolve.ts';
-import { deleteLimitCrossed, goneOnlyByRestore, keepOut, momentLabel, placeRestored, restoreSteps, sameSteps, type Step } from './restore.ts';
+import { deleteLimitCrossed, describeCleanup, keepOut, momentLabel, placeRestored, restoreSteps, sameSteps, type Step } from './restore.ts';
 import {
   describeFailure,
   inShare,
   keysMissingProblem,
   missingProblem,
-  plural,
   resultProblems,
   statusText,
   summarize,
@@ -90,8 +91,11 @@ export interface RestoreOutcome {
   failed: Failed[];
   /** The sync that sent the result. */
   sent?: SyncOutcome;
-  /** Other devices will pause before deleting what this removed, as they do whenever many files go at once. */
-  othersPause?: boolean;
+  /**
+   * So many files were removed that a device on an older version pauses before deleting them, as it does whenever
+   * many files go at once. The sync marks them as confirmed, so devices on this version do not.
+   */
+  olderPause?: boolean;
 }
 
 /** What the plugin remembers between syncs about one synced place: the vault, or a shared folder. */
@@ -100,7 +104,7 @@ interface Tracked {
   failure?: Problem;
   /** What the last finished sync left to look at: failed, conflicting or oversized files. */
   found: Problem[];
-  /** Files a restore removed and no sync has yet deleted from storage; see `syncEngine`. */
+  /** Files a restore removed, which the next sync to finish deletes from storage as confirmed (`allowDeletes`). */
   restored?: Set<string>;
   lastHeartbeat: number;
 }
@@ -119,6 +123,7 @@ export default class SelfSyncPlugin extends Plugin {
   /** The vault's engine under '', each share's under its id. */
   private engines = new Map<string, { engine: SyncEngine; fs: ScopedFS }>();
   private tracking = new Map<string, Tracked>();
+  private changes = new ChangeLog(() => this.settings.shares);
   private changedWhileRunning = false;
   private statusEl?: HTMLElement;
   private ribbonEl?: HTMLElement;
@@ -134,7 +139,7 @@ export default class SelfSyncPlugin extends Plugin {
   private lastActivity = Date.now();
   private dirty = false;
   private progressNotice?: Notice;
-  private schedule = debounce(() => void this.sync(), 10_000, true);
+  private schedule = debounce(() => void this.auto('edit'), 10_000, true);
   private lookup = (name: string) => this.secret(name);
 
   async onload(): Promise<void> {
@@ -212,32 +217,53 @@ export default class SelfSyncPlugin extends Plugin {
         if (this.running) this.changedWhileRunning = true;
         else this.schedule();
       };
-      for (const name of ['create', 'modify', 'delete', 'rename'] as const) {
-        this.registerEvent(this.app.vault.on(name as 'create', changed));
-      }
-      // A shared folder renamed or moved in Obsidian takes its share along.
+      // Each event also tells the next sync of the place it is in what to look at; see ChangeLog.
       this.registerEvent(
-        this.app.vault.on('rename', (file, oldPath) => {
-          if (file instanceof TFolder && followRename(this.settings.shares, oldPath, file.path).length) void this.saveSettings();
+        this.app.vault.on('create', (file) => {
+          // A new folder holds nothing yet: files put in it come with events of their own.
+          if (file instanceof TFile) this.changes.file(file.path);
+          changed();
         }),
       );
-      // A shared folder deleted here must not delete its files for everyone else: the share stops until the user chooses.
+      this.registerEvent(
+        this.app.vault.on('modify', (file) => {
+          this.changes.file(file.path);
+          changed();
+        }),
+      );
       this.registerEvent(
         this.app.vault.on('delete', (file) => {
-          if (!(file instanceof TFolder)) return;
-          const gone = goneWith(this.settings.shares, file.path).filter((s) => !s.missing);
-          if (!gone.length) return;
-          for (const s of gone) s.missing = true;
-          void this.saveSettings().then(() => this.report());
+          if (file instanceof TFolder) {
+            this.changes.folder(file.path);
+            // A shared folder deleted here must not delete its files for everyone else: the share stops until the user chooses.
+            const gone = goneWith(this.settings.shares, file.path).filter((s) => !s.missing);
+            for (const s of gone) s.missing = true;
+            if (gone.length) void this.saveSettings().then(() => this.report());
+          } else this.changes.file(file.path);
+          changed();
+        }),
+      );
+      this.registerEvent(
+        this.app.vault.on('rename', (file, oldPath) => {
+          if (file instanceof TFolder) {
+            this.changes.folder(oldPath, file.path);
+            // A shared folder renamed or moved in Obsidian takes its share along.
+            if (followRename(this.settings.shares, oldPath, file.path).length) void this.saveSettings();
+          } else {
+            this.changes.file(oldPath);
+            this.changes.file(file.path);
+          }
+          changed();
         }),
       );
       // Phones suspend the app in the background; catch up the moment it is opened again.
       // Going to the background: send pending edits now, before the system suspends the app.
       this.registerDomEvent(document, 'visibilitychange', () => {
-        if (document.visibilityState === 'visible') this.noteActivity();
-        if (document.visibilityState === 'visible' || this.dirty) {
+        const visible = document.visibilityState === 'visible';
+        if (visible) this.noteActivity();
+        if (visible || this.dirty) {
           this.schedule.cancel();
-          void this.sync();
+          void this.auto(visible ? 'resume' : 'edit');
         }
       });
       this.applySchedule();
@@ -245,7 +271,7 @@ export default class SelfSyncPlugin extends Plugin {
       if (!this.configured()) {
         const n = new Notice(this.fragment('Self Sync is not set up yet', 'Tap to set up encrypted sync for this vault.'), 15_000);
         n.containerEl.addEventListener('click', () => new SetupModal(this.app, this, 'start').open());
-      } else if (this.settings.syncOnStart) void this.sync();
+      } else if (this.settings.syncOnStart) void this.auto('start');
     });
   }
 
@@ -262,9 +288,9 @@ export default class SelfSyncPlugin extends Plugin {
     this.stopPoll();
     this.timer = undefined;
     this.schedule.cancel();
-    this.schedule = debounce(() => void this.sync(), Math.max(2, this.settings.changeDelaySeconds) * 1000, true);
+    this.schedule = debounce(() => void this.auto('edit'), Math.max(2, this.settings.changeDelaySeconds) * 1000, true);
     if (this.settings.intervalMinutes > 0) {
-      this.timer = window.setInterval(() => void this.sync(), this.settings.intervalMinutes * 60_000);
+      this.timer = window.setInterval(() => void this.auto('timer'), this.settings.intervalMinutes * 60_000);
       this.registerInterval(this.timer);
     }
     this.armPoll();
@@ -308,7 +334,7 @@ export default class SelfSyncPlugin extends Plugin {
           continue;
         }
         this.noteActivity();
-        await this.sync();
+        await this.auto('poll');
         return;
       }
     } finally {
@@ -500,21 +526,28 @@ export default class SelfSyncPlugin extends Plugin {
     rec.conflictCopies = rec.conflictCopies.filter((p) => this.app.vault.getAbstractFileByPath(vaultPath(share, p)));
   }
 
-  async sync(manual = false, force: Force = false, inline = false): Promise<SyncOutcome> {
+  async sync(manual = false, force: Force = false, inline = false, why: Why = 'manual'): Promise<SyncOutcome> {
     if (!this.configured()) {
       if (manual && !inline) new SetupModal(this.app, this, 'start').open();
       return {};
     }
     if (this.running) {
+      // The sync that runs after this one stands in for it, so it must look as far as this one would have.
+      if (!fromEvents(why)) this.changes.lost();
       this.changedWhileRunning = true;
       return {};
     }
     this.running = true;
     try {
-      return await this.syncHeld(manual, force, inline);
+      return await this.syncHeld(manual, force, inline, why);
     } finally {
       this.release();
     }
+  }
+
+  /** A sync nobody asked for in so many words; `why` says what started it. */
+  private auto(why: Why): Promise<SyncOutcome> {
+    return this.sync(false, false, false, why);
   }
 
   /** Tells the other devices where this one is: once per session, then every 30 minutes. Runs under the sync lock. */
@@ -551,37 +584,19 @@ export default class SelfSyncPlugin extends Plugin {
   }
 
   /**
-   * A sync. When it is refused for deleting many files, and every file it would delete from storage is one a restore
-   * the user confirmed removed, it runs again forced: the guard is for deletions nobody asked for.
+   * One place's sync and, when due, its cleanup and heartbeat. Throws when the sync fails. It looks only at the files
+   * the vault's events named when they are all there is to see; otherwise it lists every file.
    */
-  private async syncEngine(share: Share | undefined, force: boolean): Promise<SyncResult> {
-    const engine = this.getEngine(share);
-    try {
-      return await engine.sync({ force });
-    } catch (e) {
-      if (!(e instanceof SafetyError) || !(await this.restoreExplains(share, e))) throw e;
-      return engine.sync({ force: true });
-    }
-  }
-
-  private async restoreExplains(share: Share | undefined, e: SafetyError): Promise<boolean> {
-    const restored = this.tracked(share).restored;
-    if (!restored || e.localDeletes) return false;
-    try {
-      const { engine, fs } = this.scope(share);
-      const { st, cfg } = await engine.view();
-      const present = new Set((await fs.list()).map((f) => vaultKey(f.path)));
-      return goneOnlyByRestore(st.synced.keys(), present, compileExcludes(cfg.exclude), restored);
-    } catch {
-      return false;
-    }
-  }
-
-  /** One place's sync and, when due, its cleanup and heartbeat. Throws when the sync fails. */
-  private async syncOne(share: Share | undefined, force: boolean): Promise<SyncResult> {
+  private async syncOne(share: Share | undefined, force: boolean, why: Why): Promise<SyncResult> {
     const t = this.tracked(share);
     const rec = share ?? this.settings;
-    const r = await this.syncEngine(share, force);
+    const engine = this.getEngine(share);
+    const changed = this.changes.take(
+      share,
+      why,
+      share ? { folderMissing: !this.app.vault.getFolderByPath(share.folder) } : { settingsDue: this.files?.configListingDue() ?? true },
+    );
+    const r = await engine.sync({ force, changed, allowDeletes: t.restored });
     t.restored = undefined;
     if (!share && (r.pulled || r.deletedLocal)) this.files?.forgetConfigListing();
     if (r.pushed || r.pulled || r.deletedLocal || r.deletedRemote || r.merged) this.noteActivity();
@@ -591,7 +606,7 @@ export default class SelfSyncPlugin extends Plugin {
     this.pruneConflictCopies(share);
     t.found = resultProblems(share ? inVault(share, r) : r, this.conflictCopies(share), this.settings.maxFileSizeMB);
     if (!r.errors.length && cleanupDue({ autoCleanDays: this.settings.autoCleanDays, lastCleanup: rec.lastCleanup }, Date.now())) {
-      await this.getEngine(share).gc();
+      await engine.gc();
       rec.lastCleanup = Date.now();
     }
     await this.heartbeat(share);
@@ -601,19 +616,20 @@ export default class SelfSyncPlugin extends Plugin {
   private failed(share: Share | undefined, e: unknown): Problem {
     const t = this.tracked(share);
     t.failure = describeFailure(e);
+    this.changes.failed(share);
     if (!(e instanceof SafetyError)) this.engines.delete(keyOf(share));
     return t.failure;
   }
 
   /** A sync of the vault and then of each shared folder, while the caller holds `running`. One failing does not stop the rest. */
-  private async syncHeld(manual: boolean, force: Force, inline: boolean): Promise<SyncOutcome> {
+  private async syncHeld(manual: boolean, force: Force, inline: boolean, why: Why): Promise<SyncOutcome> {
     this.changedWhileRunning = false;
     this.dirty = false;
     this.updateStatus();
     // Settings changes fire no vault event; asked to sync, look at them now rather than at a listing up to 5 minutes old.
     if (manual) this.files?.forgetConfigListing();
     try {
-      const outcomes = await syncAll(this.settings, this.lookup, (share) => this.syncOne(share, share ? force === share.id : force === true));
+      const outcomes = await syncAll(this.settings, this.lookup, (share) => this.syncOne(share, share ? force === share.id : force === true, why));
       const out: SyncOutcome = { shares: new Map() };
       for (const o of outcomes) {
         const one: SyncOutcome = 'error' in o ? { problem: this.failed(o.target, o.error) } : { result: o.result };
@@ -656,6 +672,16 @@ export default class SelfSyncPlugin extends Plugin {
   async keepAllFiles(share?: Share): Promise<void> {
     const kept = await this.getEngine(share).keepAllFiles();
     new Notice(`Keeping all files${share ? ` in “${share.folder}”` : ''}: ${plural(kept, 'file')} will be copied back.`);
+    await this.sync(true);
+  }
+
+  /**
+   * After the history in storage turned out not to be the one this device saw, as when storage was restored from a
+   * backup: carries on from storage as it is now. Nothing is deleted; files that differ are merged or kept both ways.
+   */
+  async acceptStorage(share?: Share): Promise<void> {
+    await this.getEngine(share).acceptStorage();
+    new Notice(`Carrying on from storage as it is now${share ? ` in “${share.folder}”` : ''}. Nothing is deleted; where files differ, both versions are kept.`);
     await this.sync(true);
   }
 
@@ -770,7 +796,7 @@ export default class SelfSyncPlugin extends Plugin {
       share.missing = false;
       this.tracked(share).failure = undefined;
       await this.saveSettings();
-      return this.syncHeld(true, false, true);
+      return this.syncHeld(true, false, true, 'manual');
     });
     return this.outcomeOf(out, share);
   }
@@ -791,34 +817,26 @@ export default class SelfSyncPlugin extends Plugin {
 
   /** Cleans up the vault's storage and every shared folder's. */
   private async cleanUp(): Promise<void> {
-    if (!this.configured() || this.running) return;
-    this.running = true;
-    try {
-      let objects = 0;
-      let bytes = 0;
-      const failed: string[] = [];
-      for (const share of this.targets()) {
-        try {
-          const r = await this.getEngine(share).gc();
-          objects += r.packsDeleted;
-          bytes += r.bytesFreed;
-        } catch (e) {
-          failed.push(`${share ? `“${share.folder}”` : 'This vault'}: ${errorText(e)}`);
-        }
+    if (!this.configured()) return;
+    const total: GcResult = { packsDeleted: 0, bytesFreed: 0, snapshotsDeleted: 0, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0 };
+    const failed: string[] = [];
+    const targets = this.targets();
+    for (const share of targets) {
+      try {
+        const r = await this.getEngine(share).gc();
+        for (const k of Object.keys(total) as (keyof GcResult)[]) total[k] += r[k];
+      } catch (e) {
+        failed.push(`${share ? `“${share.folder}”` : 'This vault'}: ${errorText(e)}`);
       }
-      new Notice(`Removed ${plural(objects, 'storage object')} (${(bytes / 1e6).toFixed(1)} MB).`);
-      if (failed.length) new Notice(`Clean-up failed.\n${failed.join('\n')}`, 10_000);
-    } finally {
-      this.running = false;
     }
+    if (failed.length < targets.length) new Notice(describeCleanup(total), 10_000);
+    if (failed.length) new Notice(`Clean-up failed.\n${failed.join('\n')}`, 10_000);
   }
 
-  /** Reading the file table while a sync changes it would mix two moments, so no sync runs while it is copied. */
+  /** The file table is copied before anything else is awaited: a sync waiting on the engine may change it from then on. */
   async look(share?: Share): Promise<Look> {
-    return this.exclusive('Reading history…', async () => {
-      const v = await this.getEngine(share).view();
-      return { repo: v.repo, remote: new Map(v.st.remote), lastSeq: v.st.lastSeq, cfg: v.cfg, now: v.now };
-    });
+    const v = await this.getEngine(share).view();
+    return { repo: v.repo, remote: new Map(v.st.remote), lastSeq: v.st.lastSeq, cfg: v.cfg, now: v.now };
   }
 
   /**
@@ -847,6 +865,8 @@ export default class SelfSyncPlugin extends Plugin {
     const full = this.scope(share).fs.pathOf(path);
     if (full.startsWith(`${vault.configDir}/`)) {
       await this.files!.write(full, data);
+      // Settings fire no vault events: the next sync lists them again and finds it.
+      this.files!.forgetConfigListing();
       return;
     }
     const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
@@ -905,7 +925,7 @@ export default class SelfSyncPlugin extends Plugin {
   async restoreTo(target: Map<string, Entry>, folder: string, expected: Step[], share?: Share): Promise<RestoreOutcome> {
     return this.exclusive('Restoring…', async () => {
       this.say('Syncing recent changes first…');
-      const before = this.outcomeOf(await this.syncHeld(true, false, true), share);
+      const before = this.outcomeOf(await this.syncHeld(true, false, true, 'manual'), share);
       if (!before.result) return { problem: before.problem, done: [], failed: [] };
       const unsent = before.result.errors.filter((e) => !folder || e.path.startsWith(`${folder.replace(/\/+$/, '')}/`));
       if (unsent.length) {
@@ -952,8 +972,8 @@ export default class SelfSyncPlugin extends Plugin {
       const t = this.tracked(share);
       t.restored = new Set([...(t.restored ?? []), ...removed]);
       this.say('Sending the result to storage…');
-      const sent = this.outcomeOf(await this.syncHeld(true, false, true), share);
-      return { done, failed, sent, othersPause: deleteLimitCrossed(done.length - removed.length, removed.length, synced, cfg) !== undefined };
+      const sent = this.outcomeOf(await this.syncHeld(true, false, true, 'manual'), share);
+      return { done, failed, sent, olderPause: deleteLimitCrossed(done.length - removed.length, removed.length, synced, cfg) !== undefined };
     });
   }
 }

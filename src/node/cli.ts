@@ -6,10 +6,10 @@ import { DEFAULT_CONFIG, resolveConfig, type SyncConfig } from '../core/config.t
 import { heartbeatDue, writeHeartbeat } from '../core/devices.ts';
 import { SafetyError, SyncEngine, type SyncResult } from '../core/engine.ts';
 import { vaultKey } from '../core/paths.ts';
+import { plural } from '../core/text.ts';
 import { TooOldError, listCommits, listDeleted, planRestore, tableAt } from '../core/timeline.ts';
 import type { RemoteStore } from '../core/types.ts';
 import { countSteps, deleteLimitCrossed, keepOut, restoreSteps, type Step } from '../plugin/restore.ts';
-import { plural } from '../plugin/status.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
 import type { S3Config } from '../stores/s3.ts';
@@ -37,11 +37,17 @@ const USAGE = `Usage: node src/node/cli.ts <command> [--config=selfsync.json]
   log [--limit=20]       list the times the vault can be restored to, newest first
   restore-at <time> [folder] [--dry-run]
                          bring the vault, or one folder, back to how it was at <time> (ISO 8601,
-                         like 2026-11-10T14:30); syncs first, prints what changes, then changes it
+                         like 2026-11-10T14:30); syncs first, prints what changes, changes it, and
+                         syncs again to send it, no --force needed for the files it removes
   verify [--deep]        check the stored data end to end without changing it; --deep also
                          downloads and checks everything the current files are stored in
   clean                  delete versions older than the retention window from storage
   change-passphrase      re-protect the vault key with SELFSYNC_NEW_PASSPHRASE
+  accept-storage         when sync stops because the history in storage is not the one this device
+                         saw (part of it taken back or replaced), carry on from storage as it is now,
+                         then sync: nothing is deleted, and where files differ both versions are kept.
+                         Right after storage was restored from a backup; wrong if nobody did that on
+                         purpose, as then someone else may have changed what is stored
 
 Secrets come from the environment: SELFSYNC_PASSPHRASE, and for S3
 SELFSYNC_ACCESS_KEY and SELFSYNC_SECRET_KEY, for WebDAV SELFSYNC_WEBDAV_PASSWORD.`;
@@ -78,7 +84,7 @@ const STEP = { add: 'bring back', change: 'change', remove: 'remove' } as const;
 
 /**
  * Brings the vault, or `folder`, back to how it was at `when`, removals first. Syncs first, so edits not yet synced
- * are kept in history and the plan matches the files here. With `dry`, only prints the plan.
+ * are kept in history and the plan matches the files here, and after, to send the result. With `dry`, only prints the plan.
  */
 async function restoreAt(engine: SyncEngine, fs: NodeFS, when: string, folder: string, dry: boolean): Promise<number> {
   const at = Date.parse(when);
@@ -111,12 +117,14 @@ async function restoreAt(engine: SyncEngine, fs: NodeFS, when: string, folder: s
 
   const here = new Map((await fs.list()).map((f) => [vaultKey(f.path), f.path]));
   const done = { add: 0, change: 0, remove: 0 };
+  const removed: string[] = [];
   let failed = 0;
   const run = async (s: Step) => {
     try {
       if (s.kind === 'remove') await fs.remove(here.get(s.path) ?? s.path);
       else await fs.write(here.get(s.path) ?? s.path, await engine.readVersion(s.entry!));
       done[s.kind]++;
+      if (s.kind === 'remove') removed.push(s.path);
     } catch (e) {
       failed++;
       console.error(`failed: ${s.path}: ${e instanceof Error ? e.message : e}`);
@@ -124,15 +132,19 @@ async function restoreAt(engine: SyncEngine, fs: NodeFS, when: string, folder: s
   };
   for (const s of steps.filter((x) => x.kind === 'remove')) await run(s);
   await pool(steps.filter((x) => x.kind !== 'remove'), v.cfg.concurrency, run);
-  console.log(`restored ${scope} as of ${iso(past.commit.time)}: brought back ${done.add}, changed ${done.change}, removed ${done.remove}; run sync to send it to other devices`);
+  console.log(`restored ${scope} as of ${iso(past.commit.time)}: brought back ${done.add}, changed ${done.change}, removed ${done.remove}`);
   const limit = deleteLimitCrossed(done.add + done.change, done.remove, v.st.synced.size, v.cfg);
+  // The removals are deletions the user asked for: they do not count against the guard here, nor on other devices.
+  const r = await engine.sync({ allowDeletes: removed });
+  report(r, 'then synced: ');
   if (limit !== undefined) {
     console.log(
-      `that sync needs --force: it deletes ${done.remove} files from storage, and a plain sync stops before deleting more than ${limit} in case files vanished by mistake; ` +
-        'other devices stop the same way when the deletions reach them, so sync them with --force too',
+      `the ${done.remove} files removed went to storage as deletions you asked for, so no --force was needed, and other devices delete them ` +
+        `when they next sync; one on an older version, or many syncs behind, stops first, as it does before deleting more than ${limit} files ` +
+        'at once in case they vanished by mistake, so sync that one with --force',
     );
   }
-  return failed ? 1 : 0;
+  return failed || r.errors.length ? 1 : 0;
 }
 
 async function main(): Promise<number> {
@@ -270,8 +282,24 @@ async function main(): Promise<number> {
   }
   if (command === 'clean') {
     const r = await engine.gc();
-    console.log(`removed ${r.packsDeleted} objects, ${(r.bytesFreed / 1e6).toFixed(1)} MB`);
+    const mb = (bytes: number) => `${(bytes / 1e6).toFixed(1)} MB`;
+    const deleted = [r.packsDeleted && `${plural(r.packsDeleted, 'pack')} (${mb(r.bytesFreed)})`, r.snapshotsDeleted && plural(r.snapshotsDeleted, 'snapshot')].filter(Boolean);
+    if (deleted.length) console.log(`deleted ${deleted.join(' and ')} that no kept version needs`);
+    if (r.packsCombined) {
+      console.log(
+        `copied the data still in use out of ${plural(r.packsCombined, 'small or mostly unused pack')} into ${plural(r.packsWritten, 'new pack')} (${mb(r.bytesMoved)}); ` +
+          `a later clean deletes the old ones (${mb(r.bytesFreedLater)}) once no kept version reads them`,
+      );
+    }
+    if (!deleted.length && !r.packsCombined) console.log('nothing to clean: no stored version has expired, and no pack is worth combining');
     return 0;
+  }
+  if (command === 'accept-storage') {
+    await engine.acceptStorage();
+    console.log('carrying on from storage as it is now');
+    const r = await engine.sync();
+    report(r);
+    return r.errors.length ? 1 : 0;
   }
   console.log(USAGE);
   return 2;

@@ -3,7 +3,8 @@ import { test } from 'node:test';
 import { WrongPassphraseError } from '../src/core/crypto.ts';
 import { SafetyError, type SyncResult } from '../src/core/engine.ts';
 import { MissingFolderError } from '../src/core/scopedfs.ts';
-import { describeFailure, inShare, keysMissingProblem, missingProblem, plural, resultProblems, staleProblem, statusText, summarize, targetProblems, type Problem } from '../src/plugin/status.ts';
+import { plural } from '../src/core/text.ts';
+import { describeFailure, inShare, keysMissingProblem, missingProblem, resultProblems, staleProblem, statusText, summarize, targetProblems, type Problem } from '../src/plugin/status.ts';
 
 const result = (over: Partial<SyncResult> = {}): SyncResult => ({
   pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0, conflictCopies: [], skipped: 0, tooLarge: [], errors: [], commits: 0, rounds: 1, ...over,
@@ -38,6 +39,33 @@ test('failures are described by what the user can do about them', () => {
   assert.match(describeFailure(new SafetyError(0, 25)).detail, /^This sync would delete 25 files from storage\./);
   assert.deepEqual(kind(new Error('Remote vault uses format 3; this version reads format 2')), ['format', 'critical', null]);
   assert.deepEqual(kind(new Error('something odd')), ['failed', 'critical', 'retry']);
+});
+
+test('a history in storage other than the one this device saw offers to carry on from it; other damage does not', () => {
+  const kind = (message: string) => {
+    const p = describeFailure(new Error(message));
+    return [p.id, p.action ?? null];
+  };
+  for (const message of [
+    'Remote commit 3, the newest this device has seen, is missing: the log was rolled back or tampered with',
+    'Remote commit 3 is not the one this device saw: the log was tampered with or forked',
+    'Remote commit 4 does not follow the commit before it as this device saw it: the log was tampered with or forked',
+  ]) {
+    assert.deepEqual(kind(message), ['history', 'accept-storage'], message);
+  }
+  const p = describeFailure(new Error('Remote commit 3 is not the one this device saw: the log was tampered with or forked'));
+  assert.match(p.detail, /restored from a backup/);
+  assert.match(p.detail, /If nobody did that on purpose, leave sync stopped/);
+  for (const message of [
+    'Remote log has a gap before commit 7',
+    'Commit 7 is listed but cannot be read',
+    'Remote commit 100 is missing, though a snapshot was taken at it',
+    'Remote snapshot 100 was taken at a different commit 100 than storage holds: the log was tampered with or forked',
+    'Remote pack abc is missing',
+    'Remote data failed authentication (x:pack/1): corrupted or tampered with',
+  ]) {
+    assert.deepEqual(kind(message), ['damaged', null], message);
+  }
 });
 
 test('failed, conflicting and oversized files each become one problem, keyed by the files involved', () => {

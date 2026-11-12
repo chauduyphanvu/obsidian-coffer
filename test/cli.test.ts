@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
 import { test, type TestContext } from 'node:test';
@@ -93,7 +93,7 @@ test('cli: deleted lists files deleted on another device, newest first, and narr
   }
 });
 
-test('cli: restore-at brings a folder back exactly, leaves other folders alone, and the next sync carries it to the other device', async () => {
+test('cli: restore-at brings a folder back exactly, leaves other folders alone, and sends it, so the other device gets it at its next sync', async () => {
   const a = setup({ deviceName: 'laptop' });
   const b = setup({ deviceName: 'phone' }, a);
   try {
@@ -124,13 +124,13 @@ test('cli: restore-at brings a folder back exactly, leaves other folders alone, 
     const r = a.run('restore-at', then, 'notes');
     assert.equal(r.status, 0, r.stderr);
     assert.match(r.stdout, /^synced first: sent 0, received 0/);
-    assert.match(r.stdout, /brought back 1, changed 1, removed 1; run sync to send it to other devices/);
+    assert.match(r.stdout, /\nrestored notes\/ as of \S+: brought back 1, changed 1, removed 1\nthen synced: sent 2, received 0, deleted 0 here and 1 remotely, merged 0\n$/);
     assert.doesNotMatch(r.stdout, /--force/);
     const expected = { 'notes/a.md': 'a1\n', 'notes/b.md': 'b1\n', 'notes/same.md': 'same\n', 'other/x.md': 'x2\n' };
     assert.deepEqual(files(a.vault), expected);
     assert.equal(existsSync(join(a.vault, 'notes', 'sub')), false);
 
-    assert.match(a.cli('sync'), /^sent 2, received 0, deleted 0 here and 1 remotely/);
+    assert.match(a.cli('sync'), /^sent 0, received 0, deleted 0 here and 0 remotely/, 'already sent');
     assert.match(a.cli('restore-at', then, 'notes', '--dry-run'), /nothing to do: it already matches/);
     assert.match(b.cli('sync'), /^sent 0, received 2, deleted 1 here/);
     assert.deepEqual(files(b.vault), expected);
@@ -139,8 +139,9 @@ test('cli: restore-at brings a folder back exactly, leaves other folders alone, 
   }
 });
 
-test('cli: restore-at says when the sync after it needs --force, and why', async () => {
+test('cli: restore-at sends the many files it removes without --force, another device on this version deletes them too, and it says older ones stop', async () => {
   const t = setup({ deviceName: 'laptop' });
+  const other = setup({ deviceName: 'phone' }, t);
   try {
     put(t.vault, 'keep.md', 'keep\n');
     t.cli('sync');
@@ -148,15 +149,17 @@ test('cli: restore-at says when the sync after it needs --force, and why', async
     await sleep(20);
     for (let i = 0; i < 12; i++) put(t.vault, `drafts/${i}.md`, `${i}\n`);
     t.cli('sync');
+    other.cli('sync');
     const r = t.run('restore-at', then);
     assert.equal(r.status, 0, r.stderr);
-    assert.match(r.stdout, /brought back 0, changed 0, removed 12; run sync/);
-    assert.match(r.stdout, /that sync needs --force: it deletes 12 files from storage, and a plain sync stops before deleting more than 10/);
-    const plain = t.run('sync');
-    assert.equal(plain.status, 1);
-    assert.match(plain.stderr, /Refusing to sync/);
-    assert.match(t.cli('sync', '--force'), /deleted 0 here and 12 remotely/);
+    assert.match(r.stdout, /brought back 0, changed 0, removed 12\nthen synced: sent 0, received 0, deleted 0 here and 12 remotely/);
+    assert.match(r.stdout, /the 12 files removed went to storage as deletions you asked for, so no --force was needed, and other devices delete them when they next sync; one on an older version, or many syncs behind, stops first, as it does before deleting more than 10 files at once/);
+    assert.match(t.cli('sync'), /^sent 0, received 0, deleted 0 here and 0 remotely/);
+    const there = other.run('sync');
+    assert.equal(there.status, 0, there.stderr);
+    assert.match(there.stdout, /^sent 0, received 0, deleted 12 here/);
     assert.deepEqual(files(t.vault), { 'keep.md': 'keep\n' });
+    assert.deepEqual(files(other.vault), { 'keep.md': 'keep\n' });
   } finally {
     t.done();
   }
@@ -174,6 +177,46 @@ test('cli: restore-at needs a time it can read, and one not before the earliest 
     assert.equal(r.status, 1);
     assert.match(r.stderr, /too far back; the earliest time that can be restored is \d{4}-\d\d-\d\dT/);
     assert.deepEqual(files(t.vault), { 'a.md': 'a\n' });
+  } finally {
+    t.done();
+  }
+});
+
+test('cli: accept-storage carries on after storage was put back to an older copy, deleting nothing and keeping both versions', () => {
+  const t = setup({ deviceName: 'laptop' });
+  try {
+    put(t.vault, 'a.md', 'one\n');
+    t.cli('sync');
+    const remote = join(t.dir, 'remote');
+    cpSync(remote, join(t.dir, 'backup'), { recursive: true });
+    put(t.vault, 'a.md', 'one\ntwo\n');
+    put(t.vault, 'b.md', 'b\n');
+    t.cli('sync');
+    rmSync(remote, { recursive: true });
+    cpSync(join(t.dir, 'backup'), remote, { recursive: true });
+
+    const stopped = t.run('sync');
+    assert.equal(stopped.status, 1);
+    assert.match(stopped.stderr, /the newest this device has seen, is missing/);
+    const r = t.run('accept-storage');
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /^carrying on from storage as it is now\nsent \d+, received \d+, deleted 0 here and 0 remotely, merged 0\nboth versions kept: a \(conflict/);
+    const copy = Object.keys(files(t.vault)).find((p) => p.includes('conflict'))!;
+    assert.deepEqual(files(t.vault), { 'a.md': 'one\n', [copy]: 'one\ntwo\n', 'b.md': 'b\n' });
+    assert.match(t.cli('sync'), /^sent 0, received 0, deleted 0 here and 0 remotely/);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli: clean says what it did, including when there was nothing to do', () => {
+  const t = setup({});
+  try {
+    put(t.vault, 'a.md', 'a\n');
+    t.cli('sync');
+    const r = t.run('clean');
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stdout, 'nothing to clean: no stored version has expired, and no pack is worth combining\n');
   } finally {
     t.done();
   }

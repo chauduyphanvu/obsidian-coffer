@@ -50,10 +50,15 @@ export class ObsidianFS implements FolderFS {
     this.configFiles = undefined;
   }
 
+  /** The next listing walks the settings folder again. Its files fire no vault events, so until then changes there go unseen. */
+  configListingDue(): boolean {
+    return this.includeConfig && (!this.configFiles || Date.now() - this.configFiles.at > CONFIG_RESCAN_MS);
+  }
+
   async list(): Promise<LocalFile[]> {
     const out: LocalFile[] = this.app.vault.getFiles().map((f) => ({ path: f.path, size: f.stat.size, mtime: f.stat.mtime }));
     if (!this.includeConfig) return out;
-    if (!this.configFiles || Date.now() - this.configFiles.at > CONFIG_RESCAN_MS) {
+    if (this.configListingDue()) {
       const files: LocalFile[] = [];
       const adapter = this.app.vault.adapter;
       const walk = async (dir: string) => {
@@ -69,7 +74,7 @@ export class ObsidianFS implements FolderFS {
       await walk(this.app.vault.configDir);
       this.configFiles = { at: Date.now(), files };
     }
-    return out.concat(this.configFiles.files);
+    return out.concat(this.configFiles!.files);
   }
 
   async read(path: string): Promise<Uint8Array> {

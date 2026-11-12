@@ -20,16 +20,6 @@ async function load(box: HTMLElement, plugin: SelfSyncPlugin): Promise<void> {
     note('Set up sync to see the devices that share this vault.');
     return;
   }
-  // Reading the log while a sync is applying it could apply the same commit twice.
-  if (plugin.running) {
-    note('A sync is running. The devices appear when it finishes.');
-    const stop = plugin.onChange(() => {
-      if (plugin.running) return;
-      stop();
-      if (box.isConnected) void load(box, plugin);
-    });
-    return;
-  }
   note('Loading devices…');
   try {
     const view = await plugin.getEngine().view();

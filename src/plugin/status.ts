@@ -6,8 +6,7 @@ import { lineDiff, type DiffRegion } from '../core/merge.ts';
 import { ext } from '../core/paths.ts';
 import { DAY } from '../core/retention.ts';
 import { MissingFolderError } from '../core/scopedfs.ts';
-
-export const plural = (n: number, one: string, many = `${one}s`) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
+import { plural } from '../core/text.ts';
 
 export function summarize(r: SyncResult): string {
   const parts = [
@@ -21,7 +20,7 @@ export function summarize(r: SyncResult): string {
   return parts.length ? parts.join(', ') : 'everything is up to date';
 }
 
-export type Action = 'settings' | 'passphrase' | 'resolve-deletes' | 'files' | 'retry' | 'missing-folder';
+export type Action = 'settings' | 'passphrase' | 'resolve-deletes' | 'files' | 'retry' | 'missing-folder' | 'accept-storage';
 
 export interface Problem {
   /** A notice is shown once per id, so the same problem does not nag on every sync. */
@@ -131,6 +130,19 @@ export function describeFailure(e: unknown): Problem {
   }
   if (/vault uses format/i.test(message)) {
     return { id: 'format', severity: 'critical', title: 'Update Self Sync on this device', detail: `Another device uses a newer version. (${message})` };
+  }
+  // The log in storage was cut back past what this device saw, or holds other commits where it saw its own.
+  if (/does not follow the commit before it as this device saw it|the newest this device has seen, is missing|is not the one this device saw/.test(message)) {
+    return {
+      id: 'history',
+      severity: 'critical',
+      title: 'Storage was rolled back or replaced',
+      detail:
+        'Sync is stopped. What storage holds now is not what this device last saw there: part of the sync history was taken back or replaced. ' +
+        'That is expected right after storage was restored from a backup or an older copy, and then this device can carry on from storage as it is. ' +
+        `If nobody did that on purpose, leave sync stopped and find out who can reach your storage. The files on this device are untouched. (${message})`,
+      action: 'accept-storage',
+    };
   }
   if (/failed authentication|corrupted|tampered|is missing|cannot be read|gap before|inconsistent|wrong size|vanished/i.test(message)) {
     return {
