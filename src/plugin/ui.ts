@@ -37,29 +37,29 @@ export interface FieldOptions {
 
 /** A label above a full-width input. Keys and addresses must not be auto-corrected or capitalized. */
 export function field(parent: HTMLElement, label: string, opts: FieldOptions, onInput: (value: string) => void): HTMLInputElement | HTMLTextAreaElement {
-  const wrap = parent.createDiv({ cls: 'self-sync-field' });
-  const id = `self-sync-${Math.random().toString(36).slice(2, 8)}`;
+  const wrap = parent.createDiv({ cls: 'coffer-field' });
+  const id = `coffer-${Math.random().toString(36).slice(2, 8)}`;
   wrap.createEl('label', { text: label, attr: { for: id } });
   const input = opts.multiline ? wrap.createEl('textarea', { attr: { id, rows: 4 } }) : wrap.createEl('input', { attr: { id, type: opts.password ? 'password' : 'text' } });
   input.setAttrs({ autocapitalize: 'off', autocorrect: 'off', autocomplete: opts.password ? 'new-password' : 'off', spellcheck: 'false' });
   input.placeholder = opts.placeholder ?? '';
   input.value = opts.value ?? '';
   input.addEventListener('input', () => onInput(input.value));
-  if (opts.hint) wrap.createDiv({ cls: 'self-sync-hint', text: opts.hint });
+  if (opts.hint) wrap.createDiv({ cls: 'coffer-hint', text: opts.hint });
   return input;
 }
 
 /** A large tappable option with a title and one line of explanation. */
 export function choice(parent: HTMLElement, title: string, hint: string, onClick: () => void): HTMLButtonElement {
-  const b = parent.createEl('button', { cls: 'self-sync-choice' });
-  b.createDiv({ cls: 'self-sync-choice-title', text: title });
-  b.createDiv({ cls: 'self-sync-choice-hint', text: hint });
+  const b = parent.createEl('button', { cls: 'coffer-choice' });
+  b.createDiv({ cls: 'coffer-choice-title', text: title });
+  b.createDiv({ cls: 'coffer-choice-hint', text: hint });
   b.addEventListener('click', onClick);
   return b;
 }
 
 export function buttonRow(parent: HTMLElement): HTMLElement {
-  return parent.createDiv({ cls: 'self-sync-buttons' });
+  return parent.createDiv({ cls: 'coffer-buttons' });
 }
 
 export function button(parent: HTMLElement, text: string, onClick: () => unknown, kind: 'cta' | 'warning' | 'plain' = 'plain'): ButtonComponent {
@@ -73,7 +73,7 @@ export function button(parent: HTMLElement, text: string, onClick: () => unknown
 export function openLink(parent: HTMLElement, app: App, label: string, path: string, before: () => void): void {
   const file = lookup(app, path);
   if (!(file instanceof TFile)) return;
-  const a = parent.createEl('a', { cls: 'self-sync-open', text: label, href: '#' });
+  const a = parent.createEl('a', { cls: 'coffer-open', text: label, href: '#' });
   a.addEventListener('click', (e) => {
     e.preventDefault();
     before();
@@ -81,13 +81,13 @@ export function openLink(parent: HTMLElement, app: App, label: string, path: str
   });
 }
 
-export function message(parent: HTMLElement, text: string, cls = 'self-sync-error'): void {
+export function message(parent: HTMLElement, text: string, cls = 'coffer-error'): void {
   if (text) parent.createDiv({ cls, text });
 }
 
 /** A coloured dot and one line, the same on every screen that shows sync status. Returns the line's text, to update in place. */
 export function statusLine(parent: HTMLElement, text: string, tone: string): HTMLElement {
-  const line = parent.createDiv({ cls: `self-sync-status-line is-${tone}` });
-  line.createSpan({ cls: 'self-sync-dot' });
+  const line = parent.createDiv({ cls: `coffer-status-line is-${tone}` });
+  line.createSpan({ cls: 'coffer-dot' });
   return line.createSpan({ text });
 }

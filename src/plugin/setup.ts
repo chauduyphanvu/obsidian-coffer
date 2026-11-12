@@ -6,7 +6,7 @@ import { Repo } from '../core/repo.ts';
 import { errorText } from '../core/text.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
-import type SelfSyncPlugin from './main.ts';
+import type CofferPlugin from './main.ts';
 import { obsidianHttp } from './obsidianfs.ts';
 import { PROVIDERS, codeKind, folderFor, remoteSpec, secretName, setupCodeFrom, storageSettings, type Provider, type Settings, type Storage, type StorageForm } from './settings.ts';
 import { connectError, summarize } from './status.ts';
@@ -15,7 +15,7 @@ import { button, buttonRow, choice, field, message } from './ui.ts';
 type Step = 'start' | 'provider' | 'storage' | 'passphrase' | 'join' | 'syncing' | 'done';
 
 /** What setup stores, the same secrets a setup code fills in; `secretName` makes each name this vault's own. */
-export const IDS = { access: 'self-sync-access-key', secret: 'self-sync-secret-key', password: 'self-sync-webdav-password', passphrase: 'self-sync-passphrase' };
+export const IDS = { access: 'coffer-access-key', secret: 'coffer-secret-key', password: 'coffer-webdav-password', passphrase: 'coffer-passphrase' };
 
 export const MIN_PASSPHRASE = 8;
 
@@ -60,7 +60,7 @@ export function storageFields(c: HTMLElement, provider: Provider, f: StorageForm
   );
   field(c, 'Folder in bucket', { value: f.prefix, hint: forShare ? 'Filled in for you. Everyone who joins uses the same folder.' : 'Lets one bucket hold several vaults. Filled in for you.' }, set('prefix'));
   if (provider === 's3') {
-    const row = c.createEl('label', { cls: 'self-sync-check' });
+    const row = c.createEl('label', { cls: 'coffer-check' });
     const box = row.createEl('input', { attr: { type: 'checkbox' } });
     box.checked = f.pathStyle;
     box.addEventListener('change', () => (f.pathStyle = box.checked));
@@ -91,7 +91,7 @@ export async function tryStorage(base: Storage, storage: Partial<Storage>, k: Ke
 }
 
 export class SetupModal extends Modal {
-  private plugin: SelfSyncPlugin;
+  private plugin: CofferPlugin;
   private step: Step;
   private provider: Provider = 'r2';
   private form: StorageForm;
@@ -107,7 +107,7 @@ export class SetupModal extends Modal {
   private result?: SyncResult;
   private unsubscribe?: () => void;
 
-  constructor(app: App, plugin: SelfSyncPlugin, start: 'start' | 'new' | 'join', code = '') {
+  constructor(app: App, plugin: CofferPlugin, start: 'start' | 'new' | 'join', code = '') {
     super(app);
     this.plugin = plugin;
     this.step = start === 'new' ? 'provider' : start;
@@ -116,7 +116,7 @@ export class SetupModal extends Modal {
   }
 
   onOpen(): void {
-    this.modalEl.addClass('self-sync-modal');
+    this.modalEl.addClass('coffer-modal');
     this.unsubscribe = this.plugin.onChange(() => {
       if (this.step === 'syncing') this.render();
     });
@@ -150,7 +150,7 @@ export class SetupModal extends Modal {
   }
 
   private intro(text: string): void {
-    this.contentEl.createEl('p', { cls: 'self-sync-intro', text });
+    this.contentEl.createEl('p', { cls: 'coffer-intro', text });
   }
 
   private startStep(): void {
@@ -258,9 +258,9 @@ export class SetupModal extends Modal {
   private joinStep(): void {
     const c = this.contentEl;
     this.setTitle('Join your synced vault');
-    this.intro('On a device that already syncs, open Settings → Self Sync and tap "Copy setup link". Paste it here, or open the link on this device.');
-    const code = field(c, 'Setup link', { value: this.code, multiline: true, placeholder: 'obsidian://self-sync?setup=…' }, (v) => (this.code = v));
-    code.addClass('self-sync-code');
+    this.intro('On a device that already syncs, open Settings → Coffer and tap "Copy setup link". Paste it here, or open the link on this device.');
+    const code = field(c, 'Setup link', { value: this.code, multiline: true, placeholder: 'obsidian://coffer?setup=…' }, (v) => (this.code = v));
+    code.addClass('coffer-code');
     const paste = buttonRow(c);
     button(paste, 'Paste', async () => {
       try {
@@ -284,7 +284,7 @@ export class SetupModal extends Modal {
       return;
     }
     if (codeKind(setupCodeFrom(this.code)) === 'share') {
-      this.error = 'This is an invite link to a shared folder, not a setup link. Set up sync here first, then add it in Settings → Self Sync → Shared folders.';
+      this.error = 'This is an invite link to a shared folder, not a setup link. Set up sync here first, then add it in Settings → Coffer → Shared folders.';
       this.render();
       return;
     }
@@ -319,7 +319,7 @@ export class SetupModal extends Modal {
 
   private syncingStep(): void {
     this.setTitle('Syncing…');
-    this.contentEl.createEl('p', { cls: 'self-sync-progress', text: this.plugin.progress || 'Connecting to the storage…' });
+    this.contentEl.createEl('p', { cls: 'coffer-progress', text: this.plugin.progress || 'Connecting to the storage…' });
     this.intro('The first sync of a large vault can take a while. You can close this window; syncing carries on.');
   }
 
@@ -328,7 +328,7 @@ export class SetupModal extends Modal {
     this.setTitle('All set');
     this.intro(this.result ? `This vault is in sync: ${summarize(this.result)}.` : 'This vault is in sync.');
     if (!this.joined) {
-      this.intro('Next, add your other devices: install Self Sync there, choose "I already sync another device", and paste this link. It is encrypted with your passphrase.');
+      this.intro('Next, add your other devices: install Coffer there, choose "I already sync another device", and paste this link. It is encrypted with your passphrase.');
       button(buttonRow(c), 'Copy setup link', async () => {
         await navigator.clipboard.writeText(await this.plugin.setupLink());
         new Notice('Setup link copied.');

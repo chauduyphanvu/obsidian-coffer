@@ -62,7 +62,7 @@ class ObsidianLikeFS extends VaultFS {
   }
 }
 
-const PLUGIN_DIR = '.obsidian/plugins/self-sync';
+const PLUGIN_DIR = '.obsidian/plugins/coffer';
 
 /** One person's device: a vault syncing with its own storage, and the shared folders added to it. */
 class Person {

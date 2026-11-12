@@ -6,7 +6,7 @@ import { WrongPassphraseError } from '../core/crypto.ts';
 import { Repo } from '../core/repo.ts';
 import { errorText } from '../core/text.ts';
 import { openRemote } from '../stores/open.ts';
-import type SelfSyncPlugin from './main.ts';
+import type CofferPlugin from './main.ts';
 import { lookup, obsidianHttp } from './obsidianfs.ts';
 import {
   PROVIDERS,
@@ -45,9 +45,9 @@ function filesIn(app: App, path: string): number | undefined {
 }
 
 /** Adds the Shared folders block. Returns a function that redraws it, for when the status changes. */
-export function renderShares(containerEl: HTMLElement, plugin: SelfSyncPlugin): () => void {
+export function renderShares(containerEl: HTMLElement, plugin: CofferPlugin): () => void {
   new Setting(containerEl).setName('Shared folders').setHeading();
-  const box = containerEl.createDiv({ cls: 'self-sync-shares' });
+  const box = containerEl.createDiv({ cls: 'coffer-shares' });
   let shown: string | undefined;
   const draw = () => {
     const shares = plugin.settings.shares;
@@ -60,7 +60,7 @@ export function renderShares(containerEl: HTMLElement, plugin: SelfSyncPlugin): 
       message(
         box,
         'Share a folder with another person, or keep one folder on different storage. Each shared folder has its own storage and passphrase, and nothing else in this vault can be seen through it.',
-        'self-sync-hint',
+        'coffer-hint',
       );
     }
     for (const share of shares) shareRow(box, plugin, share);
@@ -70,23 +70,23 @@ export function renderShares(containerEl: HTMLElement, plugin: SelfSyncPlugin): 
   return draw;
 }
 
-function shareRow(box: HTMLElement, plugin: SelfSyncPlugin, share: Share): void {
+function shareRow(box: HTMLElement, plugin: CofferPlugin, share: Share): void {
   const { text, tone } = plugin.shareStatus(share);
-  const el = box.createDiv({ cls: `self-sync-share is-${tone}` });
-  const body = el.createDiv({ cls: 'self-sync-share-text' });
-  body.createDiv({ cls: 'self-sync-share-name', text: share.folder });
-  const status = body.createDiv({ cls: 'self-sync-share-status' });
-  status.createSpan({ cls: 'self-sync-share-dot' });
+  const el = box.createDiv({ cls: `coffer-share is-${tone}` });
+  const body = el.createDiv({ cls: 'coffer-share-text' });
+  body.createDiv({ cls: 'coffer-share-name', text: share.folder });
+  const status = body.createDiv({ cls: 'coffer-share-status' });
+  status.createSpan({ cls: 'coffer-share-dot' });
   status.createSpan({ text });
-  body.createDiv({ cls: 'self-sync-share-meta', text: describeStorage(share) });
-  const actions = el.createDiv({ cls: 'self-sync-share-actions' });
+  body.createDiv({ cls: 'coffer-share-meta', text: describeStorage(share) });
+  const actions = el.createDiv({ cls: 'coffer-share-actions' });
   if (share.missing) button(actions, 'Download again', () => downloadAgain(plugin, share), 'cta');
   else button(actions, 'Copy invite link', () => new InviteModal(plugin.app, plugin, share).open());
   button(actions, 'Stop sharing', () => new StopSharingModal(plugin.app, plugin, share).open());
 }
 
 /** Brings a missing shared folder back, saying how it went. */
-export async function downloadAgain(plugin: SelfSyncPlugin, share: Share): Promise<void> {
+export async function downloadAgain(plugin: CofferPlugin, share: Share): Promise<void> {
   try {
     const out = await plugin.downloadAgain(share);
     if (out.problem) new Notice(plugin.fragment(`“${share.folder}”: ${out.problem.title}`, out.problem.detail), 15_000);
@@ -97,7 +97,7 @@ export async function downloadAgain(plugin: SelfSyncPlugin, share: Share): Promi
 }
 
 /** Opens `then` for the vault, or first asks which, when the vault has shared folders that sync here. */
-export function pickTarget(plugin: SelfSyncPlugin, title: string, then: (share?: Share) => void): void {
+export function pickTarget(plugin: CofferPlugin, title: string, then: (share?: Share) => void): void {
   const targets = plugin.targets();
   if (targets.length === 1) then(undefined);
   else new TargetSuggest(plugin.app, title, targets.map((share) => ({ share })), then).open();
@@ -121,7 +121,7 @@ class TargetSuggest extends SuggestModal<{ share?: Share }> {
 
   renderSuggestion(t: { share?: Share }, el: HTMLElement): void {
     el.createDiv({ text: t.share ? `Shared folder “${t.share.folder}”` : 'This vault' });
-    el.createDiv({ cls: 'self-sync-hint', text: t.share ? describeStorage(t.share) : 'Everything except its shared folders' });
+    el.createDiv({ cls: 'coffer-hint', text: t.share ? describeStorage(t.share) : 'Everything except its shared folders' });
   }
 
   onChooseSuggestion(t: { share?: Share }): void {
@@ -131,19 +131,19 @@ class TargetSuggest extends SuggestModal<{ share?: Share }> {
 
 /** The invite link for one shared folder, with what to tell the person it goes to. */
 class InviteModal extends Modal {
-  private plugin: SelfSyncPlugin;
+  private plugin: CofferPlugin;
   private share: Share;
   private link = '';
   private error = '';
 
-  constructor(app: App, plugin: SelfSyncPlugin, share: Share) {
+  constructor(app: App, plugin: CofferPlugin, share: Share) {
     super(app);
     this.plugin = plugin;
     this.share = share;
   }
 
   onOpen(): void {
-    this.modalEl.addClass('self-sync-modal', 'self-sync-share-modal');
+    this.modalEl.addClass('coffer-modal', 'coffer-share-modal');
     this.setTitle(`Invite to “${this.share.folder}”`);
     this.render();
     // Made before the tap, so the copy happens in the tap itself, as phones require.
@@ -161,9 +161,9 @@ class InviteModal extends Modal {
     const c = this.contentEl;
     c.empty();
     c.createEl('p', {
-      cls: 'self-sync-intro',
+      cls: 'coffer-intro',
       text:
-        'Send this link to whoever should share this folder; they choose "Join with an invite link" in Self Sync settings. ' +
+        'Send this link to whoever should share this folder; they choose "Join with an invite link" in Coffer settings. ' +
         'They also need the passphrase. Tell it to them another way, not in the same message: the link is encrypted with it.',
     });
     inviteWarning(c, this.plugin, this.share);
@@ -184,22 +184,22 @@ class InviteModal extends Modal {
 }
 
 /** Shown wherever an invite link is made for a shared folder that holds this vault's own storage keys. */
-function inviteWarning(c: HTMLElement, plugin: SelfSyncPlugin, share: Share): void {
+function inviteWarning(c: HTMLElement, plugin: CofferPlugin, share: Share): void {
   if (!sameKeys(share, plugin.settings, (n) => plugin.secret(n))) return;
   message(
     c,
     'This shared folder uses the same storage and keys as this vault, and the link carries those keys. Whoever gets it can not read the rest of your vault, ' +
       'which is encrypted with a different passphrase, but they could delete or overwrite it in storage. That is fine for your own devices. ' +
       'To share with another person, stop sharing this folder and share it again on storage whose keys reach only the shared folder.',
-    'self-sync-note',
+    'coffer-note',
   );
 }
 
 class StopSharingModal extends Modal {
-  private plugin: SelfSyncPlugin;
+  private plugin: CofferPlugin;
   private share: Share;
 
-  constructor(app: App, plugin: SelfSyncPlugin, share: Share) {
+  constructor(app: App, plugin: CofferPlugin, share: Share) {
     super(app);
     this.plugin = plugin;
     this.share = share;
@@ -208,13 +208,13 @@ class StopSharingModal extends Modal {
   onOpen(): void {
     const c = this.contentEl;
     const s = this.share;
-    this.modalEl.addClass('self-sync-modal', 'self-sync-share-modal');
+    this.modalEl.addClass('coffer-modal', 'coffer-share-modal');
     this.setTitle(`Stop sharing “${s.folder}” on this device?`);
-    if (!s.missing) c.createEl('p', { cls: 'self-sync-intro', text: `The files stay in “${s.folder}” and from now on sync with the rest of this vault, to your own storage.` });
+    if (!s.missing) c.createEl('p', { cls: 'coffer-intro', text: `The files stay in “${s.folder}” and from now on sync with the rest of this vault, to your own storage.` });
     const note = rejoinNote(s);
-    if (note) c.createEl('p', { cls: 'self-sync-intro', text: note });
+    if (note) c.createEl('p', { cls: 'coffer-intro', text: note });
     c.createEl('p', {
-      cls: 'self-sync-intro',
+      cls: 'coffer-intro',
       text: 'Nothing is deleted from the shared storage, and the others who share this folder are not affected. To join again later, you need the invite link and the passphrase.',
     });
     const row = buttonRow(c);
@@ -236,7 +236,7 @@ class StopSharingModal extends Modal {
 }
 
 /** Asks before stopping a shared folder, from anywhere that offers it. */
-export function confirmStopSharing(plugin: SelfSyncPlugin, share: Share): void {
+export function confirmStopSharing(plugin: CofferPlugin, share: Share): void {
   new StopSharingModal(plugin.app, plugin, share).open();
 }
 
@@ -247,7 +247,7 @@ type Step = 'start' | 'folder' | 'where' | 'provider' | 'storage' | 'passphrase'
  * pick where it is stored, choose its passphrase), or join one with an invite link and pick where it goes here.
  */
 export class ShareModal extends Modal {
-  private plugin: SelfSyncPlugin;
+  private plugin: CofferPlugin;
   private step: Step;
   private joining: boolean;
   private folder = '';
@@ -268,7 +268,7 @@ export class ShareModal extends Modal {
   private busy = false;
   private unsubscribe?: () => void;
 
-  constructor(app: App, plugin: SelfSyncPlugin, start: 'start' | 'join', code = '') {
+  constructor(app: App, plugin: CofferPlugin, start: 'start' | 'join', code = '') {
     super(app);
     this.plugin = plugin;
     this.step = start;
@@ -277,7 +277,7 @@ export class ShareModal extends Modal {
   }
 
   onOpen(): void {
-    this.modalEl.addClass('self-sync-modal', 'self-sync-share-modal');
+    this.modalEl.addClass('coffer-modal', 'coffer-share-modal');
     this.unsubscribe = this.plugin.onChange(() => {
       if (this.step === 'syncing') this.render();
     });
@@ -321,12 +321,12 @@ export class ShareModal extends Modal {
   }
 
   private intro(text: string): void {
-    this.contentEl.createEl('p', { cls: 'self-sync-intro', text });
+    this.contentEl.createEl('p', { cls: 'coffer-intro', text });
   }
 
   private notSetUp(): void {
     this.setTitle('Set up sync first');
-    this.intro('A shared folder lives inside a synced vault. Set up sync for this vault, then add the shared folder in Settings → Self Sync → Shared folders.');
+    this.intro('A shared folder lives inside a synced vault. Set up sync for this vault, then add the shared folder in Settings → Coffer → Shared folders.');
     button(buttonRow(this.contentEl), 'Close', () => this.close(), 'cta');
   }
 
@@ -356,7 +356,7 @@ export class ShareModal extends Modal {
       const folder = normalFolder(this.folder);
       if (!folder) return;
       const problem = this.problem(folder);
-      if (problem) return message(info, problem, 'self-sync-hint');
+      if (problem) return message(info, problem, 'coffer-hint');
       const n = filesIn(this.app, folder);
       const text =
         n === undefined
@@ -367,7 +367,7 @@ export class ShareModal extends Modal {
               ? `“${folder}” already has ${n === 1 ? 'a file' : `${n.toLocaleString()} files`}. They are added to the shared folder, so everyone who shares it sees them; a file with the same name is compared, and both are kept when they differ. Nothing is deleted.`
               : `Its ${n === 1 ? 'file is' : `${n.toLocaleString()} files are`} sent to the shared storage, where everyone who joins can see ${n === 1 ? 'it' : 'them'}. ` +
                 'Your other devices keep their copy in this vault until you add the shared folder there too.';
-      message(info, text, 'self-sync-note');
+      message(info, text, 'coffer-note');
     };
     const input = field(c, 'Folder', { value: this.folder, placeholder: 'Shared', hint: 'An existing folder, or a new one to make.' }, (v) => {
       this.folder = v;
@@ -418,7 +418,7 @@ export class ShareModal extends Modal {
       this.sameStorage = false;
       this.go('provider');
     }).disabled = this.busy;
-    if (this.busy) this.contentEl.createEl('p', { cls: 'self-sync-progress', text: 'Checking the storage…' });
+    if (this.busy) this.contentEl.createEl('p', { cls: 'coffer-progress', text: 'Checking the storage…' });
     message(this.contentEl, this.error);
     button(buttonRow(this.contentEl), 'Back', () => this.go('folder')).setDisabled(this.busy);
   }
@@ -546,8 +546,8 @@ export class ShareModal extends Modal {
     const c = this.contentEl;
     this.setTitle('Join a shared folder');
     this.intro('Paste the invite link you were sent, or open it on this device. Then enter the shared folder\'s passphrase, which should reach you separately.');
-    const code = field(c, 'Invite link', { value: this.code, multiline: true, placeholder: 'obsidian://self-sync?share=…' }, (v) => (this.code = v));
-    code.addClass('self-sync-code');
+    const code = field(c, 'Invite link', { value: this.code, multiline: true, placeholder: 'obsidian://coffer?share=…' }, (v) => (this.code = v));
+    code.addClass('coffer-code');
     button(buttonRow(c), 'Paste', async () => {
       try {
         this.code = await navigator.clipboard.readText();
@@ -621,7 +621,7 @@ export class ShareModal extends Modal {
 
   private syncingStep(): void {
     this.setTitle('Syncing…');
-    this.contentEl.createEl('p', { cls: 'self-sync-progress', text: this.plugin.progress || 'Connecting to the storage…' });
+    this.contentEl.createEl('p', { cls: 'coffer-progress', text: this.plugin.progress || 'Connecting to the storage…' });
     this.intro('The first sync of a large folder can take a while. You can close this window; syncing carries on.');
   }
 
@@ -633,7 +633,7 @@ export class ShareModal extends Modal {
     if (p) message(c, `${p.title}. ${p.detail}`);
     else this.intro(`“${share.folder}” is shared${this.outcome?.summary ? `: ${this.outcome.summary}` : ''}.`);
     if (!this.joining) {
-      this.intro('Next, send an invite link to whoever should share it, and tell them the passphrase another way. On your own devices, use the same link in Settings → Self Sync → Shared folders.');
+      this.intro('Next, send an invite link to whoever should share it, and tell them the passphrase another way. On your own devices, use the same link in Settings → Coffer → Shared folders.');
       inviteWarning(c, this.plugin, share);
       button(buttonRow(c), 'Copy invite link', () => new InviteModal(this.app, this.plugin, share).open());
     }

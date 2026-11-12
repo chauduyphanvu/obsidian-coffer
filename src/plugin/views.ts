@@ -1,7 +1,7 @@
 import { Modal, Notice, PluginSettingTab, Setting, type App } from 'obsidian';
 import { conflictOriginal } from '../core/paths.ts';
 import { errorText } from '../core/text.ts';
-import type SelfSyncPlugin from './main.ts';
+import type CofferPlugin from './main.ts';
 import { resolveConflict } from './resolve.ts';
 import { describeStorage, hasStorageAddress, parseNumberSetting, type Settings, type Share } from './settings.ts';
 import { SetupModal } from './setup.ts';
@@ -13,11 +13,11 @@ import { button, buttonRow, field, message, openLink, statusLine } from './ui.ts
 type SecretKey = 'accessKeySecret' | 'secretKeySecret' | 'passphraseSecret' | 'webdavPasswordSecret';
 
 export class SettingsTab extends PluginSettingTab {
-  private plugin: SelfSyncPlugin;
+  private plugin: CofferPlugin;
   private unsubscribe?: () => void;
   private openSections = new Set<string>();
 
-  constructor(app: App, plugin: SelfSyncPlugin) {
+  constructor(app: App, plugin: CofferPlugin) {
     super(app, plugin);
     this.plugin = plugin;
   }
@@ -34,18 +34,18 @@ export class SettingsTab extends PluginSettingTab {
     const save = () => void plugin.saveSettings();
     this.hide();
     containerEl.empty();
-    containerEl.addClass('self-sync-settings');
+    containerEl.addClass('coffer-settings');
 
-    const card = containerEl.createDiv({ cls: 'self-sync-card' });
+    const card = containerEl.createDiv({ cls: 'coffer-card' });
     const renderCard = () => {
       card.empty();
       const configured = plugin.configured();
       const { text, tone } = plugin.statusLine();
       statusLine(card, text, tone);
-      if (configured) card.createDiv({ cls: 'self-sync-sub', text: describeStorage(s) });
+      if (configured) card.createDiv({ cls: 'coffer-sub', text: describeStorage(s) });
       if (!configured) {
         card.createEl('p', {
-          cls: 'self-sync-intro',
+          cls: 'coffer-intro',
           text: 'Sync this vault across your devices through storage you own. Files are encrypted on this device before they leave it.',
         });
         const setup = buttonRow(card);
@@ -69,12 +69,12 @@ export class SettingsTab extends PluginSettingTab {
     });
 
     const section = (id: string, title: string, summary = '') => {
-      const d = containerEl.createEl('details', { cls: 'self-sync-section' });
+      const d = containerEl.createEl('details', { cls: 'coffer-section' });
       d.open = this.openSections.has(id);
       d.addEventListener('toggle', () => (d.open ? this.openSections.add(id) : this.openSections.delete(id)));
       const sum = d.createEl('summary');
-      sum.createSpan({ cls: 'self-sync-section-title', text: title });
-      if (summary) sum.createSpan({ cls: 'self-sync-section-summary', text: summary });
+      sum.createSpan({ cls: 'coffer-section-title', text: title });
+      if (summary) sum.createSpan({ cls: 'coffer-section-summary', text: summary });
       return d;
     };
     const text = (el: HTMLElement, name: string, desc: string, key: 'endpoint' | 'region' | 'bucket' | 'prefix' | 'deviceName' | 'webdavUrl' | 'webdavUser', placeholder = '') =>
@@ -114,7 +114,7 @@ export class SettingsTab extends PluginSettingTab {
     if (plugin.configured()) {
       new Setting(containerEl)
         .setName('Add another device')
-        .setDesc('Install Self Sync there, choose "I already sync another device", and paste this link. It is encrypted with your passphrase.')
+        .setDesc('Install Coffer there, choose "I already sync another device", and paste this link. It is encrypted with your passphrase.')
         .addButton((b) =>
           b.setButtonText('Copy setup link').onClick(async () => {
             try {
@@ -147,17 +147,17 @@ export class SettingsTab extends PluginSettingTab {
     if (s.storageType === 'webdav') {
       text(storage, 'Folder address', 'Created if missing.', 'webdavUrl', 'https://cloud.example.com/remote.php/dav/files/me/obsidian');
       text(storage, 'User name', '', 'webdavUser');
-      secret(storage, 'Password', '', 'webdavPasswordSecret', 'self-sync-webdav-password');
+      secret(storage, 'Password', '', 'webdavPasswordSecret', 'coffer-webdav-password');
     } else {
       text(storage, 'Endpoint', '', 'endpoint', 'https://<account>.r2.cloudflarestorage.com');
       text(storage, 'Region', '"auto" for Cloudflare R2.', 'region', 'auto');
       text(storage, 'Bucket', '', 'bucket');
       text(storage, 'Folder in bucket', 'Every device syncing this vault must use the same folder.', 'prefix');
-      secret(storage, 'Access key ID', '', 'accessKeySecret', 'self-sync-access-key');
-      secret(storage, 'Secret access key', '', 'secretKeySecret', 'self-sync-secret-key');
+      secret(storage, 'Access key ID', '', 'accessKeySecret', 'coffer-access-key');
+      secret(storage, 'Secret access key', '', 'secretKeySecret', 'coffer-secret-key');
       toggle(storage, 'Path-style addresses', 'On for R2, B2, MinIO and most others; off for Amazon S3.', 'pathStyle');
     }
-    secret(storage, 'Passphrase', 'The one every device uses. Typing here only changes it on this device.', 'passphraseSecret', 'self-sync-passphrase');
+    secret(storage, 'Passphrase', 'The one every device uses. Typing here only changes it on this device.', 'passphraseSecret', 'coffer-passphrase');
     new Setting(storage)
       .setName('Check the connection')
       .setDesc('Writes, reads and deletes a small test object.')
@@ -224,16 +224,16 @@ export class SettingsTab extends PluginSettingTab {
 
 /** Every open problem with what can be done about it, or "all good". */
 export class ProblemsModal extends Modal {
-  private plugin: SelfSyncPlugin;
+  private plugin: CofferPlugin;
   private unsubscribe?: () => void;
 
-  constructor(app: App, plugin: SelfSyncPlugin) {
+  constructor(app: App, plugin: CofferPlugin) {
     super(app);
     this.plugin = plugin;
   }
 
   onOpen(): void {
-    this.modalEl.addClass('self-sync-modal');
+    this.modalEl.addClass('coffer-modal');
     this.unsubscribe = this.plugin.onChange(() => this.render());
     this.render();
   }
@@ -258,7 +258,7 @@ export class ProblemsModal extends Modal {
       }, 'cta');
       return;
     }
-    if (!problems.length && !plugin.running) c.createEl('p', { cls: 'self-sync-intro', text: 'Everything is in sync.' });
+    if (!problems.length && !plugin.running) c.createEl('p', { cls: 'coffer-intro', text: 'Everything is in sync.' });
     for (const p of problems) this.problem(c, p);
     button(buttonRow(c), plugin.running ? 'Syncing…' : 'Sync now', () => plugin.sync(true), problems.length ? 'plain' : 'cta').setDisabled(plugin.running);
   }
@@ -268,14 +268,14 @@ export class ProblemsModal extends Modal {
     // Its actions act on the shared folder it is about, or on the vault.
     const share = p.share ? plugin.settings.shares.find((s) => s.id === p.share) : undefined;
     if (p.share && !share) return;
-    const card = parent.createDiv({ cls: `self-sync-problem is-${p.severity}` });
-    card.createDiv({ cls: 'self-sync-problem-title', text: p.title });
-    card.createDiv({ cls: 'self-sync-problem-detail', text: p.detail });
+    const card = parent.createDiv({ cls: `coffer-problem is-${p.severity}` });
+    card.createDiv({ cls: 'coffer-problem-title', text: p.title });
+    card.createDiv({ cls: 'coffer-problem-detail', text: p.detail });
     if (p.files?.length) {
-      const list = card.createDiv({ cls: 'self-sync-files' });
+      const list = card.createDiv({ cls: 'coffer-files' });
       const close = () => this.close();
       for (const path of p.files.slice(0, 20)) {
-        const row = list.createDiv({ cls: 'self-sync-file' });
+        const row = list.createDiv({ cls: 'coffer-file' });
         row.createSpan({ text: path });
         if (isConflictProblem(p)) {
           openLink(row, this.app, 'Original', conflictOriginal(path), close);
@@ -283,7 +283,7 @@ export class ProblemsModal extends Modal {
           button(row, 'Resolve', () => resolveConflict(plugin, path), 'cta');
         } else openLink(row, this.app, 'Open', path, close);
       }
-      if (p.files.length > 20) list.createDiv({ cls: 'self-sync-hint', text: `…and ${p.files.length - 20} more` });
+      if (p.files.length > 20) list.createDiv({ cls: 'coffer-hint', text: `…and ${p.files.length - 20} more` });
     }
     const row = buttonRow(card);
     switch (p.action) {
@@ -319,19 +319,19 @@ export class ProblemsModal extends Modal {
 
 /** After the history in storage turned out not to be the one this device saw: what carrying on means, and a confirmation. */
 class AcceptStorageModal extends Modal {
-  private plugin: SelfSyncPlugin;
+  private plugin: CofferPlugin;
   private share?: Share;
   private busy = false;
   private error = '';
 
-  constructor(app: App, plugin: SelfSyncPlugin, share?: Share) {
+  constructor(app: App, plugin: CofferPlugin, share?: Share) {
     super(app);
     this.plugin = plugin;
     this.share = share;
   }
 
   onOpen(): void {
-    this.modalEl.addClass('self-sync-modal');
+    this.modalEl.addClass('coffer-modal');
     this.render();
   }
 
@@ -340,10 +340,10 @@ class AcceptStorageModal extends Modal {
     c.empty();
     this.setTitle(this.share ? `Carry on with “${this.share.folder}” from storage as it is?` : 'Carry on from storage as it is?');
     c.createEl('p', {
-      cls: 'self-sync-intro',
+      cls: 'coffer-intro',
       text: 'What storage holds is not what this device last saw there: part of the sync history was taken back or replaced.',
     });
-    const what = c.createEl('ul', { cls: 'self-sync-what' });
+    const what = c.createEl('ul', { cls: 'coffer-what' });
     what.createEl('li', { text: 'That is expected right after storage was restored from a backup or an older copy on purpose. Then carry on.' });
     what.createEl('li', { text: 'If nobody did that, someone else may have changed what is stored. Cancel, leave sync stopped, and find out who can reach your storage.' });
     what.createEl('li', {
@@ -377,19 +377,19 @@ class AcceptStorageModal extends Modal {
 
 /** After "wrong passphrase": the one this device should use, for the vault or for one shared folder. */
 class EnterPassphraseModal extends Modal {
-  private plugin: SelfSyncPlugin;
+  private plugin: CofferPlugin;
   private share?: Share;
   private value = '';
   private error = '';
 
-  constructor(app: App, plugin: SelfSyncPlugin, share?: Share) {
+  constructor(app: App, plugin: CofferPlugin, share?: Share) {
     super(app);
     this.plugin = plugin;
     this.share = share;
   }
 
   onOpen(): void {
-    this.modalEl.addClass('self-sync-modal');
+    this.modalEl.addClass('coffer-modal');
     this.render();
   }
 
@@ -399,7 +399,7 @@ class EnterPassphraseModal extends Modal {
     const share = this.share;
     this.setTitle(share ? `Passphrase of “${share.folder}”` : 'Enter the passphrase');
     c.createEl('p', {
-      cls: 'self-sync-intro',
+      cls: 'coffer-intro',
       text: share
         ? 'Use the passphrase this shared folder was shared with. Whoever shared it can tell you.'
         : 'Use the passphrase your other devices use now. If it was changed elsewhere, that is the new one.',
@@ -408,7 +408,7 @@ class EnterPassphraseModal extends Modal {
     message(c, this.error);
     button(buttonRow(c), 'Save and sync', async () => {
       if (!this.value) return;
-      await this.plugin.setSecret('passphraseSecret', 'self-sync-passphrase', this.value, share);
+      await this.plugin.setSecret('passphraseSecret', 'coffer-passphrase', this.value, share);
       const out = await this.plugin.sync(true, false, true);
       if ((share ? out.shares?.get(share.id) : out)?.problem?.id === 'passphrase') {
         this.error = 'That is not it either.';
@@ -423,9 +423,9 @@ class EnterPassphraseModal extends Modal {
 }
 
 class PassphraseModal extends Modal {
-  private plugin: SelfSyncPlugin;
+  private plugin: CofferPlugin;
 
-  constructor(app: App, plugin: SelfSyncPlugin) {
+  constructor(app: App, plugin: CofferPlugin) {
     super(app);
     this.plugin = plugin;
   }
@@ -434,9 +434,9 @@ class PassphraseModal extends Modal {
     let first = '';
     let second = '';
     const c = this.contentEl;
-    this.modalEl.addClass('self-sync-modal');
+    this.modalEl.addClass('coffer-modal');
     this.setTitle('Change the passphrase');
-    c.createEl('p', { cls: 'self-sync-intro', text: 'Nothing is re-uploaded. Each other device asks for the new passphrase once.' });
+    c.createEl('p', { cls: 'coffer-intro', text: 'Nothing is re-uploaded. Each other device asks for the new passphrase once.' });
     field(c, 'New passphrase', { password: true }, (v) => (first = v));
     field(c, 'Repeat it', { password: true }, (v) => (second = v));
     button(buttonRow(c), 'Change passphrase', async () => {

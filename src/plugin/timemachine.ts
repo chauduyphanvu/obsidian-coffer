@@ -7,7 +7,7 @@ import { plural } from '../core/text.ts';
 import { TooOldError, listCommits, listDeleted, planRestore, tableAt, type CommitSummary, type DeletedFile, type PastVault } from '../core/timeline.ts';
 import { sameContent, type Version } from '../core/types.ts';
 import type { VerifyReport } from '../core/verify.ts';
-import type SelfSyncPlugin from './main.ts';
+import type CofferPlugin from './main.ts';
 import type { Failed, Look, RestoreOutcome } from './main.ts';
 import type { Share } from './settings.ts';
 import {
@@ -50,27 +50,27 @@ const failure = (e: unknown) => {
 const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
 /** Which synced place a screen is about, once the vault has shared folders: each has a history of its own. */
-function placeLine(parent: HTMLElement, plugin: SelfSyncPlugin, share: Share | undefined): void {
+function placeLine(parent: HTMLElement, plugin: CofferPlugin, share: Share | undefined): void {
   const text = share ? `Shared folder “${share.folder}”` : plugin.settings.shares.length ? 'This vault, without its shared folders' : '';
-  if (text) parent.createDiv({ cls: 'self-sync-place', text });
+  if (text) parent.createDiv({ cls: 'coffer-place', text });
 }
 
 /** A row in a list: a title and a line under it, tappable when there is something to do. */
 function row(parent: HTMLElement, title: string, sub: string, onClick?: () => void): HTMLElement {
-  const el = parent.createEl(onClick ? 'button' : 'div', { cls: 'self-sync-row' });
-  el.createDiv({ cls: 'self-sync-row-title', text: title });
-  if (sub) el.createDiv({ cls: 'self-sync-row-sub', text: sub });
+  const el = parent.createEl(onClick ? 'button' : 'div', { cls: 'coffer-row' });
+  el.createDiv({ cls: 'coffer-row-title', text: title });
+  if (sub) el.createDiv({ cls: 'coffer-row-sub', text: sub });
   if (onClick) el.addEventListener('click', onClick);
   return el;
 }
 
 /** A whole-row checkbox with room for text beside it; returns where the text goes. */
 function checkRow(parent: HTMLElement, checked: boolean, onChange: (checked: boolean) => void): HTMLElement {
-  const label = parent.createEl('label', { cls: 'self-sync-check-row' });
+  const label = parent.createEl('label', { cls: 'coffer-check-row' });
   const box = label.createEl('input', { attr: { type: 'checkbox' } });
   box.checked = checked;
   box.addEventListener('change', () => onChange(box.checked));
-  return label.createDiv({ cls: 'self-sync-check-body' });
+  return label.createDiv({ cls: 'coffer-check-body' });
 }
 
 /** Items under a heading per day, each with its time of day. */
@@ -78,30 +78,30 @@ function days<T>(parent: HTMLElement, items: T[], timeOf: (item: T) => number, e
   const times = timeLabels(items.map(timeOf));
   const at = new Map(items.map((x, i) => [x, times[i]]));
   const groups = byDay(items, timeOf, Date.now());
-  if (repeatsDay(groups)) parent.createDiv({ cls: 'self-sync-hint', text: "Your devices' clocks disagree, so a day can come up more than once: the list keeps the order things were synced in." });
+  if (repeatsDay(groups)) parent.createDiv({ cls: 'coffer-hint', text: "Your devices' clocks disagree, so a day can come up more than once: the list keeps the order things were synced in." });
   for (const d of groups) {
-    parent.createDiv({ cls: 'self-sync-day', text: d.day });
+    parent.createDiv({ cls: 'coffer-day', text: d.day });
     for (const x of d.items) each(parent, x, at.get(x)!);
   }
 }
 
 function showDiff(parent: HTMLElement, lines: DiffLine[]): void {
-  const box = parent.createDiv({ cls: 'self-sync-diff' });
+  const box = parent.createDiv({ cls: 'coffer-diff' });
   for (const l of lines.slice(0, MAX_LINES)) {
     if (l.kind === 'gap') {
-      box.createDiv({ cls: 'self-sync-diff-gap', text: `⋯ ${plural(l.lines, 'line')} the same ⋯` });
+      box.createDiv({ cls: 'coffer-diff-gap', text: `⋯ ${plural(l.lines, 'line')} the same ⋯` });
       continue;
     }
-    const el = box.createDiv({ cls: `self-sync-diff-line is-${l.kind}` });
-    el.createSpan({ cls: 'self-sync-diff-mark', text: l.kind === 'added' ? '+' : l.kind === 'removed' ? '−' : '' });
-    el.createSpan({ cls: 'self-sync-diff-text', text: l.text });
+    const el = box.createDiv({ cls: `coffer-diff-line is-${l.kind}` });
+    el.createSpan({ cls: 'coffer-diff-mark', text: l.kind === 'added' ? '+' : l.kind === 'removed' ? '−' : '' });
+    el.createSpan({ cls: 'coffer-diff-text', text: l.text });
   }
-  if (lines.length > MAX_LINES) parent.createDiv({ cls: 'self-sync-hint', text: `Only the first ${MAX_LINES.toLocaleString()} lines are shown. “Whole text” shows all of this version.` });
+  if (lines.length > MAX_LINES) parent.createDiv({ cls: 'coffer-hint', text: `Only the first ${MAX_LINES.toLocaleString()} lines are shown. “Whole text” shows all of this version.` });
 }
 
 function showWhole(parent: HTMLElement, text: string): void {
-  parent.createDiv({ cls: 'self-sync-whole', text: text.slice(0, MAX_CHARS) });
-  if (text.length > MAX_CHARS) parent.createDiv({ cls: 'self-sync-hint', text: 'Only the beginning of this version is shown.' });
+  parent.createDiv({ cls: 'coffer-whole', text: text.slice(0, MAX_CHARS) });
+  if (text.length > MAX_CHARS) parent.createDiv({ cls: 'coffer-hint', text: 'Only the beginning of this version is shown.' });
 }
 
 function showCounts(el: HTMLElement, c: { added: number; removed: number }): void {
@@ -147,7 +147,7 @@ class Lane {
 
 /** One file's versions, newest first. Picking one shows it, and what restoring it would change, before anything is written. */
 export class VersionsModal extends Modal {
-  private plugin: SelfSyncPlugin;
+  private plugin: CofferPlugin;
   private path: string;
   /** The engine whose history the file is in, and its path there. */
   private place: { share?: Share; path: string };
@@ -172,7 +172,7 @@ export class VersionsModal extends Modal {
   /** Where the list was scrolled when a version was picked, to return there on a phone. */
   private scrolled = 0;
 
-  constructor(app: App, plugin: SelfSyncPlugin, path: string) {
+  constructor(app: App, plugin: CofferPlugin, path: string) {
     super(app);
     this.plugin = plugin;
     this.path = path;
@@ -181,7 +181,7 @@ export class VersionsModal extends Modal {
   }
 
   onOpen(): void {
-    this.modalEl.addClass('self-sync-modal', 'self-sync-past', 'self-sync-wide');
+    this.modalEl.addClass('coffer-modal', 'coffer-past', 'coffer-wide');
     this.setTitle(this.name);
     void this.load();
   }
@@ -194,7 +194,7 @@ export class VersionsModal extends Modal {
   }
 
   private async load(): Promise<void> {
-    this.contentEl.createEl('p', { cls: 'self-sync-intro', text: 'Loading versions…' });
+    this.contentEl.createEl('p', { cls: 'coffer-intro', text: 'Loading versions…' });
     try {
       const look = await this.plugin.look(this.place.share);
       const key = vaultKey(this.place.path);
@@ -227,13 +227,13 @@ export class VersionsModal extends Modal {
     c.empty();
     if (!this.versions.length) {
       if (this.error) message(c, this.error);
-      else c.createEl('p', { cls: 'self-sync-intro', text: `No versions of “${this.name}” are stored. A file shows up here once it has synced.` });
+      else c.createEl('p', { cls: 'coffer-intro', text: `No versions of “${this.name}” are stored. A file shows up here once it has synced.` });
       button(buttonRow(c), 'Close', () => this.close());
       return;
     }
-    this.panes = c.createDiv({ cls: 'self-sync-panes' });
-    this.renderList(this.panes.createDiv({ cls: 'self-sync-pane self-sync-pane-list' }));
-    this.previewEl = this.panes.createDiv({ cls: 'self-sync-pane self-sync-pane-preview' });
+    this.panes = c.createDiv({ cls: 'coffer-panes' });
+    this.renderList(this.panes.createDiv({ cls: 'coffer-pane coffer-pane-list' }));
+    this.previewEl = this.panes.createDiv({ cls: 'coffer-pane coffer-pane-preview' });
     this.renderPreview();
   }
 
@@ -241,10 +241,10 @@ export class VersionsModal extends Modal {
     const me = this.plugin.settings.deviceName;
     if (this.place.share) placeLine(parent, this.plugin, this.place.share);
     parent.createEl('p', {
-      cls: 'self-sync-intro',
+      cls: 'coffer-intro',
       text: `Versions from the last ${plural(this.plugin.settings.retentionDays, 'day')}, newest first. Pick one to see it before restoring.`,
     });
-    const list = parent.createDiv({ cls: 'self-sync-list' });
+    const list = parent.createDiv({ cls: 'coffer-list' });
     const jobs = new Map<Element, () => void>();
     this.observer = new IntersectionObserver((seen) => {
       for (const e of seen) {
@@ -260,10 +260,10 @@ export class VersionsModal extends Modal {
       }
       const r = row(el, time, '', () => this.pick(v));
       this.rows.set(v.seq, r);
-      if (v === this.now) r.querySelector('.self-sync-row-title')!.createSpan({ cls: 'self-sync-tag', text: 'Now' });
-      const sub = r.createDiv({ cls: 'self-sync-row-sub' });
+      if (v === this.now) r.querySelector('.coffer-row-title')!.createSpan({ cls: 'coffer-tag', text: 'Now' });
+      const sub = r.createDiv({ cls: 'coffer-row-sub' });
       sub.createSpan({ text: `${deviceLabel(v.device, me)} · ${sizeLabel(v.entry.size)}` });
-      const counts = sub.createSpan({ cls: 'self-sync-counts' });
+      const counts = sub.createSpan({ cls: 'coffer-counts' });
       jobs.set(r, () => this.count(v, counts));
       this.observer!.observe(r);
     });
@@ -321,25 +321,25 @@ export class VersionsModal extends Modal {
     if (!p) return;
     p.empty();
     if (!v) {
-      p.createDiv({ cls: 'self-sync-hint', text: 'Pick a version to see it here.' });
+      p.createDiv({ cls: 'coffer-hint', text: 'Pick a version to see it here.' });
       return;
     }
     const me = this.plugin.settings.deviceName;
-    button(p, '‹ All versions', () => this.unpick()).buttonEl.addClass('self-sync-back');
-    p.createDiv({ cls: 'self-sync-preview-title', text: `The version from ${momentLabel(v.time, Date.now())}` });
-    p.createDiv({ cls: 'self-sync-row-sub', text: `Saved by ${deviceLabel(v.device, me)} · ${sizeLabel(v.entry!.size)}` });
+    button(p, '‹ All versions', () => this.unpick()).buttonEl.addClass('coffer-back');
+    p.createDiv({ cls: 'coffer-preview-title', text: `The version from ${momentLabel(v.time, Date.now())}` });
+    p.createDiv({ cls: 'coffer-row-sub', text: `Saved by ${deviceLabel(v.device, me)} · ${sizeLabel(v.entry!.size)}` });
     const pv = this.preview;
     if (!pv) {
       if (this.error) message(p, this.error);
-      else p.createEl('p', { cls: 'self-sync-intro', text: 'Downloading this version…' });
+      else p.createEl('p', { cls: 'coffer-intro', text: 'Downloading this version…' });
       return;
     }
     if (pv.kind === 'changes') {
       p.createEl('p', {
-        cls: 'self-sync-intro',
+        cls: 'coffer-intro',
         text: `Restoring it would add ${plural(pv.added, 'line')} to the file as it is now and remove ${pv.removed.toLocaleString()}.`,
       });
-      const pick = p.createDiv({ cls: 'self-sync-pick' });
+      const pick = p.createDiv({ cls: 'coffer-pick' });
       for (const [whole, text] of [[false, 'Changes'], [true, 'Whole text']] as const) {
         const b = button(pick, text, () => {
           this.whole = whole;
@@ -350,24 +350,24 @@ export class VersionsModal extends Modal {
       }
       if (this.whole) showWhole(p, pv.text);
       else {
-        p.createDiv({ cls: 'self-sync-hint', text: '+ marks a line restoring adds, − a line it removes.' });
+        p.createDiv({ cls: 'coffer-hint', text: '+ marks a line restoring adds, − a line it removes.' });
         showDiff(p, pv.lines);
       }
     } else if (pv.kind === 'same') {
-      p.createEl('p', { cls: 'self-sync-intro', text: 'This version is the same as the file is now.' });
+      p.createEl('p', { cls: 'coffer-intro', text: 'This version is the same as the file is now.' });
     } else if (pv.kind === 'text') {
       p.createEl('p', {
-        cls: 'self-sync-intro',
+        cls: 'coffer-intro',
         text: pv.why === 'missing' ? `There is no “${this.name}” now. Restoring brings it back with this text:` : "This version can't be compared line by line with the file as it is now. Here is all of it:",
       });
       showWhole(p, pv.text);
     } else {
-      p.createEl('p', { cls: 'self-sync-intro', text: pv.why === 'binary' ? "This kind of file can't be shown here." : 'This version is too large to show here.' });
+      p.createEl('p', { cls: 'coffer-intro', text: pv.why === 'binary' ? "This kind of file can't be shown here." : 'This version is too large to show here.' });
     }
 
     message(p, this.error);
     p.createDiv({
-      cls: 'self-sync-hint',
+      cls: 'coffer-hint',
       text: this.current === null ? `Restoring brings “${this.name}” back as it was then.` : `Restoring replaces “${this.name}” with this version. What it holds now stays in its version history.`,
     });
     const r = buttonRow(p);
@@ -393,7 +393,7 @@ export class VersionsModal extends Modal {
 
 /** Files deleted within the time versions are kept, newest first, to bring back one or several at once. */
 export class DeletedModal extends Modal {
-  private plugin: SelfSyncPlugin;
+  private plugin: CofferPlugin;
   private share?: Share;
   private files: DeletedFile[] = [];
   private picked = new Set<DeletedFile>();
@@ -404,16 +404,16 @@ export class DeletedModal extends Modal {
   private listEl?: HTMLElement;
   private footEl?: HTMLElement;
 
-  constructor(app: App, plugin: SelfSyncPlugin, share?: Share) {
+  constructor(app: App, plugin: CofferPlugin, share?: Share) {
     super(app);
     this.plugin = plugin;
     this.share = share;
   }
 
   onOpen(): void {
-    this.modalEl.addClass('self-sync-modal', 'self-sync-past');
+    this.modalEl.addClass('coffer-modal', 'coffer-past');
     this.setTitle('Restore deleted files');
-    this.contentEl.createEl('p', { cls: 'self-sync-intro', text: 'Looking for deleted files…' });
+    this.contentEl.createEl('p', { cls: 'coffer-intro', text: 'Looking for deleted files…' });
     void this.load();
   }
 
@@ -440,17 +440,17 @@ export class DeletedModal extends Modal {
     if (!this.files.length) {
       if (this.error) message(c, this.error);
       else if (this.loaded) {
-        c.createEl('p', { cls: 'self-sync-intro', text: `No deleted files can be brought back. Files deleted in the last ${plural(this.plugin.settings.retentionDays, 'day')} show up here.` });
+        c.createEl('p', { cls: 'coffer-intro', text: `No deleted files can be brought back. Files deleted in the last ${plural(this.plugin.settings.retentionDays, 'day')} show up here.` });
       }
       button(buttonRow(c), 'Close', () => this.close());
       return;
     }
     c.createEl('p', {
-      cls: 'self-sync-intro',
+      cls: 'coffer-intro',
       text: `${plural(this.files.length, 'file')} deleted in the last ${plural(this.plugin.settings.retentionDays, 'day')} can be brought back, newest first.`,
     });
     const search = c.createEl('input', {
-      cls: 'self-sync-search',
+      cls: 'coffer-search',
       attr: { type: 'search', placeholder: 'Filter by name or folder', 'aria-label': 'Filter by name or folder', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false' },
     });
     search.value = this.query;
@@ -460,7 +460,7 @@ export class DeletedModal extends Modal {
       this.renderFoot();
     });
     this.listEl = c.createDiv();
-    this.footEl = c.createDiv({ cls: 'self-sync-foot' });
+    this.footEl = c.createDiv({ cls: 'coffer-foot' });
     this.renderList();
     this.renderFoot();
   }
@@ -471,7 +471,7 @@ export class DeletedModal extends Modal {
     const me = this.plugin.settings.deviceName;
     const shown = this.files.filter((f) => matchesQuery(f.path, this.query)).slice(0, MAX_ROWS);
     if (!shown.length) {
-      l.createDiv({ cls: 'self-sync-hint', text: 'No deleted file matches.' });
+      l.createDiv({ cls: 'coffer-hint', text: 'No deleted file matches.' });
       return;
     }
     const all = shown.every((f) => this.picked.has(f));
@@ -482,20 +482,20 @@ export class DeletedModal extends Modal {
       }
       this.renderList();
       this.renderFoot();
-    }).createDiv({ cls: 'self-sync-row-title', text: shown.length === 1 ? 'Select the one shown' : `Select all ${shown.length.toLocaleString()} shown` });
-    const list = l.createDiv({ cls: 'self-sync-list' });
+    }).createDiv({ cls: 'coffer-row-title', text: shown.length === 1 ? 'Select the one shown' : `Select all ${shown.length.toLocaleString()} shown` });
+    const list = l.createDiv({ cls: 'coffer-list' });
     days(list, shown, (f) => f.time, (el, f, time) => {
       const body = checkRow(el, this.picked.has(f), (on) => {
         if (on) this.picked.add(f);
         else this.picked.delete(f);
         this.renderFoot();
       });
-      body.createDiv({ cls: 'self-sync-row-title', text: fileName(f.path) });
+      body.createDiv({ cls: 'coffer-row-title', text: fileName(f.path) });
       const folder = f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) : '';
-      body.createDiv({ cls: 'self-sync-row-sub', text: `${folder ? `in ${folder} · ` : ''}deleted at ${time} on ${deviceLabel(f.device, me)}` });
+      body.createDiv({ cls: 'coffer-row-sub', text: `${folder ? `in ${folder} · ` : ''}deleted at ${time} on ${deviceLabel(f.device, me)}` });
     });
     const matching = this.files.filter((f) => matchesQuery(f.path, this.query)).length;
-    if (matching > shown.length) l.createDiv({ cls: 'self-sync-hint', text: `Showing the newest ${shown.length.toLocaleString()} of ${matching.toLocaleString()}. Type to narrow the list.` });
+    if (matching > shown.length) l.createDiv({ cls: 'coffer-hint', text: `Showing the newest ${shown.length.toLocaleString()} of ${matching.toLocaleString()}. Type to narrow the list.` });
   }
 
   private renderFoot(): void {
@@ -503,7 +503,7 @@ export class DeletedModal extends Modal {
     f.empty();
     message(f, this.error);
     const n = this.picked.size;
-    f.createDiv({ cls: 'self-sync-hint', text: 'Files come back where they were. If something has that name now, the file comes back beside it with “(restored)” in its name.' });
+    f.createDiv({ cls: 'coffer-hint', text: 'Files come back where they were. If something has that name now, the file comes back beside it with “(restored)” in its name.' });
     const r = buttonRow(f);
     button(r, 'Cancel', () => this.close());
     button(r, this.busy ? 'Restoring…' : n ? `Restore ${plural(n, 'file')}` : 'Restore', () => this.restore(), 'cta').setDisabled(!n || this.busy);
@@ -528,10 +528,10 @@ export class DeletedModal extends Modal {
     c.empty();
     if (placed.length) {
       statusLine(c, `${plural(placed.length, 'file')} brought back`, failed.length ? 'warning' : 'ok');
-      c.createDiv({ cls: 'self-sync-sub', text: `The next sync sends ${placed.length === 1 ? 'it' : 'them'} to your other devices.` });
-      const list = c.createDiv({ cls: 'self-sync-files' });
+      c.createDiv({ cls: 'coffer-sub', text: `The next sync sends ${placed.length === 1 ? 'it' : 'them'} to your other devices.` });
+      const list = c.createDiv({ cls: 'coffer-files' });
       for (const p of placed) {
-        const r = list.createDiv({ cls: 'self-sync-file' });
+        const r = list.createDiv({ cls: 'coffer-file' });
         r.createSpan({ text: p.to === p.path ? p.path : `${p.path} came back as “${fileName(p.to)}”, as something has its name now` });
         openLink(r, this.app, 'Open', this.share ? `${this.share.folder}/${p.to}` : p.to, () => this.close());
       }
@@ -548,7 +548,7 @@ const KIND: [Step['kind'], string][] = [['add', 'Brought back'], ['change', 'Cha
  * would change, confirm, then watch it happen.
  */
 export class RestoreEarlierModal extends Modal {
-  private plugin: SelfSyncPlugin;
+  private plugin: CofferPlugin;
   /** The shared folder whose history this works on, or none for the vault's. */
   private share?: Share;
   /** Inside the vault or the shared folder; '' for all of it. */
@@ -569,7 +569,7 @@ export class RestoreEarlierModal extends Modal {
   private closed = false;
 
   /** `folder` is a vault path ('' for the whole vault); a folder in a shared folder is restored from that one's history. */
-  constructor(app: App, plugin: SelfSyncPlugin, folder: string) {
+  constructor(app: App, plugin: CofferPlugin, folder: string) {
     super(app);
     this.plugin = plugin;
     const place = folder ? plugin.placeOf(folder) : { path: '' };
@@ -583,7 +583,7 @@ export class RestoreEarlierModal extends Modal {
   }
 
   onOpen(): void {
-    this.modalEl.addClass('self-sync-modal', 'self-sync-past');
+    this.modalEl.addClass('coffer-modal', 'coffer-past');
     this.setTitle('Restore to an earlier time');
     void this.loadMore();
   }
@@ -635,8 +635,8 @@ export class RestoreEarlierModal extends Modal {
   }
 
   private renderChoose(c: HTMLElement): void {
-    c.createDiv({ cls: 'self-sync-pick-label', text: 'What to restore' });
-    const pick = c.createDiv({ cls: 'self-sync-pick' });
+    c.createDiv({ cls: 'coffer-pick-label', text: 'What to restore' });
+    const pick = c.createDiv({ cls: 'coffer-pick' });
     const option = (text: string, on: boolean, run: () => void) => {
       const b = button(pick, text, run);
       b.buttonEl.toggleClass('is-selected', on);
@@ -646,26 +646,26 @@ export class RestoreEarlierModal extends Modal {
     option('The whole vault', whole, () => this.target(undefined, ''));
     option('One folder', !whole, () => this.chooseFolder());
     if (!whole) {
-      const f = c.createDiv({ cls: 'self-sync-file' });
+      const f = c.createDiv({ cls: 'coffer-file' });
       f.createSpan({ text: this.share && !this.folder ? `${this.share.folder} (shared folder)` : this.share ? `${this.share.folder}/${this.folder}` : this.folder });
       button(f, 'Change', () => this.chooseFolder());
     }
     if (whole && this.plugin.settings.shares.length) {
-      c.createDiv({ cls: 'self-sync-hint', text: 'Shared folders are not part of it: each has a history of its own. To restore one, choose it under “One folder”.' });
+      c.createDiv({ cls: 'coffer-hint', text: 'Shared folders are not part of it: each has a history of its own. To restore one, choose it under “One folder”.' });
     }
 
-    c.createDiv({ cls: 'self-sync-pick-label', text: 'Bring it back to how it was' });
-    c.createDiv({ cls: 'self-sync-hint', text: `Each time is when a device synced. The numbers say what that sync changed across ${this.share ? 'the shared folder' : 'the vault'}.` });
+    c.createDiv({ cls: 'coffer-pick-label', text: 'Bring it back to how it was' });
+    c.createDiv({ cls: 'coffer-hint', text: `Each time is when a device synced. The numbers say what that sync changed across ${this.share ? 'the shared folder' : 'the vault'}.` });
     message(c, this.gone);
     const me = this.plugin.settings.deviceName;
     const { moments, loading, more } = this.pages;
-    const list = c.createDiv({ cls: 'self-sync-list' });
+    const list = c.createDiv({ cls: 'coffer-list' });
     days(list, moments, (m) => m.time, (el, m, time) => {
       row(el, time, `${deviceLabel(m.device, me)} · ${changesLabel(m)}`, () => void this.review(m));
     });
     message(c, this.error);
-    if (loading) c.createDiv({ cls: 'self-sync-hint', text: 'Loading…' });
-    else if (!moments.length && !this.error) c.createEl('p', { cls: 'self-sync-intro', text: 'Nothing has synced yet, so there is no earlier time to go back to.' });
+    if (loading) c.createDiv({ cls: 'coffer-hint', text: 'Loading…' });
+    else if (!moments.length && !this.error) c.createEl('p', { cls: 'coffer-intro', text: 'Nothing has synced yet, so there is no earlier time to go back to.' });
     const r = buttonRow(c);
     button(r, 'Cancel', () => this.close());
     if (more && !loading && moments.length) button(r, 'Show earlier times', () => this.loadMore());
@@ -727,32 +727,32 @@ export class RestoreEarlierModal extends Modal {
   private renderReview(c: HTMLElement): void {
     const past = this.past;
     if (!past) {
-      c.createEl('p', { cls: 'self-sync-intro', text: 'Working out what would change…' });
+      c.createEl('p', { cls: 'coffer-intro', text: 'Working out what would change…' });
       return;
     }
     const me = this.plugin.settings.deviceName;
-    c.createDiv({ cls: 'self-sync-preview-title', text: `${capital(this.scopeText())} as it was ${momentLabel(past.commit.time, Date.now())}` });
-    c.createDiv({ cls: 'self-sync-row-sub', text: `When ${deviceLabel(past.commit.device, me)} synced.` });
-    message(c, this.note, 'self-sync-note');
+    c.createDiv({ cls: 'coffer-preview-title', text: `${capital(this.scopeText())} as it was ${momentLabel(past.commit.time, Date.now())}` });
+    c.createDiv({ cls: 'coffer-row-sub', text: `When ${deviceLabel(past.commit.device, me)} synced.` });
+    message(c, this.note, 'coffer-note');
     message(c, this.error);
     const counts = countSteps(this.steps);
-    c.createEl('p', { cls: 'self-sync-summary', text: stepSummary(counts) });
+    c.createEl('p', { cls: 'coffer-summary', text: stepSummary(counts) });
     for (const [kind, label] of KIND) {
       const paths = this.steps.filter((s) => s.kind === kind).map((s) => s.path);
       if (!paths.length) continue;
-      const d = c.createEl('details', { cls: 'self-sync-plan' });
+      const d = c.createEl('details', { cls: 'coffer-plan' });
       d.createEl('summary', { text: `${label} (${paths.length.toLocaleString()})` });
-      const list = d.createDiv({ cls: 'self-sync-files' });
-      for (const path of paths.slice(0, MAX_ROWS)) list.createDiv({ cls: 'self-sync-file', text: path });
-      if (paths.length > MAX_ROWS) list.createDiv({ cls: 'self-sync-hint', text: `…and ${(paths.length - MAX_ROWS).toLocaleString()} more` });
+      const list = d.createDiv({ cls: 'coffer-files' });
+      for (const path of paths.slice(0, MAX_ROWS)) list.createDiv({ cls: 'coffer-file', text: path });
+      if (paths.length > MAX_ROWS) list.createDiv({ cls: 'coffer-hint', text: `…and ${(paths.length - MAX_ROWS).toLocaleString()} more` });
     }
-    if (this.left) c.createDiv({ cls: 'self-sync-hint', text: `${plural(this.left, 'file')} excluded from sync on this device ${this.left === 1 ? 'stays as it is' : 'stay as they are'}.` });
+    if (this.left) c.createDiv({ cls: 'coffer-hint', text: `${plural(this.left, 'file')} excluded from sync on this device ${this.left === 1 ? 'stays as it is' : 'stay as they are'}.` });
     if (!this.steps.length) {
       button(buttonRow(c), 'Back', () => this.back());
       return;
     }
 
-    const what = c.createEl('ul', { cls: 'self-sync-what' });
+    const what = c.createEl('ul', { cls: 'coffer-what' });
     what.createEl('li', { text: 'Changes on this device sync first, so nothing unsaved is lost.' });
     if (counts.remove) what.createEl('li', { text: 'Removed files go where your “Deleted files” setting sends them.' });
     what.createEl('li', { text: 'What each file holds now stays in its version history, so this can be undone.' });
@@ -794,25 +794,25 @@ export class RestoreEarlierModal extends Modal {
 
   private renderWorking(c: HTMLElement): void {
     statusLine(c, this.plugin.progress || 'Restoring…', 'busy');
-    c.createDiv({ cls: 'self-sync-sub', text: 'Keep Obsidian open until this finishes. Closing this window does not stop it.' });
+    c.createDiv({ cls: 'coffer-sub', text: 'Keep Obsidian open until this finishes. Closing this window does not stop it.' });
   }
 
   private renderDone(c: HTMLElement): void {
     const out = this.outcome!;
     statusLine(c, out.failed.length ? `Restored, except ${plural(out.failed.length, 'file')}` : 'Restored', out.failed.length ? 'warning' : 'ok');
     c.createEl('p', {
-      cls: 'self-sync-intro',
+      cls: 'coffer-intro',
       text: `${capital(this.scopeText())} is back to how it was ${momentLabel(this.past!.commit.time, Date.now())}. ${stepSummary(countSteps(out.done), true)}`,
     });
     if (out.failed.length) message(c, `These files could not be restored:\n${out.failed.map((f) => `${f.path}: ${f.message}`).join('\n')}`);
     const p = out.sent?.problem;
     if (p) message(c, `It is not sent to your other devices yet. ${p.title}. ${p.detail}`);
-    else c.createDiv({ cls: 'self-sync-hint', text: 'Sent to storage. Your other devices get it when they next sync.' });
+    else c.createDiv({ cls: 'coffer-hint', text: 'Sent to storage. Your other devices get it when they next sync.' });
     if (out.olderPause) {
       message(
         c,
-        'Your other devices remove these files too when they next sync. One with an older version of Self Sync, or one that has been away for many syncs, may pause first, as it does whenever many files go at once: choose “Delete them everywhere” there to finish. “Keep all files” would bring the removed files back.',
-        'self-sync-note',
+        'Your other devices remove these files too when they next sync. One with an older version of Coffer, or one that has been away for many syncs, may pause first, as it does whenever many files go at once: choose “Delete them everywhere” there to finish. “Keep all files” would bring the removed files back.',
+        'coffer-note',
       );
     }
     button(buttonRow(c), 'Close', () => this.close(), 'cta');
@@ -821,7 +821,7 @@ export class RestoreEarlierModal extends Modal {
 
 /** Checks what storage holds, quickly or by downloading everything, and says what it found in plain words. */
 export class VerifyModal extends Modal {
-  private plugin: SelfSyncPlugin;
+  private plugin: CofferPlugin;
   private share?: Share;
   private deep = false;
   private running = false;
@@ -832,14 +832,14 @@ export class VerifyModal extends Modal {
   private progressEl?: HTMLElement;
   private closed = false;
 
-  constructor(app: App, plugin: SelfSyncPlugin, share?: Share) {
+  constructor(app: App, plugin: CofferPlugin, share?: Share) {
     super(app);
     this.plugin = plugin;
     this.share = share;
   }
 
   onOpen(): void {
-    this.modalEl.addClass('self-sync-modal', 'self-sync-past');
+    this.modalEl.addClass('coffer-modal', 'coffer-past');
     this.setTitle('Check synced data');
     void this.run(false);
   }
@@ -874,7 +874,7 @@ export class VerifyModal extends Modal {
     c.empty();
     placeLine(c, this.plugin, this.share);
     c.createEl('p', {
-      cls: 'self-sync-intro',
+      cls: 'coffer-intro',
       text: this.deep
         ? 'Downloads everything stored for your files as they are now and checks that it decrypts to what was saved. Nothing is changed.'
         : 'Reads the sync history and checks that the stored data for every file is there. Nothing is changed.',
@@ -893,24 +893,24 @@ export class VerifyModal extends Modal {
     }
     const d = describeVerify(r);
     statusLine(c, d.title, d.ok ? 'ok' : 'critical');
-    c.createDiv({ cls: 'self-sync-sub', text: d.detail });
+    c.createDiv({ cls: 'coffer-sub', text: d.detail });
     for (const f of d.findings) {
-      const card = c.createDiv({ cls: 'self-sync-problem is-critical' });
-      card.createDiv({ cls: 'self-sync-problem-title', text: f.title });
-      card.createDiv({ cls: 'self-sync-problem-detail', text: f.detail });
+      const card = c.createDiv({ cls: 'coffer-problem is-critical' });
+      card.createDiv({ cls: 'coffer-problem-title', text: f.title });
+      card.createDiv({ cls: 'coffer-problem-detail', text: f.detail });
       if (f.files.length) {
-        const list = card.createDiv({ cls: 'self-sync-files' });
-        for (const path of f.files.slice(0, 20)) list.createDiv({ cls: 'self-sync-file', text: path });
-        if (f.files.length > 20) list.createDiv({ cls: 'self-sync-hint', text: `…and ${(f.files.length - 20).toLocaleString()} more` });
+        const list = card.createDiv({ cls: 'coffer-files' });
+        for (const path of f.files.slice(0, 20)) list.createDiv({ cls: 'coffer-file', text: path });
+        if (f.files.length > 20) list.createDiv({ cls: 'coffer-hint', text: `…and ${(f.files.length - 20).toLocaleString()} more` });
       }
-      const more = card.createEl('details', { cls: 'self-sync-plan' });
+      const more = card.createEl('details', { cls: 'coffer-plan' });
       more.createEl('summary', { text: 'Technical details' });
-      more.createDiv({ cls: 'self-sync-problem-detail', text: f.messages.join('\n') });
+      more.createDiv({ cls: 'coffer-problem-detail', text: f.messages.join('\n') });
     }
     if (!r.deep) {
-      c.createDiv({ cls: 'self-sync-pick-label', text: 'Thorough check' });
+      c.createDiv({ cls: 'coffer-pick-label', text: 'Thorough check' });
       c.createDiv({
-        cls: 'self-sync-hint',
+        cls: 'coffer-hint',
         text: `Also downloads everything stored for your files${this.stored === undefined ? '' : ` (about ${sizeLabel(this.stored)})`} and checks that it decrypts to what was saved. This can take a long time, and on a phone it may use mobile data.`,
       });
     }

@@ -74,6 +74,21 @@ function sliceEq(a: Int32Array, a0: number, a1: number, b: Int32Array, b0: numbe
   return true;
 }
 
+/**
+ * `s` cut after each newline, which stays at the end of its line; '' gives ['']. What `s.split(/(?<=\n)/)` returns,
+ * without a lookbehind: iOS before 16.4 cannot run one.
+ */
+export function splitLines(s: string): string[] {
+  const out: string[] = [];
+  let start = 0;
+  for (let nl = s.indexOf('\n'); nl !== -1; nl = s.indexOf('\n', start)) {
+    out.push(s.slice(start, nl + 1));
+    start = nl + 1;
+  }
+  if (start < s.length || !out.length) out.push(s.slice(start));
+  return out;
+}
+
 /** Line-based three-way merge. Returns null when both sides changed the same region differently. */
 export function merge3(base: string, ours: string, theirs: string): string | null {
   if (ours === theirs) return ours;
@@ -81,7 +96,7 @@ export function merge3(base: string, ours: string, theirs: string): string | nul
   if (base === theirs) return ours;
 
   const ids = new Map<string, number>();
-  const lines = (s: string) => s.split(/(?<=\n)/);
+  const lines = splitLines;
   const intern = (ls: string[]) => Int32Array.from(ls, (l) => ids.get(l) ?? (ids.set(l, ids.size), ids.size - 1));
   const A = lines(ours);
   const B = lines(theirs);
@@ -137,7 +152,7 @@ export type DiffRegion = SameLines | ChangedLines;
  * side's lines joined give that text back byte for byte. Null when the texts differ too much, as for `merge3`.
  */
 export function lineDiff(a: string, b: string): DiffRegion[] | null {
-  const lines = (s: string) => (s ? s.split(/(?<=\n)/) : []);
+  const lines = (s: string) => (s ? splitLines(s) : []);
   const ids = new Map<string, number>();
   const intern = (ls: string[]) => Int32Array.from(ls, (l) => ids.get(l) ?? (ids.set(l, ids.size), ids.size - 1));
   const A = lines(a);
@@ -243,7 +258,7 @@ function mergeValue(base: unknown, ours: unknown, theirs: unknown): unknown {
   if (equal(base, theirs)) return ours;
   if (isObject(ours) && isObject(theirs)) {
     const b = isObject(base) ? base : {};
-    const out: Record<string, unknown> = Object.create(null);
+    const out = Object.create(null) as Record<string, unknown>;
     for (const k of new Set([...Object.keys(theirs), ...Object.keys(ours)])) {
       const v = mergeValue(get(b, k), get(ours, k), get(theirs, k));
       if (v !== undefined) out[k] = v;

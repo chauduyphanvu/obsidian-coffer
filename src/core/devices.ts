@@ -65,7 +65,7 @@ export async function writeHeartbeat(view: RepoView, info: { platform: string; v
 export async function listDevices(view: RepoView): Promise<DeviceStatus[]> {
   const { repo, st, cfg, now } = view;
   const docs = await repo.listDocs(PREFIX);
-  const records: (Heartbeat | null)[] = new Array(docs.length).fill(null);
+  const records: (Heartbeat | null)[] = new Array<Heartbeat | null>(docs.length).fill(null);
   await pool(docs, cfg.concurrency, async (doc, i) => {
     try {
       records[i] = parse(await repo.readDoc(doc.key));

@@ -107,7 +107,7 @@ async function replayLog(
   let prev: string | undefined = '';
   let intact = true;
   for (let lo = 1; lo <= last; lo += LOG_WINDOW) {
-    const block: (Commit | Error | null)[] = new Array(Math.min(LOG_WINDOW, last - lo + 1)).fill(null);
+    const block: (Commit | Error | null)[] = new Array<Commit | Error | null>(Math.min(LOG_WINDOW, last - lo + 1)).fill(null);
     await pool(block, o.concurrency, async (_, i) => {
       if (!listed.has(lo + i)) return;
       try {
@@ -217,7 +217,7 @@ async function checkChunks(repo: Repo, o: Context, files: Map<string, Entry>, sk
     for (const ref of e.chunks) {
       if (skip.has(ref.pack)) continue;
       let stored = byPack.get(ref.pack);
-      if (!stored) byPack.set(ref.pack, (stored = new Map()));
+      if (!stored) byPack.set(ref.pack, (stored = new Map<number, { ref: ChunkRef; paths: string[] }>()));
       let u = stored.get(ref.off);
       if (!u) stored.set(ref.off, (u = { ref, paths: [] }));
       u.paths.push(path);

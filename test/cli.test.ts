@@ -21,14 +21,14 @@ const CLI = new URL('../src/node/cli.ts', import.meta.url).pathname;
  * Given another setup, a second device: its own vault, the same remote.
  */
 function setup(sync: object, other?: { dir: string }) {
-  const dir = other?.dir ?? mkdtempSync(join(tmpdir(), 'selfsync-cli-'));
+  const dir = other?.dir ?? mkdtempSync(join(tmpdir(), 'coffer-cli-'));
   const name = other ? 'vault2' : 'vault';
   const vault = join(dir, name);
   mkdirSync(vault);
   const config = join(dir, `${name}.json`);
   writeFileSync(config, JSON.stringify({ vault, remote: { type: 'folder', path: join(dir, 'remote') }, sync: { kdfIterations: 1000, ...sync } }));
   const run = (...args: string[]) =>
-    spawnSync('node', [CLI, ...args, `--config=${config}`], { encoding: 'utf8', env: { ...process.env, SELFSYNC_PASSPHRASE: 'pw' } });
+    spawnSync('node', [CLI, ...args, `--config=${config}`], { encoding: 'utf8', env: { ...process.env, COFFER_PASSPHRASE: 'pw' } });
   const cli = (...args: string[]) => run(...args).stdout;
   return { dir, vault, config, run, cli, done: () => rmSync(dir, { recursive: true, force: true }) };
 }
@@ -42,7 +42,7 @@ function put(vault: string, path: string, text: string): void {
 function files(vault: string): Record<string, string> {
   const out: Record<string, string> = {};
   for (const p of (readdirSync(vault, { recursive: true }) as string[]).sort()) {
-    if (!p.startsWith('.self-sync') && statSync(join(vault, p)).isFile()) out[p.split(sep).join('/')] = readFileSync(join(vault, p), 'utf8');
+    if (!p.startsWith('.coffer') && statSync(join(vault, p)).isFile()) out[p.split(sep).join('/')] = readFileSync(join(vault, p), 'utf8');
   }
   return out;
 }
@@ -351,11 +351,11 @@ test('cli: restore leaves alone a file with changes not synced yet, which no sto
 test('cli: says what went wrong with the config file, a path with no stored versions, and how to force a refused sync', () => {
   const t = setup({ maxDeleteCount: 1 });
   try {
-    const missing = spawnSync('node', [CLI, 'sync', `--config=${join(t.dir, 'nope.json')}`], { encoding: 'utf8', env: { ...process.env, SELFSYNC_PASSPHRASE: 'pw' } });
+    const missing = spawnSync('node', [CLI, 'sync', `--config=${join(t.dir, 'nope.json')}`], { encoding: 'utf8', env: { ...process.env, COFFER_PASSPHRASE: 'pw' } });
     assert.equal(missing.status, 1);
     assert.match(missing.stderr, /^config file .*nope\.json not found; pass --config=<file>$/m);
     writeFileSync(join(t.dir, 'bad.json'), '{"vault": "x",\n');
-    const bad = spawnSync('node', [CLI, 'sync', `--config=${join(t.dir, 'bad.json')}`], { encoding: 'utf8', env: { ...process.env, SELFSYNC_PASSPHRASE: 'pw' } });
+    const bad = spawnSync('node', [CLI, 'sync', `--config=${join(t.dir, 'bad.json')}`], { encoding: 'utf8', env: { ...process.env, COFFER_PASSPHRASE: 'pw' } });
     assert.match(bad.stderr, /^config file .*bad\.json is not valid JSON: /m);
 
     const none = t.run('history', 'nothing/here.md');
@@ -378,7 +378,7 @@ test('cli: a half-written file left by a sync that was killed is never sent as a
   const b = setup({}, a);
   try {
     put(a.vault, 'a.md', 'a\n');
-    put(a.vault, 'sub/b.md.selfsync-tmp', 'half of b');
+    put(a.vault, 'sub/b.md.coffer-tmp', 'half of b');
     assert.match(a.cli('sync'), /^sent 1,/);
     b.cli('sync');
     assert.deepEqual(files(b.vault), { 'a.md': 'a\n' });
@@ -409,7 +409,7 @@ test('cli: a storage folder that is gone, as a drive not mounted, fails the sync
 });
 
 test('a folder remote that disappears is reported missing by every operation and never recreated; a first run may create it', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'selfsync-folder-'));
+  const dir = mkdtempSync(join(tmpdir(), 'coffer-folder-'));
   try {
     const root = join(dir, 'remote');
     const store = new FolderStore(root);
@@ -641,12 +641,12 @@ test('watch: with the storage down it retries with backoff, then sends the edit 
 });
 
 test("watch: the sync's own writes and the state folder are not local changes, an edit of the same file is", async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'selfsync-watch-'));
+  const dir = mkdtempSync(join(tmpdir(), 'coffer-watch-'));
   const fs = new NodeFS(dir);
   const seen: string[] = [];
   mkdirSync(join(dir, 'notes'));
-  mkdirSync(join(dir, '.self-sync'));
-  const watcher = watchVault(dir, fs, '.self-sync', (path) => seen.push(path), (e) => assert.fail(e.message));
+  mkdirSync(join(dir, '.coffer'));
+  const watcher = watchVault(dir, fs, '.coffer', (path) => seen.push(path), (e) => assert.fail(e.message));
   const reported = async (path: string) => {
     await eventually(() => seen.includes(path));
     await sleep(200);
@@ -656,7 +656,7 @@ test("watch: the sync's own writes and the state folder are not local changes, a
     await fs.write('notes/a.md', new TextEncoder().encode('two!'), 1_700_000_001_000);
     await fs.write('notes/b.md', new TextEncoder().encode('b'));
     await fs.remove('notes/b.md');
-    writeFileSync(join(dir, '.self-sync', 'state.json'), '{}');
+    writeFileSync(join(dir, '.coffer', 'state.json'), '{}');
     writeFileSync(join(dir, 'user.md'), 'hello');
     await reported('user.md');
     assert.deepEqual([...new Set(seen)], ['user.md']);
@@ -669,10 +669,10 @@ test("watch: the sync's own writes and the state folder are not local changes, a
 });
 
 test("watch: a file put back the way the sync last left it is still reported, once someone else changed it in between", async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'selfsync-watch-'));
+  const dir = mkdtempSync(join(tmpdir(), 'coffer-watch-'));
   const fs = new NodeFS(dir);
   const seen: string[] = [];
-  const watcher = watchVault(dir, fs, '.self-sync', (path) => seen.push(path), (e) => assert.fail(e.message));
+  const watcher = watchVault(dir, fs, '.coffer', (path) => seen.push(path), (e) => assert.fail(e.message));
   const count = () => seen.filter((p) => p === 'x.md').length;
   try {
     // The sync applies another device's deletion of x.md.
@@ -693,7 +693,7 @@ test("watch: a file put back the way the sync last left it is still reported, on
 });
 
 test('NodeFS remembers what its own writes left only while a watcher asks, and only for a minute after each', async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'selfsync-own-'));
+  const dir = mkdtempSync(join(tmpdir(), 'coffer-own-'));
   const fs = new NodeFS(dir);
   const bytes = new TextEncoder().encode('x');
   try {
@@ -723,7 +723,7 @@ test('NodeFS remembers what its own writes left only while a watcher asks, and o
 test('cli watch: sends local edits, receives another device\'s changes, and stops on SIGTERM', async () => {
   const a = setup({});
   const b = setup({ deviceName: 'other' }, a);
-  const child = spawn('node', [CLI, 'watch', '--poll=0.2', '--interval=60', `--config=${a.config}`], { env: { ...process.env, SELFSYNC_PASSPHRASE: 'pw' } });
+  const child = spawn('node', [CLI, 'watch', '--poll=0.2', '--interval=60', `--config=${a.config}`], { env: { ...process.env, COFFER_PASSPHRASE: 'pw' } });
   let out = '';
   let err = '';
   child.stdout.setEncoding('utf8').on('data', (d: string) => (out += d));

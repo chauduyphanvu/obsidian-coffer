@@ -46,29 +46,29 @@ test('a restore plan becomes removals first, then writes, each in path order, wi
     write: [
       { path: 'b.md', entry: entry('b1') },
       { path: 'a.md', entry: entry('a1') },
-      { path: '.obsidian/plugins/self-sync/main.js', entry: entry('m1') },
+      { path: '.obsidian/plugins/coffer/main.js', entry: entry('m1') },
       { path: 'Private/x.md', entry: entry('x1') },
     ],
     remove: ['z.md', 'c.md', 'Private/y.md'],
   };
-  const { steps, left } = restoreSteps(plan, current, keepOut(['Private/'], ['.obsidian/plugins/self-sync']));
+  const { steps, left } = restoreSteps(plan, current, keepOut(['Private/'], ['.obsidian/plugins/coffer']));
   assert.deepEqual(steps.map((s) => [s.kind, s.path]), [['remove', 'c.md'], ['remove', 'z.md'], ['change', 'a.md'], ['add', 'b.md']]);
   assert.equal(steps[2].entry, plan.write[1].entry);
   assert.equal(left, 3);
   assert.deepEqual(countSteps(steps), { add: 1, change: 1, remove: 2 });
-  assert.ok(sameSteps(steps, restoreSteps(plan, current, keepOut(['Private/'], ['.obsidian/plugins/self-sync'])).steps));
+  assert.ok(sameSteps(steps, restoreSteps(plan, current, keepOut(['Private/'], ['.obsidian/plugins/coffer'])).steps));
   assert.ok(!sameSteps(steps, steps.slice(1)));
   assert.ok(!sameSteps(steps, steps.map((s) => (s.path === 'b.md' ? { ...s, kind: 'change' as const } : s))));
 });
 
 test('kept out: excluded patterns and whole folders, but not a folder that only starts with the same name', () => {
-  const kept = keepOut(['*.tmp', 'Private/', '.obsidian/workspace*.json'], ['.obsidian/plugins/self-sync/']);
+  const kept = keepOut(['*.tmp', 'Private/', '.obsidian/workspace*.json'], ['.obsidian/plugins/coffer/']);
   assert.ok(kept('notes/draft.tmp'));
   assert.ok(kept('Private/a/b.md'));
   assert.ok(kept('.obsidian/workspace-mobile.json'));
-  assert.ok(kept('.obsidian/plugins/self-sync/data.json'));
-  assert.ok(kept('.obsidian/plugins/self-sync/main.js'), "the plugin's own code is never rolled back by a restore");
-  assert.ok(!kept('.obsidian/plugins/self-sync-extra/main.js'));
+  assert.ok(kept('.obsidian/plugins/coffer/data.json'));
+  assert.ok(kept('.obsidian/plugins/coffer/main.js'), "the plugin's own code is never rolled back by a restore");
+  assert.ok(!kept('.obsidian/plugins/coffer-extra/main.js'));
   assert.ok(!kept('Privateer.md'));
   assert.ok(!kept('notes/a.md'));
   assert.ok(keepOut([], ['.obsidian'])('.obsidian/app.json'), 'the settings folder when it does not sync on this device');

@@ -86,11 +86,11 @@ test('settings: storage address and sync config', () => {
   });
   assert.deepEqual(remoteSpec(dav(), secret), { type: 'webdav', url: 'https://dav.example.com/me/vault', username: 'me', password: 'dav pw' });
 
-  const c = syncConfig(s3({ exclude: 'Private/\n*.tmp', deviceName: 'laptop', retentionDays: 0 }), '.config', '.config/plugins/self-sync');
+  const c = syncConfig(s3({ exclude: 'Private/\n*.tmp', deviceName: 'laptop', retentionDays: 0 }), '.config', '.config/plugins/coffer');
   assert.deepEqual(c.exclude, [
-    '.self-sync/**', '.config/workspace*.json', '.trash/**', '.git/**', '.DS_Store',
+    '.coffer/**', '.config/workspace*.json', '.trash/**', '.git/**', '.DS_Store',
     '.*', '*/**/.*/', '.!(config)/', '.config/**/node_modules/',
-    '.config/plugins/self-sync/state.json', '.config/plugins/self-sync/data.json', 'Private/', '*.tmp',
+    '.config/plugins/coffer/state.json', '.config/plugins/coffer/data.json', 'Private/', '*.tmp',
   ]);
   assert.equal(c.deviceName, 'laptop');
   assert.equal(c.retentionDays, 1);
@@ -106,10 +106,10 @@ test('settings: automatic cleanup is due after its interval', () => {
 
 test('setup codes carry storage settings and keys under the passphrase', async () => {
   const code = await encodeSetupCode(s3(), secret);
-  assert.match(code, /^selfsync1\./);
+  assert.match(code, /^coffer1\./);
   assert.ok(!code.includes('SECRET'));
   assert.equal(
-    await openWithPassphrase(code.slice('selfsync1.'.length), 'vault pass'),
+    await openWithPassphrase(code.slice('coffer1.'.length), 'vault pass'),
     '{"storageType":"s3","endpoint":" https://s3.example.com ","region":" ","bucket":"bkt ","prefix":"my vault","pathStyle":true,' +
       '"webdavUrl":"","webdavUser":"","accessKey":"AKID","secretKey":"SECRET","webdavPassword":""}',
   );
@@ -118,16 +118,16 @@ test('setup codes carry storage settings and keys under the passphrase', async (
   assert.deepEqual(settings, {
     storageType: 's3', endpoint: ' https://s3.example.com ', region: ' ', bucket: 'bkt ', prefix: 'my vault', pathStyle: true,
     webdavUrl: '', webdavUser: '',
-    accessKeySecret: id('self-sync-access-key'), secretKeySecret: id('self-sync-secret-key'), webdavPasswordSecret: '', passphraseSecret: id('self-sync-passphrase'),
+    accessKeySecret: id('coffer-access-key'), secretKeySecret: id('coffer-secret-key'), webdavPasswordSecret: '', passphraseSecret: id('coffer-passphrase'),
   });
-  assert.deepEqual(stored, [[id('self-sync-access-key'), 'AKID'], [id('self-sync-secret-key'), 'SECRET'], [id('self-sync-passphrase'), 'vault pass']]);
+  assert.deepEqual(stored, [[id('coffer-access-key'), 'AKID'], [id('coffer-secret-key'), 'SECRET'], [id('coffer-passphrase'), 'vault pass']]);
   await assert.rejects(decodeSetupCode(code, 'wrong', 'My Notes'), /Wrong passphrase/);
 });
 
 test('each vault gets its own secret names, because a phone keeps one keychain for every vault', async () => {
   const secret = (name: string) => ({ k: 'AKID', s: 'SECRET', p: 'vault pass' })[name] ?? '';
   const code = await encodeSetupCode({ ...defaultSettings(true), endpoint: 'https://s3.example.com', bucket: 'b', accessKeySecret: 'k', secretKeySecret: 's', passphraseSecret: 'p' }, secret);
-  const vaults = ['Self Sync Test', 'Self Sync Test 2', '日記', 'メモ', 'self sync test', 'A'.repeat(200)];
+  const vaults = ['Coffer Test', 'Coffer Test 2', '日記', 'メモ', 'coffer test', 'A'.repeat(200)];
   const ids = [];
   for (const vault of vaults) {
     const { settings, secrets } = await decodeSetupCode(code, 'vault pass', vault);
@@ -136,8 +136,8 @@ test('each vault gets its own secret names, because a phone keeps one keychain f
     ids.push(...secrets.map(([name]) => name));
   }
   assert.equal(new Set(ids).size, ids.length);
-  assert.match(secretName('self-sync-passphrase', 'Self Sync Test'), /^self-sync-passphrase-self-sync-test-[a-z0-9]+$/);
-  assert.equal(secretName('self-sync-passphrase', 'Self Sync Test'), secretName('self-sync-passphrase', 'Self Sync Test'));
+  assert.match(secretName('coffer-passphrase', 'Coffer Test'), /^coffer-passphrase-coffer-test-[a-z0-9]+$/);
+  assert.equal(secretName('coffer-passphrase', 'Coffer Test'), secretName('coffer-passphrase', 'Coffer Test'));
 });
 
 test('settings: a cleared or invalid number field changes nothing', () => {
@@ -185,10 +185,10 @@ test('storage is named the way the user knows it', () => {
 });
 
 test('a setup link carries the setup code, and either can be pasted', () => {
-  const code = 'selfsync1.abc+/=def';
+  const code = 'coffer1.abc+/=def';
   assert.equal(setupCodeFrom(setupLink(code)), code);
   assert.equal(setupCodeFrom(`  ${code}\n`), code);
-  assert.match(setupLink(code), /^obsidian:\/\/self-sync\?setup=selfsync1\.abc%2B%2F%3Ddef$/);
+  assert.match(setupLink(code), /^obsidian:\/\/coffer\?setup=coffer1\.abc%2B%2F%3Ddef$/);
 });
 
 const share = (over: Partial<Share> & Pick<Share, 'id' | 'folder'>): Share =>
@@ -208,8 +208,8 @@ test('settings saved before shared folders load unchanged, and a saved share get
 
 test('the vault leaves out every shared folder and its state, and a shared folder never holds the settings folder', () => {
   const s = s3({ exclude: 'Private/\n*.tmp\nWork/drafts/\nWork/*.bak\n**/cache/\nOther/x.md', shares: [share({ id: 'w1', folder: 'Work' }), share({ id: 'n2', folder: 'Café/Notes' })] });
-  const c = syncConfig(s, '.obsidian', '.obsidian/plugins/self-sync');
-  assert.deepEqual(c.exclude.slice(-4), ['Work/', '.obsidian/plugins/self-sync/state-w1.json', 'Café/Notes/', '.obsidian/plugins/self-sync/state-n2.json']);
+  const c = syncConfig(s, '.obsidian', '.obsidian/plugins/coffer');
+  assert.deepEqual(c.exclude.slice(-4), ['Work/', '.obsidian/plugins/coffer/state-w1.json', 'Café/Notes/', '.obsidian/plugins/coffer/state-n2.json']);
   const vault = compileExcludes(c.exclude);
   assert.ok(vault('Work/a.md') && vault('Work/deep/b.md') && vault('Café/Notes/c.md'));
   assert.ok(!vault('Work notes/a.md') && !vault('Workshop.md') && !vault('Café/other.md'), 'a sibling whose name starts the same still syncs');
@@ -229,14 +229,14 @@ test('the vault leaves out every shared folder and its state, and a shared folde
 });
 
 test('what Obsidian does not list is left out: names starting with a dot, except the settings folder when it syncs, without its node_modules', () => {
-  const vault = compileExcludes(syncConfig(s3(), '.obsidian', '.obsidian/plugins/self-sync').exclude);
+  const vault = compileExcludes(syncConfig(s3(), '.obsidian', '.obsidian/plugins/coffer').exclude);
   for (const path of ['.gitignore', '.vscode/settings.json', 'notes/.keep', 'notes/.cache/x.json', 'a/b/.c/d.md', '.obsidianx/a', '.obsidian/plugins/p/.hotreload', '.obsidian/plugins/p/node_modules/m/i.js', '.obsidian/plugins/p/.git/HEAD']) {
     assert.ok(vault(path), path);
   }
   for (const path of ['notes/n.md', 'v1.2.md', 'notes/a.b/c.md', 'a/b.c/.d', '.obsidian/app.json', '.obsidian/plugins/p/main.js', '.obsidian/snippets/x.css']) {
     assert.equal(vault(path), path === 'a/b.c/.d', path);
   }
-  const without = compileExcludes(syncConfig(s3({ syncConfigDir: false }), '.obsidian', '.obsidian/plugins/self-sync').exclude);
+  const without = compileExcludes(syncConfig(s3({ syncConfigDir: false }), '.obsidian', '.obsidian/plugins/coffer').exclude);
   assert.ok(without('.obsidian/app.json') && without('.obsidian/plugins/p/main.js') && !without('notes/n.md'));
   const shared = compileExcludes(shareConfig(s3(), share({ id: 'w', folder: 'Work' }), '.obsidian').exclude);
   for (const path of ['.keep', '.hidden/a.md', 'sub/.hidden/a.md', 'sub/.keep']) assert.ok(shared(path), path);
@@ -245,7 +245,7 @@ test('what Obsidian does not list is left out: names starting with a dot, except
 
 test('a shared folder must be a real folder of the vault, outside the others, the settings folder and what is left out', () => {
   const s = s3({ exclude: 'Private/\n*.tmp', shares: [share({ id: 'w', folder: 'Work' }), share({ id: 'f', folder: 'Family/Photos' })] });
-  const problem = (folder: string, id = '') => folderProblem(s, folder, '.obsidian', '.obsidian/plugins/self-sync', id);
+  const problem = (folder: string, id = '') => folderProblem(s, folder, '.obsidian', '.obsidian/plugins/coffer', id);
   assert.equal(problem('Notes'), '');
   assert.equal(problem('Work notes'), '', 'only starts like a shared folder');
   assert.equal(problem('Family'), 'The shared folder “Family/Photos” is inside it. Shared folders can not be inside each other.');
@@ -263,8 +263,8 @@ test('a shared folder must be a real folder of the vault, outside the others, th
   assert.match(problem('/Notes'), /not a folder name/);
   assert.match(problem('What?'), /can not contain/);
   const cafe = s3({ shares: [share({ id: 'c', folder: 'Café'.normalize('NFD') })] });
-  assert.equal(folderProblem(cafe, 'Café'.normalize('NFC'), '.obsidian', '.obsidian/plugins/self-sync'), `“${'Café'.normalize('NFD')}” is already a shared folder.`, 'either Unicode form names the same folder');
-  assert.match(folderProblem(cafe, `${'Café'.normalize('NFC')}/Sub`, '.obsidian', '.obsidian/plugins/self-sync'), /inside the shared folder/);
+  assert.equal(folderProblem(cafe, 'Café'.normalize('NFC'), '.obsidian', '.obsidian/plugins/coffer'), `“${'Café'.normalize('NFD')}” is already a shared folder.`, 'either Unicode form names the same folder');
+  assert.match(folderProblem(cafe, `${'Café'.normalize('NFC')}/Sub`, '.obsidian', '.obsidian/plugins/coffer'), /inside the shared folder/);
   assert.equal(normalFolder(' /Notes//Sub/ '), 'Notes/Sub');
   assert.equal(normalFolder('Notes\\Sub'), 'Notes/Sub');
 });
@@ -306,18 +306,18 @@ test('an invite to a shared folder is a setup code of its own kind, opened with 
   assert.equal(codeKind(` ${vault}`), 'vault');
   assert.equal(codeKind('hello'), undefined);
   assert.ok(!invite.includes('SECRET'));
-  assert.match(setupLink(invite), /^obsidian:\/\/self-sync\?share=selfshare1\./);
+  assert.match(setupLink(invite), /^obsidian:\/\/coffer\?share=coffershare1\./);
   assert.equal(setupCodeFrom(setupLink(invite)), invite);
   assert.match(setupLink(vault), /\?setup=/);
 
   const { storage, secrets, folder } = await decodeInvite(`${invite}\n`, 'share pass', 'My Notes', 'j9');
   const id = (base: string) => shareSecretName(base, 'My Notes', 'j9');
   assert.equal(folder, 'Work');
-  assert.deepEqual([storage.endpoint, storage.bucket, storage.prefix, storage.accessKeySecret, storage.passphraseSecret], ['https://s3.example.com', 'bkt', 'team', id('self-sync-access-key'), id('self-sync-passphrase')]);
-  assert.deepEqual(secrets, [[id('self-sync-access-key'), 'AKID'], [id('self-sync-secret-key'), 'SECRET'], [id('self-sync-passphrase'), 'share pass']]);
+  assert.deepEqual([storage.endpoint, storage.bucket, storage.prefix, storage.accessKeySecret, storage.passphraseSecret], ['https://s3.example.com', 'bkt', 'team', id('coffer-access-key'), id('coffer-passphrase')]);
+  assert.deepEqual(secrets, [[id('coffer-access-key'), 'AKID'], [id('coffer-secret-key'), 'SECRET'], [id('coffer-passphrase'), 'share pass']]);
   for (const [name] of secrets) assert.match(name, /^[a-z0-9-]{1,64}$/);
-  assert.notEqual(id('self-sync-passphrase'), secretName('self-sync-passphrase', 'My Notes'), "a share's secrets never replace the vault's");
-  assert.notEqual(id('self-sync-passphrase'), shareSecretName('self-sync-passphrase', 'My Notes', 'k1'));
+  assert.notEqual(id('coffer-passphrase'), secretName('coffer-passphrase', 'My Notes'), "a share's secrets never replace the vault's");
+  assert.notEqual(id('coffer-passphrase'), shareSecretName('coffer-passphrase', 'My Notes', 'k1'));
 
   await assert.rejects(decodeInvite(invite, 'vault pass', 'My Notes', 'j9'), /Wrong passphrase/);
   await assert.rejects(decodeInvite(vault, 'vault pass', 'My Notes', 'j9'), /setup link for a whole vault/);

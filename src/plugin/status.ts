@@ -141,7 +141,7 @@ export function describeFailure(e: unknown): Problem {
     return { id: 'bucket', severity: 'critical', title: 'Bucket not found', detail: 'Sync is stopped. Check the bucket name and region.', action: 'settings' };
   }
   if (/vault uses format/i.test(message)) {
-    return { id: 'format', severity: 'critical', title: 'Update Self Sync on this device', detail: `Another device uses a newer version. (${message})` };
+    return { id: 'format', severity: 'critical', title: 'Update Coffer on this device', detail: `Another device uses a newer version. (${message})` };
   }
   if (/failed authentication|corrupted|tampered|is missing|cannot be read|gap before|inconsistent|wrong size|vanished/i.test(message)) {
     return {

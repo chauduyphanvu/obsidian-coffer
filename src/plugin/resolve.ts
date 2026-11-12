@@ -3,7 +3,7 @@ import { Modal, Notice, TFile, type App } from 'obsidian';
 import { applyChoices, hunks, type Choice, type Hunk } from '../core/merge.ts';
 import { conflictOriginal, fileName } from '../core/paths.ts';
 import { errorText, plural } from '../core/text.ts';
-import type SelfSyncPlugin from './main.ts';
+import type CofferPlugin from './main.ts';
 import { lookup } from './obsidianfs.ts';
 import { MAX_COMPARE_BYTES, compareConflict, unchangedSince, type Comparison, type Snapshot, type WholeReason } from './status.ts';
 import { button, buttonRow, choice, message, openLink } from './ui.ts';
@@ -21,12 +21,12 @@ const WHY: Record<WholeReason, (name: string) => string> = {
 };
 
 /** Opens the resolver for one conflict copy. */
-export function resolveConflict(plugin: SelfSyncPlugin, copy: string): void {
+export function resolveConflict(plugin: CofferPlugin, copy: string): void {
   new ConflictModal(plugin.app, plugin, copy).open();
 }
 
 /** Opens the resolver for the first conflict copy still waiting, or says there is none. */
-export function resolveFirstConflict(plugin: SelfSyncPlugin): void {
+export function resolveFirstConflict(plugin: CofferPlugin): void {
   const copy = plugin.allConflictCopies().find((p) => lookup(plugin.app, p) instanceof TFile);
   if (copy) resolveConflict(plugin, copy);
   else new Notice('No files are waiting to be resolved.');
@@ -35,12 +35,12 @@ export function resolveFirstConflict(plugin: SelfSyncPlugin): void {
 /** Lines as written, one block each, without their line endings. */
 function showLines(parent: HTMLElement, lines: string[], cls: string): void {
   if (!lines.length) return;
-  const box = parent.createDiv({ cls: `self-sync-lines ${cls}` });
-  for (const l of lines) box.createDiv({ cls: 'self-sync-line', text: l.replace(/\r?\n$/, '') });
+  const box = parent.createDiv({ cls: `coffer-lines ${cls}` });
+  for (const l of lines) box.createDiv({ cls: 'coffer-line', text: l.replace(/\r?\n$/, '') });
 }
 
 class ConflictModal extends Modal {
-  private plugin: SelfSyncPlugin;
+  private plugin: CofferPlugin;
   /** This device's version, kept aside by the sync. */
   private copy: string;
   /** The other device's version, under the original name. */
@@ -56,7 +56,7 @@ class ConflictModal extends Modal {
   private stale = '';
   private busy = false;
 
-  constructor(app: App, plugin: SelfSyncPlugin, copy: string) {
+  constructor(app: App, plugin: CofferPlugin, copy: string) {
     super(app);
     this.plugin = plugin;
     this.copy = copy;
@@ -65,7 +65,7 @@ class ConflictModal extends Modal {
   }
 
   onOpen(): void {
-    this.modalEl.addClass('self-sync-modal', 'self-sync-resolve');
+    this.modalEl.addClass('coffer-modal', 'coffer-resolve');
     this.setTitle(this.name);
     void this.load();
   }
@@ -76,7 +76,7 @@ class ConflictModal extends Modal {
 
   private async load(): Promise<void> {
     this.contentEl.empty();
-    this.contentEl.createEl('p', { cls: 'self-sync-intro', text: 'Comparing the two versions…' });
+    this.contentEl.createEl('p', { cls: 'coffer-intro', text: 'Comparing the two versions…' });
     this.error = this.stale = '';
     this.busy = false;
     try {
@@ -129,24 +129,24 @@ class ConflictModal extends Modal {
     const h = this.hunks[this.at];
     const picked = this.choices[this.at];
     c.createEl('p', {
-      cls: 'self-sync-intro',
+      cls: 'coffer-intro',
       text: total === 1 ? 'The two versions differ in one place. Choose what to keep.' : `The two versions differ in ${total} places. Choose what to keep at each.`,
     });
     if (total > 1) {
-      const nav = c.createDiv({ cls: 'self-sync-resolve-nav' });
-      nav.createDiv({ cls: 'self-sync-resolve-count', text: `Change ${this.at + 1} of ${total}` });
+      const nav = c.createDiv({ cls: 'coffer-resolve-nav' });
+      nav.createDiv({ cls: 'coffer-resolve-count', text: `Change ${this.at + 1} of ${total}` });
       button(nav, '', () => this.go(this.at - 1)).setIcon('chevron-left').setTooltip('Previous change').setDisabled(this.at === 0);
       button(nav, '', () => this.go(this.at + 1)).setIcon('chevron-right').setTooltip('Next change').setDisabled(this.at === total - 1);
     }
 
-    const card = c.createDiv({ cls: 'self-sync-hunk' });
-    showLines(card, h.before, 'self-sync-context');
+    const card = c.createDiv({ cls: 'coffer-hunk' });
+    showLines(card, h.before, 'coffer-context');
     this.side(card, 'This device', h.change.a, 'mine', picked);
     this.side(card, 'Other device', h.change.b, 'theirs', picked);
-    showLines(card, h.after, 'self-sync-context');
+    showLines(card, h.after, 'coffer-context');
 
-    c.createDiv({ cls: 'self-sync-pick-label', text: 'Keep' });
-    const pick = c.createDiv({ cls: 'self-sync-pick' });
+    c.createDiv({ cls: 'coffer-pick-label', text: 'Keep' });
+    const pick = c.createDiv({ cls: 'coffer-pick' });
     const options: [Choice, string][] = [['mine', 'This device'], ['theirs', 'Other device']];
     if (h.change.a.length && h.change.b.length) options.push(['both', 'Both']);
     for (const [value, text] of options) {
@@ -154,7 +154,7 @@ class ConflictModal extends Modal {
       b.buttonEl.toggleClass('is-selected', picked === value);
       b.buttonEl.setAttr('aria-pressed', String(picked === value));
     }
-    if (options.length === 3) c.createDiv({ cls: 'self-sync-hint', text: "Both keeps this device's lines first, then the other device's." });
+    if (options.length === 3) c.createDiv({ cls: 'coffer-hint', text: "Both keeps this device's lines first, then the other device's." });
     if (total > 1) {
       const all = buttonRow(c);
       button(all, 'Use all from this device', () => this.chooseAll('mine')).setDisabled(this.busy);
@@ -166,20 +166,20 @@ class ConflictModal extends Modal {
   }
 
   private side(parent: HTMLElement, label: string, lines: string[], which: 'mine' | 'theirs', picked: Choice | undefined): void {
-    const box = parent.createDiv({ cls: `self-sync-side is-${which}` });
+    const box = parent.createDiv({ cls: `coffer-side is-${which}` });
     const kept = picked === which || picked === 'both';
     if (picked) box.addClass(kept ? 'is-kept' : 'is-dropped');
-    const head = box.createDiv({ cls: 'self-sync-side-label' });
+    const head = box.createDiv({ cls: 'coffer-side-label' });
     head.createSpan({ text: label });
-    if (picked) head.createSpan({ cls: 'self-sync-side-state', text: kept ? 'Keeping' : 'Not keeping' });
-    if (lines.length) showLines(box, lines, 'self-sync-changed');
-    else box.createDiv({ cls: 'self-sync-none', text: 'Not in this version' });
+    if (picked) head.createSpan({ cls: 'coffer-side-state', text: kept ? 'Keeping' : 'Not keeping' });
+    if (lines.length) showLines(box, lines, 'coffer-changed');
+    else box.createDiv({ cls: 'coffer-none', text: 'Not in this version' });
   }
 
   private go(at: number): void {
     this.at = Math.max(0, Math.min(this.hunks.length - 1, at));
     this.render();
-    this.contentEl.querySelector('.self-sync-resolve-nav')?.scrollIntoView({ block: 'nearest' });
+    this.contentEl.querySelector('.coffer-resolve-nav')?.scrollIntoView({ block: 'nearest' });
   }
 
   /** A first choice at a change moves on to the next one still open. */
@@ -208,12 +208,12 @@ class ConflictModal extends Modal {
   }
 
   private renderWhole(c: HTMLElement, reason: WholeReason): void {
-    c.createEl('p', { cls: 'self-sync-intro', text: WHY[reason](this.name) });
-    const files = c.createDiv({ cls: 'self-sync-files' });
+    c.createEl('p', { cls: 'coffer-intro', text: WHY[reason](this.name) });
+    const files = c.createDiv({ cls: 'coffer-files' });
     this.fileRow(files, 'This device', this.copy);
     if (reason !== 'missing') this.fileRow(files, 'Other device', this.original);
 
-    const options = c.createDiv({ cls: 'self-sync-options' });
+    const options = c.createDiv({ cls: 'coffer-options' });
     const option = (title: string, hint: string, run: () => Promise<void>) => {
       choice(options, title, hint, () => void run()).disabled = this.busy;
     };
@@ -241,7 +241,7 @@ class ConflictModal extends Modal {
   }
 
   private fileRow(parent: HTMLElement, label: string, path: string): void {
-    const row = parent.createDiv({ cls: 'self-sync-file' });
+    const row = parent.createDiv({ cls: 'coffer-file' });
     row.createSpan({ text: `${label}: ${fileName(path)}` });
     openLink(row, this.app, 'Open', path, () => this.close());
   }
@@ -254,7 +254,7 @@ class ConflictModal extends Modal {
       button(buttonRow(c), 'Compare again', () => this.load(), 'cta');
       return;
     }
-    if (hint) c.createDiv({ cls: 'self-sync-hint', text: hint });
+    if (hint) c.createDiv({ cls: 'coffer-hint', text: hint });
     const row = buttonRow(c);
     button(row, 'Cancel', () => this.close());
     if (save) button(row, this.busy ? 'Saving…' : 'Save', save, 'cta').setDisabled(blocked || this.busy);

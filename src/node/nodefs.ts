@@ -4,7 +4,7 @@ import type { FileStat, LocalFS, LocalFile, ObjectInfo, RemoteStore, StateStore 
 
 const toStat = (s: { size: number; mtimeMs: number }): FileStat => ({ size: s.size, mtime: Math.floor(s.mtimeMs) });
 const missing = (e: unknown) => (e as NodeJS.ErrnoException).code === 'ENOENT';
-const TMP = '.selfsync-tmp';
+const TMP = '.coffer-tmp';
 /** How long after one of its own writes or removals settles a change event there is still taken for its echo. */
 const ECHO_MS = 60_000;
 

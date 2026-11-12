@@ -47,7 +47,7 @@ export class Packer {
   private size = 0;
   private id: string;
   private inflight = new Set<Promise<void>>();
-  private failure: unknown;
+  private failure: Error | undefined;
 
   constructor(repo: Repo, target: number, solo: number, limit: number) {
     this.repo = repo;
@@ -84,7 +84,7 @@ export class Packer {
     const p: Promise<void> = this.repo
       .putPack(id, data)
       .catch((e) => {
-        this.failure ??= e;
+        this.failure ??= e instanceof Error ? e : new Error(String(e));
       })
       .finally(() => this.inflight.delete(p));
     this.inflight.add(p);

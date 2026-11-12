@@ -306,13 +306,13 @@ export function cleanupDue(s: Pick<Settings, 'autoCleanDays' | 'lastCleanup'>, n
 const SETUP_FIELDS = ['storageType', 'endpoint', 'region', 'bucket', 'prefix', 'pathStyle', 'webdavUrl', 'webdavUser'] as const;
 /** Field in the code, setting that names the secret, secret name used on the receiving device. */
 const SETUP_SECRETS = [
-  ['accessKey', 'accessKeySecret', 'self-sync-access-key'],
-  ['secretKey', 'secretKeySecret', 'self-sync-secret-key'],
-  ['webdavPassword', 'webdavPasswordSecret', 'self-sync-webdav-password'],
+  ['accessKey', 'accessKeySecret', 'coffer-access-key'],
+  ['secretKey', 'secretKeySecret', 'coffer-secret-key'],
+  ['webdavPassword', 'webdavPasswordSecret', 'coffer-webdav-password'],
 ] as const;
 
-const VAULT_CODE = 'selfsync1.';
-const SHARE_CODE = 'selfshare1.';
+const VAULT_CODE = 'coffer1.';
+const SHARE_CODE = 'coffershare1.';
 
 /** What a code is: a vault's setup code, an invite to a shared folder, or neither. */
 export function codeKind(code: string): 'vault' | 'share' | undefined {
@@ -355,7 +355,7 @@ export function secretName(base: string, vault: string): string {
 export const shareSecretName = (base: string, vault: string, id: string) => secretName(base, `${vault} ${id}`);
 
 async function openCode(code: string, passphrase: string, name: (base: string) => string) {
-  const body = code.trim().replace(/^selfs(?:ync|hare)1\./, '');
+  const body = code.trim().replace(/^coffer(?:share)?1\./, '');
   const p = JSON.parse(await openWithPassphrase(body, passphrase)) as Record<string, string | boolean>;
   const settings: Record<string, unknown> = { storageType: p.storageType === 'webdav' ? 'webdav' : 's3' };
   for (const f of SETUP_FIELDS) if (f !== 'storageType') settings[f] = p[f];
@@ -366,15 +366,15 @@ async function openCode(code: string, passphrase: string, name: (base: string) =
     return value ? id : '';
   };
   for (const [field, setting, id] of SETUP_SECRETS) settings[setting] = keep(id, p[field]);
-  settings.passphraseSecret = keep('self-sync-passphrase', passphrase);
+  settings.passphraseSecret = keep('coffer-passphrase', passphrase);
   return { settings, secrets, folder: typeof p.folder === 'string' ? p.folder : '' };
 }
 
 /** The settings a setup code fills in, and the secrets to store first, in order, named for `vault`. */
 export async function decodeSetupCode(code: string, passphrase: string, vault: string): Promise<{ settings: Partial<Settings>; secrets: [string, string][] }> {
-  if (codeKind(code) === 'share') throw new Error('This is an invite link to a shared folder. Add it under Shared folders in the Self Sync settings.');
+  if (codeKind(code) === 'share') throw new Error('This is an invite link to a shared folder. Add it under Shared folders in the Coffer settings.');
   const { settings, secrets } = await openCode(code, passphrase, (base) => secretName(base, vault));
-  return { settings: settings as Partial<Settings>, secrets };
+  return { settings, secrets };
 }
 
 /**
@@ -385,7 +385,7 @@ export async function decodeInvite(code: string, passphrase: string, vault: stri
   const kind = codeKind(code);
   if (kind !== 'share') throw new Error(kind === 'vault' ? 'This is a setup link for a whole vault, not an invite to a shared folder.' : 'That is not an invite link.');
   const { settings, secrets, folder } = await openCode(code, passphrase, (base) => shareSecretName(base, vault, id));
-  return { storage: settings as Partial<Storage>, secrets, folder: normalFolder(folder).split('/').pop() ?? '' };
+  return { storage: settings, secrets, folder: normalFolder(folder).split('/').pop() ?? '' };
 }
 
 export type Provider = 'r2' | 'b2' | 'aws' | 's3' | 'webdav';
@@ -475,7 +475,7 @@ export function describeStorage(s: Storage): string {
 export const folderFor = (vaultName: string) => vaultName.trim().replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'vault';
 
 /** A link that opens Obsidian on the other device with the setup code, or the invite, filled in. */
-export const setupLink = (code: string) => `obsidian://self-sync?${codeKind(code) === 'share' ? 'share' : 'setup'}=${encodeURIComponent(code)}`;
+export const setupLink = (code: string) => `obsidian://coffer?${codeKind(code) === 'share' ? 'share' : 'setup'}=${encodeURIComponent(code)}`;
 
 /** The code inside whatever was pasted: the code itself, a setup link or an invite link. */
 export function setupCodeFrom(text: string): string {

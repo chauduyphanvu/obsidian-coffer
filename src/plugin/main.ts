@@ -6,7 +6,7 @@ import { SafetyError, type GcResult, type SyncEngine, type SyncResult } from '..
 import { fileName, vaultKey } from '../core/paths.ts';
 import type { Repo } from '../core/repo.ts';
 import type { ScopedFS } from '../core/scopedfs.ts';
-import { errorText, plural } from '../core/text.ts';
+import { errorText, firstSentence, plural } from '../core/text.ts';
 import { planRestore, type DeletedFile } from '../core/timeline.ts';
 import type { Entry, Version } from '../core/types.ts';
 import { checkStore } from '../stores/doctor.ts';
@@ -125,7 +125,7 @@ type Force = boolean | string;
 
 const keyOf = (share?: Share) => share?.id ?? '';
 
-export default class SelfSyncPlugin extends Plugin {
+export default class CofferPlugin extends Plugin {
   settings: Settings = defaultSettings(Platform.isMobile);
   /** "Receiving 40 of 249" while a sync moves files, otherwise empty. */
   progress = '';
@@ -169,10 +169,10 @@ export default class SelfSyncPlugin extends Plugin {
     }
     this.addSettingTab(new SettingsTab(this.app, this));
     this.statusEl = this.addStatusBarItem();
-    this.statusEl.addClass('self-sync-status', 'mod-clickable');
+    this.statusEl.addClass('coffer-status', 'mod-clickable');
     this.statusEl.onClickEvent(() => this.openStatus());
     this.ribbonEl = this.addRibbonIcon('refresh-cw', 'Sync now', () => (this.problems().length ? this.openStatus() : void this.sync(true)));
-    this.registerObsidianProtocolHandler('self-sync', (params) => {
+    this.registerObsidianProtocolHandler('coffer', (params) => {
       if (params.setup) new SetupModal(this.app, this, 'join', params.setup).open();
       else if (params.share) new ShareModal(this.app, this, 'join', params.share).open();
     });
@@ -285,7 +285,7 @@ export default class SelfSyncPlugin extends Plugin {
       this.applySchedule();
       this.updateStatus();
       if (!this.configured()) {
-        const n = new Notice(this.fragment('Self Sync is not set up yet', 'Tap to set up encrypted sync for this vault.'), 15_000);
+        const n = new Notice(this.fragment('Coffer is not set up yet', 'Tap to set up encrypted sync for this vault.'), 15_000);
         n.containerEl.addEventListener('click', () => new SetupModal(this.app, this, 'start').open());
       } else if (this.settings.syncOnStart) void this.auto('start');
     });
@@ -488,15 +488,15 @@ export default class SelfSyncPlugin extends Plugin {
     if (this.ribbonEl) {
       setIcon(this.ribbonEl, tone === 'critical' || tone === 'warning' ? 'alert-triangle' : 'refresh-cw');
       this.ribbonEl.setAttribute('aria-label', tone === 'critical' || tone === 'warning' ? `Sync: ${text}` : 'Sync now');
-      this.ribbonEl.toggleClass('self-sync-alert', tone === 'critical');
+      this.ribbonEl.toggleClass('coffer-alert', tone === 'critical');
     }
     for (const l of this.listeners) l();
   }
 
   fragment(title: string, detail: string): DocumentFragment {
     return createFragment((f) => {
-      f.createDiv({ cls: 'self-sync-notice-title', text: title });
-      if (detail) f.createDiv({ cls: 'self-sync-notice-detail', text: detail });
+      f.createDiv({ cls: 'coffer-notice-title', text: title });
+      if (detail) f.createDiv({ cls: 'coffer-notice-detail', text: detail });
     });
   }
 
@@ -519,10 +519,10 @@ export default class SelfSyncPlugin extends Plugin {
       const critical = fresh.some((p) => p.severity === 'critical');
       const [title, detail] =
         fresh.length === 1
-          ? [fresh[0].title, `${fresh[0].detail.split(/(?<=\.)\s|\n/)[0]} Tap for details.`]
+          ? [fresh[0].title, `${firstSentence(fresh[0].detail)} Tap for details.`]
           : [critical ? 'Sync needs your attention' : `${fresh.length} things to review`, `${fresh.map((p) => p.title).join('\n')}\nTap for details.`];
       const notice = new Notice(this.fragment(title, detail), critical ? 0 : 30_000);
-      notice.containerEl.addClass('self-sync-notice', critical ? 'is-critical' : 'is-warning');
+      notice.containerEl.addClass('coffer-notice', critical ? 'is-critical' : 'is-warning');
       notice.containerEl.addEventListener('click', () => this.openStatus());
       this.alertNotice = { notice, ids: fresh.map((p) => p.id) };
     }
@@ -987,7 +987,7 @@ export default class SelfSyncPlugin extends Plugin {
       .map((p) => p.path);
     const taken = new Set([...loaded, ...(await this.localPaths(share)).keys()].map((p) => vaultKey(p).toLowerCase()));
     const to = placeRestored(files.map((f) => f.path), taken);
-    const outcome: ({ path: string; to: string } | Failed)[] = new Array(files.length);
+    const outcome: ({ path: string; to: string } | Failed)[] = new Array<{ path: string; to: string } | Failed>(files.length);
     await pool(files, 4, async (f, i) => {
       try {
         await this.writeFile(share, to.get(f.path)!, await engine.readVersion(f.entry));

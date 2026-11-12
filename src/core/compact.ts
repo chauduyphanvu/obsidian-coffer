@@ -37,7 +37,7 @@ export function planCompaction(packs: { id: string; size: number; modified: numb
   for (const e of current.values()) {
     for (const c of e.chunks) {
       let m = byPack.get(c.pack);
-      if (!m) byPack.set(c.pack, (m = new Map()));
+      if (!m) byPack.set(c.pack, (m = new Map<number, ChunkRef>()));
       m.set(c.off, c);
     }
   }
@@ -74,7 +74,7 @@ export function planCompaction(packs: { id: string; size: number; modified: numb
  */
 export async function copyChunks(repo: Repo, plan: Compaction, cfg: SyncConfig): Promise<Map<string, ChunkRef>> {
   const ranges = packRanges(plan.chunks, cfg.rangeGapBytes, MAX_RANGE);
-  const data: (Uint8Array | null)[] = new Array(ranges.length);
+  const data: (Uint8Array | null)[] = new Array<Uint8Array | null>(ranges.length);
   await pool(ranges, cfg.concurrency, async (r, i) => {
     const got = await repo.getPackRange(r.pack, r.start, r.end);
     data[i] = got && got.length === r.end - r.start ? got : null;

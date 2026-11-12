@@ -367,7 +367,7 @@ export class SyncEngine {
       await loadSnapshot();
       seqs = seqs.filter((s) => s > st.lastSeq);
     }
-    const commits: Commit[] = new Array(seqs.length);
+    const commits: Commit[] = new Array<Commit>(seqs.length);
     await pool(seqs, this.cfg.concurrency, async (seq, i) => {
       const c = await repo.readCommit(seq);
       if (!c) throw new Error(`Commit ${seq} is listed but cannot be read`);
@@ -945,7 +945,7 @@ export class SyncEngine {
         bytes += files[i].size;
       }
       // In the batch's order, whichever finishes first, so the same changes always make the same commit.
-      const prepared: (Prepared | undefined)[] = new Array(batch.length);
+      const prepared: (Prepared | undefined)[] = new Array<Prepared | undefined>(batch.length);
       await pool(batch, this.cfg.concurrency, async (f, n) => {
         try {
           prepared[n] = await prepare(f);
@@ -1010,7 +1010,7 @@ export class SyncEngine {
     const { repo } = await this.open();
     const n = this.cfg.snapshotEvery;
     try {
-      const commits: Commit[] = new Array(n);
+      const commits: Commit[] = new Array<Commit>(n);
       await pool(commits, this.cfg.concurrency, async (_, i) => {
         const c = await repo.readCommit(seq - n + 1 + i);
         if (!c) throw new Error('missing commit');

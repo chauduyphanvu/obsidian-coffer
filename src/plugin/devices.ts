@@ -3,18 +3,18 @@ import { Modal, Notice, Setting, type App } from 'obsidian';
 import { agoText, forgetDevice, listDevices, statusText, statusTone, type DeviceStatus } from '../core/devices.ts';
 import type { RepoView } from '../core/engine.ts';
 import { errorText } from '../core/text.ts';
-import type SelfSyncPlugin from './main.ts';
+import type CofferPlugin from './main.ts';
 import { button, buttonRow, message } from './ui.ts';
 
 /** Adds the block and fills it in the background, so the rest of the screen is not held up. */
-export function renderDevices(containerEl: HTMLElement, plugin: SelfSyncPlugin): void {
+export function renderDevices(containerEl: HTMLElement, plugin: CofferPlugin): void {
   new Setting(containerEl).setName('Devices').setHeading();
-  void load(containerEl.createDiv({ cls: 'self-sync-devices' }), plugin);
+  void load(containerEl.createDiv({ cls: 'coffer-devices' }), plugin);
 }
 
-async function load(box: HTMLElement, plugin: SelfSyncPlugin): Promise<void> {
+async function load(box: HTMLElement, plugin: CofferPlugin): Promise<void> {
   box.empty();
-  const note = (text: string) => message(box, text, 'self-sync-hint');
+  const note = (text: string) => message(box, text, 'coffer-hint');
   if (!plugin.configured()) {
     note('Set up sync to see the devices that share this vault.');
     return;
@@ -35,20 +35,20 @@ async function load(box: HTMLElement, plugin: SelfSyncPlugin): Promise<void> {
 }
 
 function row(box: HTMLElement, d: DeviceStatus, view: RepoView, forget: () => void): void {
-  const el = box.createDiv({ cls: `self-sync-device is-${statusTone(d)}` });
-  const text = el.createDiv({ cls: 'self-sync-device-text' });
-  const name = text.createDiv({ cls: 'self-sync-device-name', text: d.name });
-  if (d.isSelf) name.createSpan({ cls: 'self-sync-device-tag', text: 'This device' });
+  const el = box.createDiv({ cls: `coffer-device is-${statusTone(d)}` });
+  const text = el.createDiv({ cls: 'coffer-device-text' });
+  const name = text.createDiv({ cls: 'coffer-device-name', text: d.name });
+  if (d.isSelf) name.createSpan({ cls: 'coffer-device-tag', text: 'This device' });
   const about = [d.platform, d.version && `v${d.version}`].filter(Boolean).join(' · ');
-  if (about) text.createDiv({ cls: 'self-sync-device-meta', text: about });
-  text.createDiv({ cls: 'self-sync-device-meta', text: `Last synced ${agoText(view.now - d.lastSeen)}` });
-  const status = text.createDiv({ cls: 'self-sync-device-status' });
-  status.createSpan({ cls: 'self-sync-device-dot' });
+  if (about) text.createDiv({ cls: 'coffer-device-meta', text: about });
+  text.createDiv({ cls: 'coffer-device-meta', text: `Last synced ${agoText(view.now - d.lastSeen)}` });
+  const status = text.createDiv({ cls: 'coffer-device-status' });
+  status.createSpan({ cls: 'coffer-device-dot' });
   status.createSpan({ text: statusText(d, view.now) });
   if (!d.isSelf) button(el, 'Forget', forget).buttonEl.setAttribute('aria-label', `Forget ${d.name}`);
 }
 
-function confirmForget(plugin: SelfSyncPlugin, box: HTMLElement, view: RepoView, name: string): void {
+function confirmForget(plugin: CofferPlugin, box: HTMLElement, view: RepoView, name: string): void {
   new ForgetModal(plugin.app, name, async () => {
     try {
       await forgetDevice(view, name);
@@ -72,10 +72,10 @@ class ForgetModal extends Modal {
 
   onOpen(): void {
     const c = this.contentEl;
-    this.modalEl.addClass('self-sync-modal');
+    this.modalEl.addClass('coffer-modal');
     this.setTitle(`Forget ${this.name}?`);
     c.createEl('p', {
-      cls: 'self-sync-intro',
+      cls: 'coffer-intro',
       text: 'It leaves this list. Use this for a device you no longer sync; if it syncs again it shows up again. Nothing in your vault changes.',
     });
     const row = buttonRow(c);

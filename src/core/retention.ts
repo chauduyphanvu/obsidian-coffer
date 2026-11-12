@@ -166,7 +166,7 @@ export class Reads {
 
   /** Commits `lo` to `hi`, in order. */
   async range(lo: number, hi: number): Promise<Commit[]> {
-    const out: Commit[] = new Array(hi - lo + 1);
+    const out: Commit[] = new Array<Commit>(hi - lo + 1);
     await pool(out, this.cfg.concurrency, async (_, i) => {
       out[i] = await this.get(lo + i);
     });

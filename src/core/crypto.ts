@@ -35,6 +35,8 @@ async function expand(master: Uint8Array): Promise<Keys> {
   const base = await subtle.importKey('raw', bs(master), 'HKDF', false, ['deriveKey']);
   const derive = (info: string, alg: AesKeyGenParams | HmacKeyGenParams, usages: KeyUsage[]) =>
     subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: bs(utf8.encode(info)) }, base, alg, false, usages);
+  // These labels keep the plugin's first name: they are part of every stored vault's keys, so changing them would make
+  // all existing vaults unreadable.
   return {
     enc: await derive('self-sync/enc', { name: 'AES-GCM', length: 256 }, ['encrypt', 'decrypt']),
     id: await derive('self-sync/id', { name: 'HMAC', hash: 'SHA-256', length: 256 }, ['sign']),

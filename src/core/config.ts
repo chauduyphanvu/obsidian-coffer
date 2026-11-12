@@ -36,7 +36,7 @@ export interface SyncConfig {
 
 export const DEFAULT_CONFIG: SyncConfig = {
   deviceName: 'device',
-  exclude: ['.self-sync/**', '.obsidian/workspace*.json', '.trash/**', '.git/**', '.DS_Store'],
+  exclude: ['.coffer/**', '.obsidian/workspace*.json', '.trash/**', '.git/**', '.DS_Store'],
   configDir: '.obsidian',
   maxFileSizeMB: 500,
   conflictStrategy: 'merge',

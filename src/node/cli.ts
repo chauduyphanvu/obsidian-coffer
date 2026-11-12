@@ -25,7 +25,7 @@ interface CliConfig {
   sync?: Partial<SyncConfig>;
 }
 
-const USAGE = `Usage: node src/node/cli.ts <command> [--config=selfsync.json]
+const USAGE = `Usage: node src/node/cli.ts <command> [--config=coffer.json]
 
   sync [--force]         sync the vault once
   watch                  sync, then keep syncing until stopped; --poll=30 seconds between checks for
@@ -45,15 +45,15 @@ const USAGE = `Usage: node src/node/cli.ts <command> [--config=selfsync.json]
   verify [--deep]        check the stored data end to end without changing it; --deep also
                          downloads and checks everything the current files are stored in
   clean                  delete versions older than the retention window from storage
-  change-passphrase      re-protect the vault key with SELFSYNC_NEW_PASSPHRASE
+  change-passphrase      re-protect the vault key with COFFER_NEW_PASSPHRASE
   accept-storage         when sync stops because the history in storage is not the one this device
                          saw (part of it taken back or replaced), carry on from storage as it is now,
                          then sync: nothing is deleted, and where files differ both versions are kept.
                          Right after storage was restored from a backup; wrong if nobody did that on
                          purpose, as then someone else may have changed what is stored
 
-Secrets come from the environment: SELFSYNC_PASSPHRASE, and for S3
-SELFSYNC_ACCESS_KEY and SELFSYNC_SECRET_KEY, for WebDAV SELFSYNC_WEBDAV_PASSWORD.`;
+Secrets come from the environment: COFFER_PASSPHRASE, and for S3
+COFFER_ACCESS_KEY and COFFER_SECRET_KEY, for WebDAV COFFER_WEBDAV_PASSWORD.`;
 
 /** Each command's options besides --config. */
 const OPTIONS: Record<string, string[]> = {
@@ -71,7 +71,7 @@ const OPTIONS: Record<string, string[]> = {
   'accept-storage': [],
 };
 
-const STATE_DIR = '.self-sync';
+const STATE_DIR = '.coffer';
 const FORCE_HINT = 'to delete them anyway, run sync --force';
 const ACCEPT_HINT = 'if storage was put back to a backup or an older copy on purpose, run accept-storage to carry on from it as it is now';
 const WATCH_SETTLE_MS = 3000;
@@ -87,8 +87,8 @@ const env = (name: string) => {
 /** `firstRun`: this device has not synced yet, so a missing storage folder is created rather than taken for one not mounted. */
 function makeStore(remote: CliConfig['remote'], firstRun: boolean): RemoteStore {
   if (remote.type === 'folder') return new FolderStore(resolve(remote.path), { create: firstRun });
-  if (remote.type === 'webdav') return openRemote({ type: 'webdav', url: remote.url, username: remote.username, password: env('SELFSYNC_WEBDAV_PASSWORD') });
-  return openRemote({ ...remote, pathStyle: remote.pathStyle ?? true, prefix: remote.prefix ?? '', accessKey: env('SELFSYNC_ACCESS_KEY'), secretKey: env('SELFSYNC_SECRET_KEY') });
+  if (remote.type === 'webdav') return openRemote({ type: 'webdav', url: remote.url, username: remote.username, password: env('COFFER_WEBDAV_PASSWORD') });
+  return openRemote({ ...remote, pathStyle: remote.pathStyle ?? true, prefix: remote.prefix ?? '', accessKey: env('COFFER_ACCESS_KEY'), secretKey: env('COFFER_SECRET_KEY') });
 }
 
 const summary = (r: SyncResult) => `sent ${r.pushed}, received ${r.pulled}, deleted ${r.deletedLocal} here and ${r.deletedRemote} remotely, merged ${r.merged}`;
@@ -192,7 +192,7 @@ async function main(): Promise<number> {
     console.error(`unknown option for ${command}: ${unknown.map((f) => `--${f}`).join(', ')}`);
     return 2;
   }
-  const configFile = flags.get('config') || 'selfsync.json';
+  const configFile = flags.get('config') || 'coffer.json';
   const cli = await readFile(configFile, 'utf8').then(
     (text) => {
       try {
@@ -220,7 +220,7 @@ async function main(): Promise<number> {
     fs,
     store,
     stateStore: new FileState(stateFile),
-    passphrase: env('SELFSYNC_PASSPHRASE'),
+    passphrase: env('COFFER_PASSPHRASE'),
     config: resolveConfig({
       deviceName: hostname().split('.')[0],
       ...cli.sync,
@@ -339,7 +339,7 @@ async function main(): Promise<number> {
     return r.problems.length ? 1 : 0;
   }
   if (command === 'change-passphrase') {
-    await engine.changePassphrase(env('SELFSYNC_NEW_PASSPHRASE'));
+    await engine.changePassphrase(env('COFFER_NEW_PASSPHRASE'));
     console.log('passphrase changed; update it on every device');
     return 0;
   }

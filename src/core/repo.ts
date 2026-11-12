@@ -236,7 +236,7 @@ export class Repo {
     const cuts = cutPoints(data, this.chunk);
     const parts = cuts.map((end, i) => data.subarray(i ? cuts[i - 1] : 0, end));
     // WebCrypto copies its input, so hashing every chunk of a big file at once would double its memory.
-    const ids: string[] = new Array(parts.length);
+    const ids: string[] = new Array<string>(parts.length);
     await pool(parts, 4, async (part, i) => {
       ids[i] = await chunkId(this.keys, part);
     });

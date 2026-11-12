@@ -44,7 +44,7 @@ const gc = (globalThis as { gc?: () => void }).gc ?? (() => {});
 async function measure(notes: number, runs: number, net: string): Promise<Samples> {
   const mem = new MemoryStore();
   const via = new Via(mem);
-  const dir = mkdtempSync(join(tmpdir(), 'selfsync-bench-'));
+  const dir = mkdtempSync(join(tmpdir(), 'coffer-bench-'));
   const fs = new MemFS();
   const engine = new SyncEngine({
     fs, store: via, stateStore: new FileState(join(dir, 'state.json')), passphrase: 'benchmark',

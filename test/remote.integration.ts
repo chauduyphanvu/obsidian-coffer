@@ -26,7 +26,7 @@ async function s3Store() {
   const accessKey = process.env.S3_ACCESS_KEY!;
   const secretKey = process.env.S3_SECRET_KEY!;
   const region = process.env.S3_REGION ?? 'us-east-1';
-  const bucket = process.env.S3_BUCKET ?? `selfsync-test-${Date.now()}`;
+  const bucket = process.env.S3_BUCKET ?? `coffer-test-${Date.now()}`;
   if (!process.env.S3_BUCKET) {
     const headers = await sign({
       method: 'PUT', host: new URL(endpoint).host, path: `/${bucket}`, query: {}, headers: {},
@@ -48,18 +48,18 @@ const report = await checkStore(store);
 for (const c of report.checks) console.log(`${c.ok ? 'ok  ' : 'FAIL'} ${c.name}${c.detail ? `: ${c.detail}` : ''}`);
 assert.ok(report.ok, 'storage check failed');
 
-const root = await mkdtemp(join(tmpdir(), 'selfsync-'));
+const root = await mkdtemp(join(tmpdir(), 'coffer-'));
 const device = (name: string) => {
   const dir = join(root, name);
   // Every note in its own object, so listing has to page through more than 1,000 keys.
   const config = resolveConfig({ deviceName: name, kdfIterations: 1000, packMaxBlobBytes: 0, snapshotEvery: 3 });
-  const engine = new SyncEngine({ fs: new NodeFS(dir), store, stateStore: new FileState(join(dir, '.self-sync/state.json')), passphrase: 'integration', config });
+  const engine = new SyncEngine({ fs: new NodeFS(dir), store, stateStore: new FileState(join(dir, '.coffer/state.json')), passphrase: 'integration', config });
   return { dir, engine, fs: new NodeFS(dir) };
 };
 const a = device('a');
 const b = device('b');
 const listing = async (d: { fs: NodeFS }) =>
-  Object.fromEntries(await Promise.all((await d.fs.list()).filter((f) => !f.path.startsWith('.self-sync')).sort((x, y) => (x.path < y.path ? -1 : 1)).map(async (f) => [f.path.normalize('NFC'), await sha256Hex(await d.fs.read(f.path))])));
+  Object.fromEntries(await Promise.all((await d.fs.list()).filter((f) => !f.path.startsWith('.coffer')).sort((x, y) => (x.path < y.path ? -1 : 1)).map(async (f) => [f.path.normalize('NFC'), await sha256Hex(await d.fs.read(f.path))])));
 
 await mkdir(join(a.dir, 'Ghi chú/sub'), { recursive: true });
 await mkdir(b.dir);
