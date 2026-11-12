@@ -197,7 +197,7 @@ test('cli: accept-storage carries on after storage was put back to an older copy
 
     const stopped = t.run('sync');
     assert.equal(stopped.status, 1);
-    assert.match(stopped.stderr, /the newest this device has seen, is missing/);
+    assert.match(stopped.stderr, /the newest this device has seen, is missing.*\nif storage was put back to a backup or an older copy on purpose, run accept-storage to carry on from it as it is now\n$/);
     const r = t.run('accept-storage');
     assert.equal(r.status, 0, r.stderr);
     assert.match(r.stdout, /^carrying on from storage as it is now\nsent \d+, received \d+, deleted 0 here and 0 remotely, merged 0\nboth versions kept: a \(conflict/);
@@ -539,6 +539,58 @@ test("watch: the sync's own writes and the state folder are not local changes, a
     await reported('notes/a.md');
   } finally {
     watcher.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("watch: a file put back the way the sync last left it is still reported, once someone else changed it in between", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'selfsync-watch-'));
+  const fs = new NodeFS(dir);
+  const seen: string[] = [];
+  const watcher = watchVault(dir, fs, '.self-sync', (path) => seen.push(path), (e) => assert.fail(e.message));
+  const count = () => seen.filter((p) => p === 'x.md').length;
+  try {
+    // The sync applies another device's deletion of x.md.
+    await fs.write('x.md', new TextEncoder().encode('from another device'));
+    await fs.remove('x.md');
+    await sleep(300);
+    assert.equal(count(), 0, "the sync's own write and removal");
+    writeFileSync(join(dir, 'x.md'), 'made again by hand');
+    await eventually(() => count() > 0);
+    await sleep(300);
+    const before = count();
+    rmSync(join(dir, 'x.md'));
+    await eventually(() => count() > before);
+  } finally {
+    watcher.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('NodeFS remembers what its own writes left only while a watcher asks, and only for a minute after each', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'selfsync-own-'));
+  const fs = new NodeFS(dir);
+  const bytes = new TextEncoder().encode('x');
+  try {
+    await fs.write('notes/a.md', bytes);
+    await fs.remove('notes/a.md');
+    await fs.write('b.md', bytes);
+    assert.equal(await fs.isOwnChange('b.md'), false, 'nothing is remembered with no watcher');
+    assert.equal(await fs.isOwnChange('notes/a.md'), false);
+
+    t.mock.timers.enable({ apis: ['Date'], now: 1_700_000_000_000 });
+    fs.rememberOwn();
+    await fs.write('notes/c.md', bytes);
+    assert.equal(await fs.isOwnChange('notes/c.md'), true);
+    assert.equal(await fs.isOwnChange('notes'), true, 'and the folder above');
+    t.mock.timers.tick(60_000);
+    assert.equal(await fs.isOwnChange('notes/c.md'), true, 'echoes can come late');
+    t.mock.timers.tick(1);
+    assert.equal(await fs.isOwnChange('notes/c.md'), false, 'then it is forgotten');
+    await fs.write('d.md', bytes);
+    assert.equal(await fs.isOwnChange('notes'), false);
+    assert.equal(await fs.isOwnChange('d.md'), true);
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -4,14 +4,14 @@ import type { Share } from './settings.ts';
 import { goneWith, placeOf } from './shares.ts';
 
 /**
- * What asked for a sync. After `edit` (the wait after the vault's events) and `poll` (another device committed) every
- * local change since the last sync came with an event. After the others one may not have: nothing listened before
- * `start`, a `manual` sync and the `timer` are there to catch what was missed, and before `resume` the app may have
- * been suspended while other apps or iCloud wrote files.
+ * What asked for a sync. After `edit` (the wait after the vault's events), `poll` (another device committed) and
+ * `retry` (a place's wait after a failed sync ended) every local change since the last sync came with an event. After
+ * the others one may not have: nothing listened before `start`, a `manual` sync and the `timer` are there to catch
+ * what was missed, and before `resume` the app may have been suspended while other apps or iCloud wrote files.
  */
-export type Why = 'edit' | 'poll' | 'start' | 'manual' | 'timer' | 'resume';
+export type Why = 'edit' | 'poll' | 'retry' | 'start' | 'manual' | 'timer' | 'resume';
 
-export const fromEvents = (why: Why) => why === 'edit' || why === 'poll';
+export const fromEvents = (why: Why) => why === 'edit' || why === 'poll' || why === 'retry';
 
 /** What one place, the vault or a shared folder, has seen since its last sync began. */
 export interface Seen {

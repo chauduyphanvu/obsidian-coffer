@@ -3,9 +3,9 @@ import { hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DEFAULT_CONFIG, resolveConfig, type SyncConfig } from '../core/config.ts';
 import { heartbeatDue, writeHeartbeat } from '../core/devices.ts';
-import { SafetyError, SyncEngine, type SyncResult } from '../core/engine.ts';
+import { HistoryError, SafetyError, SyncEngine, type SyncResult } from '../core/engine.ts';
 import { vaultKey } from '../core/paths.ts';
-import { plural } from '../core/text.ts';
+import { errorText, plural } from '../core/text.ts';
 import { TooOldError, listCommits, listDeleted, planRestore, tableAt } from '../core/timeline.ts';
 import type { RemoteStore } from '../core/types.ts';
 import { applyRestore, countSteps, deleteLimitCrossed, keepOut, restoreSteps } from '../plugin/restore.ts';
@@ -55,6 +55,7 @@ Secrets come from the environment: SELFSYNC_PASSPHRASE, and for S3
 SELFSYNC_ACCESS_KEY and SELFSYNC_SECRET_KEY, for WebDAV SELFSYNC_WEBDAV_PASSWORD.`;
 
 const STATE_DIR = '.self-sync';
+const ACCEPT_HINT = 'if storage was put back to a backup or an older copy on purpose, run accept-storage to carry on from it as it is now';
 const WATCH_SETTLE_MS = 3000;
 
 const env = (name: string) => {
@@ -190,7 +191,7 @@ async function main(): Promise<number> {
       const { version } = JSON.parse(await readFile(new URL('../../manifest.json', import.meta.url), 'utf8')) as { version: string };
       await writeHeartbeat(await engine.view(), { platform: `CLI on ${process.platform}`, version });
     } catch (e) {
-      console.error(`could not record this device's heartbeat: ${e instanceof Error ? e.message : e}`);
+      console.error(`could not record this device's heartbeat: ${errorText(e)}`);
     }
   };
 
@@ -224,8 +225,9 @@ async function main(): Promise<number> {
         if (didSomething(r)) report(r, `${stamp()} `);
       },
       onFailure: (e, retryMs) => {
-        const message = e instanceof Error ? e.message : String(e);
+        const message = errorText(e);
         console.error(`${stamp()} ${e instanceof SafetyError ? `${message} Not retrying until something changes.` : `sync failed: ${message}; retrying in ${retryMs! / 1000}s`}`);
+        if (e instanceof HistoryError) console.error(`${stamp()} ${ACCEPT_HINT}`);
       },
       debounceMs: WATCH_SETTLE_MS,
       pollMs,
@@ -313,7 +315,8 @@ async function main(): Promise<number> {
 main().then(
   (code) => process.exit(code),
   (e) => {
-    console.error(e instanceof Error ? e.message : e);
+    console.error(errorText(e));
+    if (e instanceof HistoryError) console.error(ACCEPT_HINT);
     process.exit(1);
   },
 );

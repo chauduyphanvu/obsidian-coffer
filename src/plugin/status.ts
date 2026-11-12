@@ -1,12 +1,12 @@
 // What a sync did, what went wrong and what a conflict leaves to choose, in words a user can act on.
 // No Obsidian import, so it runs under plain Node tests.
 import { WrongPassphraseError } from '../core/crypto.ts';
-import { SafetyError, type SyncResult } from '../core/engine.ts';
+import { HistoryError, SafetyError, type SyncResult } from '../core/engine.ts';
 import { lineDiff, type DiffRegion } from '../core/merge.ts';
 import { ext } from '../core/paths.ts';
 import { DAY } from '../core/retention.ts';
 import { MissingFolderError } from '../core/scopedfs.ts';
-import { plural } from '../core/text.ts';
+import { errorText, plural } from '../core/text.ts';
 
 export function summarize(r: SyncResult): string {
   const parts = [
@@ -94,7 +94,7 @@ export const isTransient = (message: string) =>
 
 /** A sync that threw, described. */
 export function describeFailure(e: unknown): Problem {
-  const message = e instanceof Error ? e.message : String(e);
+  const message = errorText(e);
   if (e instanceof MissingFolderError) return missingProblem(e.folder);
   if (e instanceof SafetyError) {
     return {
@@ -105,6 +105,18 @@ export function describeFailure(e: unknown): Problem {
         `This sync would delete ${[e.localDeletes && `${plural(e.localDeletes, 'file')} on this device`, e.remoteDeletes && `${plural(e.remoteDeletes, 'file')} from storage`].filter(Boolean).join(' and ')}. ` +
         'If that was not you, keep the files: nothing is lost yet.',
       action: 'resolve-deletes',
+    };
+  }
+  if (e instanceof HistoryError) {
+    return {
+      id: 'history',
+      severity: 'critical',
+      title: 'Storage was rolled back or replaced',
+      detail:
+        'Sync is stopped. What storage holds now is not what this device last saw there: part of the sync history was taken back or replaced. ' +
+        'That is expected right after storage was restored from a backup or an older copy, and then this device can carry on from storage as it is. ' +
+        `If nobody did that on purpose, leave sync stopped and find out who can reach your storage. The files on this device are untouched. (${message})`,
+      action: 'accept-storage',
     };
   }
   if (e instanceof WrongPassphraseError || /wrong passphrase/i.test(message)) {
@@ -130,19 +142,6 @@ export function describeFailure(e: unknown): Problem {
   }
   if (/vault uses format/i.test(message)) {
     return { id: 'format', severity: 'critical', title: 'Update Self Sync on this device', detail: `Another device uses a newer version. (${message})` };
-  }
-  // The log in storage was cut back past what this device saw, or holds other commits where it saw its own.
-  if (/does not follow the commit before it as this device saw it|the newest this device has seen, is missing|is not the one this device saw/.test(message)) {
-    return {
-      id: 'history',
-      severity: 'critical',
-      title: 'Storage was rolled back or replaced',
-      detail:
-        'Sync is stopped. What storage holds now is not what this device last saw there: part of the sync history was taken back or replaced. ' +
-        'That is expected right after storage was restored from a backup or an older copy, and then this device can carry on from storage as it is. ' +
-        `If nobody did that on purpose, leave sync stopped and find out who can reach your storage. The files on this device are untouched. (${message})`,
-      action: 'accept-storage',
-    };
   }
   if (/failed authentication|corrupted|tampered|is missing|cannot be read|gap before|inconsistent|wrong size|vanished/i.test(message)) {
     return {

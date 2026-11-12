@@ -5,11 +5,24 @@ import type { FileStat, LocalFS, LocalFile, ObjectInfo, RemoteStore, StateStore 
 const toStat = (s: { size: number; mtimeMs: number }): FileStat => ({ size: s.size, mtime: Math.floor(s.mtimeMs) });
 const missing = (e: unknown) => (e as NodeJS.ErrnoException).code === 'ENOENT';
 const TMP = '.selfsync-tmp';
+/** How long after one of its own writes or removals settles a change event there is still taken for its echo. */
+const ECHO_MS = 60_000;
+
+/** What one of this FS's own writes or removals left at a path. */
+interface Left {
+  /** Its stat, null when absent, undefined when the operation failed. */
+  stat: Promise<FileStat | null | undefined>;
+  /** When the operation, and the stat after it, finished. */
+  settled?: number;
+}
 
 export class NodeFS implements LocalFS {
   private root: string;
-  /** What this FS last left at each path it wrote or removed, and in the folders above: its stat, null when absent, undefined when the operation failed. */
-  private own = new Map<string, Promise<FileStat | null | undefined>>();
+  /**
+   * What this FS last left at each path it wrote or removed, and in the folders above, the oldest first. Only kept
+   * once a watcher asks (`rememberOwn`), and each only for `ECHO_MS` after it settled.
+   */
+  private own?: Map<string, Left>;
   constructor(root: string) {
     this.root = root;
   }
@@ -17,24 +30,45 @@ export class NodeFS implements LocalFS {
     return join(this.root, ...path.split('/'));
   }
 
+  /** From now on remembers what its own writes and removals leave, so `isOwnChange` can tell their echoes from other changes. */
+  rememberOwn(): void {
+    this.own ??= new Map();
+  }
+
   /** Whether a change event for `path` is the echo of this FS's own latest write or removal, with nothing since by anyone else. */
   async isOwnChange(path: string): Promise<boolean> {
     if (path.endsWith(TMP)) return true;
+    const own = this.own;
     // An operation that starts meanwhile, as a removal beside it changing a folder, replaces what to compare with.
     for (;;) {
-      const pending = this.own.get(path);
-      const left = await pending;
+      const entry = own?.get(path);
+      if (!own || !entry) return false;
+      const left = await entry.stat;
       const now = left === undefined ? undefined : await this.stat(path);
-      if (this.own.get(path) !== pending) continue;
-      if (left === undefined) return false;
-      return left === null ? now === null : !!now && now.size === left.size && now.mtime === left.mtime;
+      if (own.get(path) !== entry) continue;
+      const same = left === null ? now === null : !!left && !!now && now.size === left.size && now.mtime === left.mtime;
+      const fresh = Date.now() - entry.settled! <= ECHO_MS;
+      // Once someone else changed it, a later change back to what this FS left is theirs too.
+      if (!same || !fresh) own.delete(path);
+      return same && fresh;
     }
   }
 
   /** Starts remembering what `path` and its folders look like once `done` settles. A watcher can report the effects before the operation returns, so this runs as it starts. */
   private track(path: string, done: Promise<unknown>): void {
+    const own = this.own;
+    if (!own) return;
+    const now = Date.now();
+    for (const [p, e] of own) {
+      if (e.settled === undefined || now - e.settled <= ECHO_MS) break;
+      own.delete(p);
+    }
     for (let p = path; p; p = p.slice(0, Math.max(0, p.lastIndexOf('/')))) {
-      this.own.set(p, Promise.all([this.own.get(p), done]).then(() => this.stat(p)).catch(() => undefined));
+      const entry: Left = { stat: Promise.all([own.get(p)?.stat, done]).then(() => this.stat(p)).catch(() => undefined) };
+      void entry.stat.then(() => (entry.settled = Date.now()));
+      // Moved to the end, so the oldest stay first.
+      own.delete(p);
+      own.set(p, entry);
     }
   }
 

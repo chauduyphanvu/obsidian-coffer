@@ -1,5 +1,6 @@
 import { Modal, Notice, PluginSettingTab, Setting, type App } from 'obsidian';
 import { conflictOriginal } from '../core/paths.ts';
+import { errorText } from '../core/text.ts';
 import type SelfSyncPlugin from './main.ts';
 import { resolveConflict } from './resolve.ts';
 import { describeStorage, hasStorageAddress, parseNumberSetting, type Settings, type Share } from './settings.ts';
@@ -121,7 +122,7 @@ export class SettingsTab extends PluginSettingTab {
               await activeWindow.navigator.clipboard.writeText(await plugin.setupLink());
               new Notice('Setup link copied.');
             } catch (e) {
-              new Notice(`Could not copy the setup link: ${e instanceof Error ? e.message : e}`, 8000);
+              new Notice(`Could not copy the setup link: ${errorText(e)}`, 8000);
             }
           }),
         );
@@ -174,7 +175,7 @@ export class SettingsTab extends PluginSettingTab {
     toggle(when, 'When Obsidian starts', '', 'syncOnStart');
     number(when, 'After an edit (seconds)', 'Waits this long after the last edit.', 'changeDelaySeconds', 2);
     number(when, 'Every (minutes)', '0 turns the timer off.', 'intervalMinutes', 0);
-    number(when, 'Look for other devices\' changes every (seconds)', 'One tiny request, only while Obsidian is on screen. 0 turns it off.', 'pollSeconds', 0);
+    number(when, 'Look for other devices\' changes every (seconds)', 'Only while Obsidian is on screen, six times as often (no faster than every 5 seconds) for two minutes after you switch to it or changes arrive, and half as often after ten minutes without either; 0 turns it off.', 'pollSeconds', 0);
 
     const what = section('what', 'What to sync', `files up to ${s.maxFileSizeMB || 'any'} MB`);
     toggle(
@@ -364,7 +365,7 @@ class AcceptStorageModal extends Modal {
       this.close();
     } catch (e) {
       this.busy = false;
-      this.error = `Could not carry on: ${e instanceof Error ? e.message : e}`;
+      this.error = `Could not carry on: ${errorText(e)}`;
       this.render();
     }
   }
@@ -448,7 +449,7 @@ class PassphraseModal extends Modal {
         this.close();
         new Notice('Passphrase changed. Enter the new one on your other devices.');
       } catch (e) {
-        new Notice(`Could not change the passphrase: ${e instanceof Error ? e.message : e}`, 10_000);
+        new Notice(`Could not change the passphrase: ${errorText(e)}`, 10_000);
       }
     }, 'cta');
   }

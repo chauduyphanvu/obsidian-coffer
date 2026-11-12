@@ -2,10 +2,9 @@
 import { Modal, Notice, Setting, type App } from 'obsidian';
 import { agoText, forgetDevice, listDevices, statusText, statusTone, type DeviceStatus } from '../core/devices.ts';
 import type { RepoView } from '../core/engine.ts';
+import { errorText } from '../core/text.ts';
 import type SelfSyncPlugin from './main.ts';
 import { button, buttonRow, message } from './ui.ts';
-
-const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 /** Adds the block and fills it in the background, so the rest of the screen is not held up. */
 export function renderDevices(containerEl: HTMLElement, plugin: SelfSyncPlugin): void {

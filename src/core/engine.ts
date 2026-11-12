@@ -9,6 +9,7 @@ import { nothingToDo, planChanges, type Local, type Plan } from './plan.ts';
 import { Repo } from './repo.ts';
 import { collectGarbage, listVersions, type CleanupResult } from './retention.ts';
 import { LocalState } from './state.ts';
+import { errorText } from './text.ts';
 import { hasChunks, sameContent, type Change, type ChunkRef, type Commit, type Entry, type FileStat, type LocalFS, type RemoteStore, type StateStore, type Version } from './types.ts';
 import { verifyRepo, type VerifyOptions, type VerifyReport } from './verify.ts';
 
@@ -123,6 +124,15 @@ export class SafetyError extends Error {
 }
 
 /**
+ * The log in storage, or the commit it is anchored on, is not the one this device saw: cut back under it, or
+ * holding other commits where it saw its own, as after storage was restored from a backup or replaced. Storage
+ * is consistent in itself as far as this device checked, so `acceptStorage` carries on from it. Damage within
+ * storage (a gap, a link between two stored commits that does not hold, a snapshot that disagrees with its
+ * commit) is a plain Error: accepting storage would only find it again.
+ */
+export class HistoryError extends Error {}
+
+/**
  * The guard against a vault that looks empty for the wrong reason (unmounted folder, wrong path, files
  * evicted by another tool): unless forced, a sync is refused when either side would end up with more than
  * this many fewer files, counting deletions minus files added, so a move counts for nothing. `synced` is
@@ -153,7 +163,7 @@ const contentKey = (e: Entry) => e.chunks.map((c) => c.id).join(',');
 const unchanged = (cur: FileStat | null, l: Local | undefined) => (l ? !!cur && cur.size === l.size && cur.mtime === l.mtime : !cur);
 
 const recordError = (res: SyncResult, path: string, e: unknown) => {
-  const message = e instanceof Error ? e.message : String(e);
+  const message = errorText(e);
   // A later pass of the same sync may try the file again; it is still one failed file.
   const earlier = res.errors.find((x) => x.path === path);
   if (earlier) earlier.message = message;
@@ -293,11 +303,14 @@ export class SyncEngine {
       this.recheck.add(p);
       this.unplanned = true;
     };
-    const add = (c: Commit) => {
+    const add = async (c: Commit) => {
       // A commit without `prev` comes from a version that did not chain the log. It is taken as it
       // is, and the chain restarts from it: the next chained commit names its digest like any other.
       if (c.prev !== undefined && st.head !== undefined && c.prev !== st.head) {
-        throw new Error(`Remote commit ${c.seq} does not follow the commit before it as this device saw it: the log was tampered with or forked`);
+        const message = `Remote commit ${c.seq} does not follow the commit before it as this device saw it: the log was tampered with or forked`;
+        // Only on this path: storage's own commit before it says whether storage holds another one than this
+        // device saw, or the link between two stored commits is broken.
+        throw (await repo.readCommit(c.seq - 1))?.hash === c.prev ? new HistoryError(message) : new Error(message);
       }
       // A move changes no content, so work prepared against the file before it is still valid. It
       // moves this device's merge base too, whose old place goes once no kept version records it.
@@ -343,11 +356,11 @@ export class SyncEngine {
         repo.readCommit(st.lastSeq + 2),
         checkHead ? repo.readCommit(st.lastSeq) : undefined,
       ]);
-      if (head !== undefined) this.checkHead(st, head);
+      if (head !== undefined) this.checkHead(st, head, first ?? second);
       if (!first) return touched;
-      add(first);
+      await add(first);
       if (!second) return touched;
-      add(second);
+      await add(second);
     }
     let seqs = await repo.commitSeqsAfter(st.lastSeq);
     if (seqs.length > this.cfg.snapshotEvery) {
@@ -362,7 +375,7 @@ export class SyncEngine {
     });
     for (const c of commits) {
       if (c.seq !== st.lastSeq + 1) throw new Error(`Remote log has a gap before commit ${c.seq}`);
-      add(c);
+      await add(c);
     }
     this.headSeen = this.now();
     return touched;
@@ -372,10 +385,15 @@ export class SyncEngine {
     return st.head === undefined || this.now() - this.headSeen >= HEAD_CHECK_EVERY;
   }
 
-  private checkHead(st: LocalState, head: Commit | null): void {
-    if (!head) throw new Error(`Remote commit ${st.lastSeq}, the newest this device has seen, is missing: the log was rolled back or tampered with`);
+  /** `head` is storage's commit `st.lastSeq`, and `later` one it holds after it, if any. */
+  private checkHead(st: LocalState, head: Commit | null, later: Commit | null): void {
+    if (!head) {
+      const message = `Remote commit ${st.lastSeq}, the newest this device has seen, is missing: the log was rolled back or tampered with`;
+      // With a later commit stored, the log has a hole rather than an end before it.
+      throw later ? new Error(message) : new HistoryError(message);
+    }
     if (st.head !== undefined && head.hash !== st.head) {
-      throw new Error(`Remote commit ${st.lastSeq} is not the one this device saw: the log was tampered with or forked`);
+      throw new HistoryError(`Remote commit ${st.lastSeq} is not the one this device saw: the log was tampered with or forked`);
     }
     st.head = head.hash;
     this.headSeen = this.now();
@@ -973,7 +991,7 @@ export class SyncEngine {
       });
       await repo.writeDigest(seq, commits);
     } catch (e) {
-      this.log(`Could not write the history index for commit ${seq}: ${e instanceof Error ? e.message : e}`);
+      this.log(`Could not write the history index for commit ${seq}: ${errorText(e)}`);
     }
   }
 
@@ -1157,8 +1175,8 @@ export class SyncEngine {
   }
 
   /**
-   * Accepts storage as it is now, for when this device found the log cut back or replaced, as after
-   * the bucket was restored from a backup. Forgets what it knew of storage and anchors on the log as
+   * Accepts storage as it is now, for when this device found the log cut back or replaced (`HistoryError`),
+   * as after the bucket was restored from a backup. Forgets what it knew of storage and anchors on the log as
    * stored. The next sync then treats every file that differs between this device and storage as
    * changed on both sides: nothing is deleted or overwritten, differing files are merged or kept as
    * conflict copies, and identical ones are matched up.

@@ -2,7 +2,7 @@
 import { Modal, Notice, TFile, type App } from 'obsidian';
 import { applyChoices, hunks, type Choice, type Hunk } from '../core/merge.ts';
 import { conflictOriginal, fileName } from '../core/paths.ts';
-import { plural } from '../core/text.ts';
+import { errorText, plural } from '../core/text.ts';
 import type SelfSyncPlugin from './main.ts';
 import { lookup } from './obsidianfs.ts';
 import { MAX_COMPARE_BYTES, compareConflict, unchangedSince, type Comparison, type Snapshot, type WholeReason } from './status.ts';
@@ -19,8 +19,6 @@ const WHY: Record<WholeReason, (name: string) => string> = {
   structured: () => 'Mixing lines from two versions could break this kind of file. Open each version to look, then choose which to keep.',
   different: () => 'The two versions are too different to compare line by line. Open each to look, then choose which to keep.',
 };
-
-const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 /** Opens the resolver for one conflict copy. */
 export function resolveConflict(plugin: SelfSyncPlugin, copy: string): void {

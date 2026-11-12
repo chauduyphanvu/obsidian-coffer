@@ -1,6 +1,7 @@
 import { pool } from './bytes.ts';
 import { packRanges } from './packer.ts';
 import { seqKey, type Repo } from './repo.ts';
+import { errorText } from './text.ts';
 import { sameContent, type ChunkRef, type Commit, type Entry } from './types.ts';
 
 export interface VerifyOptions {
@@ -95,7 +96,7 @@ async function replayLog(
       snap = await repo.readSnapshotWithHead(snapSeq);
       if (!snap) problem(`Snapshot ${snapSeq} is listed but cannot be read`, snapKey);
     } catch (e) {
-      problem(`Snapshot ${snapSeq} cannot be read: ${message(e)}`, snapKey);
+      problem(`Snapshot ${snapSeq} cannot be read: ${errorText(e)}`, snapKey);
     }
     if (snapSeq > last) problem(`Snapshot ${snapSeq} is newer than the last commit, ${last}: commits are missing`, snapKey);
   }
@@ -120,7 +121,7 @@ async function replayLog(
       const key = seqKey('log', seq);
       const c = block[i];
       if (!c || c instanceof Error) {
-        if (c) problem(`Commit ${seq} cannot be read: ${message(c)}`, key);
+        if (c) problem(`Commit ${seq} cannot be read: ${errorText(c)}`, key);
         else if (listed.has(seq)) problem(`Commit ${seq} is listed but cannot be read`, key);
         intact = false;
         prev = undefined;
@@ -245,12 +246,10 @@ async function checkChunks(repo: Repo, o: Context, files: Map<string, Entry>, sk
         if (plain.length !== ref.size) problem(`${where} has the wrong size: corrupted`, `pack/${ref.pack}`, paths);
         else if ((await repo.chunkId(plain)) !== ref.id) problem(`${where} does not match its id: corrupted`, `pack/${ref.pack}`, paths);
       } catch (e) {
-        problem(`${where} cannot be read: ${message(e)}`, `pack/${ref.pack}`, paths);
+        problem(`${where} cannot be read: ${errorText(e)}`, `pack/${ref.pack}`, paths);
       }
       report.chunks++;
       o.onProgress?.({ phase: 'chunks', done: ++done, total });
     }
   });
 }
-
-const message = (e: unknown) => (e instanceof Error ? e.message : String(e));

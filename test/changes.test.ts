@@ -15,6 +15,17 @@ test('hints: only a sync after edits or a poll may look at the files events name
   assert.ok(!trustSeen(seen, 'poll', { folderMissing: true }), 'only a listing notices a shared folder is gone');
 });
 
+test('hints: a retry after a failed sync looks only at what events named in the places that did not fail; the one that failed lists', () => {
+  const work = shareWith({ id: 'w', folder: 'Work' });
+  const log = new ChangeLog(() => [work]);
+  for (const s of [undefined, work]) log.take(s, 'manual');
+  log.file('a.md');
+  log.file('Work/w.md');
+  log.failed(work);
+  assert.deepEqual(sorted(log.take(undefined, 'retry')), ['a.md']);
+  assert.equal(log.take(work, 'retry'), undefined);
+});
+
 test('hints: a place lists on its first sync, after a failure and after changes went unseen; otherwise a sync gets what happened since the last began', () => {
   const log = new ChangeLog(() => []);
   log.file('a.md');

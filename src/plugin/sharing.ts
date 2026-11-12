@@ -4,6 +4,7 @@ import { Modal, Notice, Setting, SuggestModal, TFile, TFolder, Vault, type App }
 import { DEFAULT_CONFIG } from '../core/config.ts';
 import { WrongPassphraseError } from '../core/crypto.ts';
 import { Repo } from '../core/repo.ts';
+import { errorText } from '../core/text.ts';
 import { openRemote } from '../stores/open.ts';
 import type SelfSyncPlugin from './main.ts';
 import { lookup, obsidianHttp } from './obsidianfs.ts';
@@ -31,8 +32,6 @@ import { newShareId, rejoinNote } from './shares.ts';
 import { IDS, MIN_PASSPHRASE, formStorage, storageFields, tryStorage, type Keys } from './setup.ts';
 import { summarize, type Problem } from './status.ts';
 import { FolderSuggest, button, buttonRow, choice, field, message } from './ui.ts';
-
-const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 /** Files in the vault folder `path`, at any depth; undefined when there is no such folder. */
 function filesIn(app: App, path: string): number | undefined {
@@ -421,7 +420,7 @@ export class ShareModal extends Modal {
     }).disabled = this.busy;
     if (this.busy) this.contentEl.createEl('p', { cls: 'self-sync-progress', text: 'Checking the storage…' });
     message(this.contentEl, this.error);
-    button(buttonRow(this.contentEl), 'Back', () => this.go('folder'));
+    button(buttonRow(this.contentEl), 'Back', () => this.go('folder')).setDisabled(this.busy);
   }
 
   private async useVaultStorage(): Promise<void> {
@@ -459,7 +458,7 @@ export class ShareModal extends Modal {
     storageFields(c, this.provider, this.form, this.keys, true);
     message(c, this.error);
     const row = buttonRow(c);
-    button(row, 'Back', () => this.go('provider'));
+    button(row, 'Back', () => this.go('provider')).setDisabled(this.busy);
     button(row, this.busy ? 'Checking…' : 'Connect', () => this.connect(), 'cta').setDisabled(this.busy);
   }
 
@@ -501,7 +500,7 @@ export class ShareModal extends Modal {
     }
     message(c, this.error);
     const row = buttonRow(c);
-    button(row, 'Back', () => this.go(this.sameStorage ? 'where' : 'storage'));
+    button(row, 'Back', () => this.go(this.sameStorage ? 'where' : 'storage')).setDisabled(this.busy);
     button(row, this.busy ? 'Checking…' : 'Share this folder', () => this.create(), 'cta').setDisabled(this.busy);
   }
 
@@ -560,7 +559,7 @@ export class ShareModal extends Modal {
     field(c, 'Passphrase', { value: this.passphrase, password: true }, (v) => (this.passphrase = v));
     message(c, this.error);
     const row = buttonRow(c);
-    button(row, 'Back', () => this.go('start'));
+    button(row, 'Back', () => this.go('start')).setDisabled(this.busy);
     button(row, this.busy ? 'Opening…' : 'Next', () => this.openInvite(), 'cta').setDisabled(this.busy);
   }
 
@@ -592,7 +591,7 @@ export class ShareModal extends Modal {
     this.intro('The shared files go in this folder. It does not need to have the same name as on the other devices.');
     this.folderField();
     const row = buttonRow(this.contentEl);
-    button(row, 'Back', () => this.go('join'));
+    button(row, 'Back', () => this.go('join')).setDisabled(this.busy);
     button(row, this.busy ? 'Joining…' : 'Join', () => this.join(), 'cta').setDisabled(this.busy);
   }
 

@@ -3,6 +3,7 @@ import { Modal, Notice, type App } from 'obsidian';
 import { WrongPassphraseError } from '../core/crypto.ts';
 import type { SyncResult } from '../core/engine.ts';
 import { Repo } from '../core/repo.ts';
+import { errorText } from '../core/text.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
 import type SelfSyncPlugin from './main.ts';
@@ -96,7 +97,7 @@ export async function tryStorage(base: Storage, storage: Partial<Storage>, k: Ke
     if (bad) throw new Error(bad.detail ?? bad.name);
     return await Repo.exists(store);
   } catch (e) {
-    throw new Error(connectError(e instanceof Error ? e.message : String(e)));
+    throw new Error(connectError(errorText(e)));
   }
 }
 
@@ -195,7 +196,7 @@ export class SetupModal extends Modal {
     try {
       this.storage = formStorage(this.provider, this.form, this.keys);
     } catch (e) {
-      this.error = (e as Error).message;
+      this.error = errorText(e);
       this.render();
       return;
     }
@@ -207,7 +208,7 @@ export class SetupModal extends Modal {
       this.go('passphrase');
     } catch (e) {
       this.busy = false;
-      this.error = (e as Error).message;
+      this.error = errorText(e);
       this.render();
     }
   }

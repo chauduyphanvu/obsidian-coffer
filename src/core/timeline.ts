@@ -1,7 +1,7 @@
 import type { SyncConfig } from './config.ts';
 import { vaultKey } from './paths.ts';
 import type { Repo } from './repo.ts';
-import { Backward, Forward, HOUR, Reads, Thinning, floorSnapshot, keptState, type Snapshot } from './retention.ts';
+import { Backward, Forward, HOUR, Reads, Thinning, historyFloor, keptState, type Snapshot } from './retention.ts';
 import { sameContent, type Commit, type Entry } from './types.ts';
 
 /** A commit seen as a point in time: the vault right after it. */
@@ -58,8 +58,10 @@ interface Kept {
   now: number;
 }
 
-function kept(snaps: Snapshot[], cfg: SyncConfig, now: number): Kept {
-  return { floor: floorSnapshot(snaps, cfg, now)?.seq ?? 0, now };
+/** The snapshots, and what cleanup keeps as of `now`, from this device's retention and how far cleanup has gone. */
+async function kept(repo: Repo, cfg: SyncConfig, now: number, lastSeq: number): Promise<{ snaps: Snapshot[]; k: Kept }> {
+  const { snaps, floor } = await historyFloor(repo, cfg, now, lastSeq);
+  return { snaps, k: { floor, now } };
 }
 
 /**
@@ -226,8 +228,7 @@ export async function tableAt(
   at: number | { seq: number },
 ): Promise<PastVault> {
   if (!lastSeq) throw new Error('Nothing has been synced yet');
-  const all = await repo.snapshots();
-  const k = kept(all, cfg, now);
+  const { snaps: all, k } = await kept(repo, cfg, now, lastSeq);
   const snaps = all.filter((s) => s.seq <= lastSeq);
   const reads = new Reads(repo, cfg);
   const earliest = await earliestMoment(reads, snaps, k, lastSeq);
@@ -257,8 +258,8 @@ export async function tableAt(
  * deletion first. With `folder`, only the files in it and its subfolders.
  */
 export async function listDeleted(repo: Repo, lastSeq: number, cfg: SyncConfig, now: number, folder = ''): Promise<DeletedFile[]> {
-  const snaps = await repo.snapshots();
-  const thin = restorable(kept(snaps, cfg, now));
+  const { snaps, k } = await kept(repo, cfg, now, lastSeq);
+  const thin = restorable(k);
   const inside = inFolder(folder);
   const walk = new Backward(new Reads(repo, cfg), snaps, lastSeq);
   const seen = new Set<string>();
@@ -331,8 +332,7 @@ export async function listCommits(
   opts: { limit?: number; since?: number; before?: number; beforeSeq?: number } = {},
 ): Promise<CommitSummary[]> {
   const { limit = Infinity, since = -Infinity, before = Infinity, beforeSeq = Infinity } = opts;
-  const snaps = await repo.snapshots();
-  const k = kept(snaps, cfg, now);
+  const { snaps, k } = await kept(repo, cfg, now, lastSeq);
   const reads = new Reads(repo, cfg);
   let from = Math.max(0, Math.min(lastSeq, beforeSeq - 1));
   let next = from < lastSeq ? (await userAfter(reads, from, lastSeq))?.time : undefined;

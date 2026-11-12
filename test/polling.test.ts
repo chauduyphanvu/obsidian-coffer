@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import type { SyncResult } from '../src/core/engine.ts';
 import type { Why } from '../src/plugin/changes.ts';
-import { Pauses, nextPollDelay, pollPlaces } from '../src/plugin/polling.ts';
+import { Pauses, Retries, nextPollDelay, pollPlaces, receivedChanges } from '../src/plugin/polling.ts';
 
 const S = 1000;
 const MIN = 60 * S;
@@ -18,7 +19,82 @@ test('polling is off when the setting is 0, whatever happened lately', () => {
 test('polling is fast for two minutes after activity', () => {
   assert.equal(after(30, 0), 5 * S);
   assert.equal(after(30, 119_999), 5 * S);
-  assert.equal(after(300, 60 * S), 5 * S);
+  assert.equal(after(300, 60 * S), 50 * S);
+});
+
+test('the fast spell polls six times as often as the setting, never faster than every 5 seconds', () => {
+  assert.equal(after(30, 0), 5 * S);
+  assert.equal(after(60, 0), 10 * S);
+  assert.equal(after(300, 0), 50 * S);
+  assert.equal(after(300, 2 * MIN - 1), 50 * S);
+  assert.equal(after(300, 2 * MIN), 300 * S);
+  assert.equal(after(12, 0), 5 * S);
+  assert.equal(after(1, 0), 5 * S);
+});
+
+const result = (over: Partial<SyncResult> = {}): SyncResult => ({
+  pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0, conflictCopies: [], skipped: 0, tooLarge: [], errors: [], commits: 0, rounds: 1, ...over,
+});
+
+test('a sync counts as activity only when it received changes from another device, not when it only sent this one\'s', () => {
+  assert.equal(receivedChanges(result()), false);
+  assert.equal(receivedChanges(result({ pushed: 3, deletedRemote: 1, commits: 1 })), false);
+  for (const over of [{ pulled: 1 }, { deletedLocal: 1 }, { merged: 1 }, { conflictCopies: ['a (conflict phone 20261111-1200).md'] }]) {
+    assert.equal(receivedChanges(result(over)), true, JSON.stringify(over));
+  }
+});
+
+test('a place whose sync keeps failing waits 5 s, then 10, doubling to 5 minutes, and a success starts over', () => {
+  const r = new Retries();
+  let now = T;
+  assert.equal(r.due(now), undefined);
+  for (const wait of [5, 10, 20, 40, 80, 160, 300, 300]) {
+    assert.equal(r.failed('', now), wait * S);
+    assert.equal(r.due(now), now + wait * S);
+    for (const why of ['poll', 'timer', 'resume', 'edit', 'start', 'retry'] as Why[]) assert.equal(r.includes('', why, now + wait * S - 1), false, `${why} before ${wait} s`);
+    now += wait * S;
+    assert.ok(r.includes('', 'retry', now), `tried again after ${wait} s`);
+    assert.equal(r.due(now), undefined, 'nothing waits once the wait is over');
+  }
+  r.reset('');
+  assert.ok(r.includes('', 'poll', now));
+  assert.equal(r.failed('', now), 5 * S);
+});
+
+test('waiting after a failure holds back only that place, and never a sync the user asks for', () => {
+  const r = new Retries();
+  r.failed('', T);
+  r.failed('', T + 5 * S);
+  assert.ok(r.includes('', 'manual', T + 5 * S), 'Sync now tries at once');
+  assert.ok(r.includes('w', 'poll', T + 5 * S), 'other places keep syncing');
+  r.failed('w', T + 6 * S);
+  assert.equal(r.due(T + 6 * S), T + 11 * S, 'the soonest wait to end, the shared folder’s');
+  assert.equal(r.due(T + 11 * S), T + 15 * S, 'then the vault’s');
+});
+
+test('a poll does not ask a place that waits after failing, so a sync that keeps failing does not start again every poll', async () => {
+  const r = new Retries();
+  const pauses = new Pauses();
+  let now = T;
+  const gate = { includes: (id: string, why: Why) => pauses.includes(id, why) && r.includes(id, why, now) };
+  const asked: string[] = [];
+  const changed = async (id: string) => {
+    asked.push(id);
+    return true;
+  };
+  r.failed('', now);
+  assert.equal(await pollPlaces(['', 'w'], gate, changed), true);
+  assert.deepEqual(asked, ['w']);
+  asked.length = 0;
+  now += 5 * S;
+  assert.equal(await pollPlaces(['', 'w'], gate, changed), true);
+  assert.deepEqual(asked, ['']);
+});
+
+test('a retry, like any sync nobody asked for, leaves out a place paused before deleting many files', () => {
+  const p = new Pauses();
+  p.pause('');
+  assert.equal(p.includes('', 'retry'), false);
 });
 
 test('after the fast spell it polls at the setting, and at twice the setting after ten quiet minutes', () => {

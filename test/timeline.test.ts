@@ -151,19 +151,20 @@ test('an old moment, a recent one, the newest commits and the window each cost a
     await f();
     return net.stats.get + net.stats.list;
   };
+  // Each also reads, alongside the snapshot listing, the record of how far cleanup has gone.
   // The earliest moment is the last commit up to the floor snapshot (40) that ends its day, which takes
   // commit 41 to tell. The snapshot listing, the digests of 31-40 and 41-50 (read once, for the earliest
   // moment and the replay alike), and snapshot 40.
-  assert.equal(await cost(() => at(v, times[45] + 1)), 4);
+  assert.equal(await cost(() => at(v, times[45] + 1)), 1 + 4);
   // The listing, the digests of 31-40 and 41-50 for the earliest moment, commits 91-95 in one batch, and snapshot 90 to show new.md did not exist yet.
-  assert.equal(await cost(() => at(v, times[92] + 1)), 9);
+  assert.equal(await cost(() => at(v, times[92] + 1)), 1 + 9);
   assert.equal((await at(v, times[92] + 1)).files.has('new.md'), false);
-  assert.equal(await cost(() => commits(v, { limit: 3 })), 7);
+  assert.equal(await cost(() => commits(v, { limit: 3 })), 1 + 7);
   // The listing, commits 91-95, the digests of 31-90 (commit 40 itself shows it ends its day), and snapshot 40 for gone.md's last version.
-  assert.equal(await cost(() => deleted(v)), 13);
+  assert.equal(await cost(() => deleted(v)), 1 + 13);
   assert.deepEqual((await deleted(v)).map((d) => [d.path, d.seq]), [['gone.md', 60]]);
   // The listing, commits 91-95, the digests of 31-90, and snapshot 30 to show new.md did not exist before 93.
-  assert.equal(await cost(() => commits(v)), 13);
+  assert.equal(await cost(() => commits(v)), 1 + 13);
   assert.equal((await commits(v)).at(-1)!.seq, 40);
 });
 
@@ -207,7 +208,7 @@ test('after cleanup the earliest moment moves forward, older ones are refused, a
   await assert.rejects(at(v, times[4] - 1), tooOld(4));
   net.reset();
   await assert.rejects(at(v, times[1]), tooOld(4));
-  assert.equal(net.stats.get + net.stats.list, 3, 'refused without replaying the log from its start');
+  assert.equal(net.stats.get + net.stats.list, 1 + 3, 'refused without replaying the log from its start (the record of how far cleanup has gone, and three more)');
   const before = await replay(v.repo, 1);
   await assert.rejects(download(v.repo, before.get('old.bin')!), /is gone/, 'the refused moments really lost data');
   await assert.rejects(download(v.repo, before.get('drop.bin')!), /is gone/);

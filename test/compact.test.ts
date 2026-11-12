@@ -4,7 +4,8 @@ import { utf8 } from '../src/core/bytes.ts';
 import { deflate, inflate } from '../src/core/compress.ts';
 import type { SyncConfig } from '../src/core/config.ts';
 import { open, seal, unlockKeys, type KeyHeader } from '../src/core/crypto.ts';
-import { seqKey, type Repo } from '../src/core/repo.ts';
+import { Repo, seqKey } from '../src/core/repo.ts';
+import { Forward, Reads } from '../src/core/retention.ts';
 import { listCommits, listDeleted, tableAt, TooOldError } from '../src/core/timeline.ts';
 import { sameContent, type Commit, type Entry, type RemoteStore } from '../src/core/types.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
@@ -221,6 +222,150 @@ test('device clocks that disagree, and commits in one millisecond, change what i
     }
     for (const x of versions) await download(v.repo, x.entry!);
     for (const d of deleted) assert.match(await text(v.repo, d.entry), /^brief/);
+  }
+});
+
+/** Twenty days of a note edited once a day, on devices that keep versions for the given days, one store between them. */
+async function daily(days: number[], store: (net: SimStore) => RemoteStore = (net) => net) {
+  const clock = { now: T0 };
+  const mem = new MemoryStore(() => clock.now);
+  const net = new SimStore(mem);
+  const devices = days.map((d, i) => new Device('ABC'[i], store(net), clock, { packMaxBlobBytes: 4096, snapshotEvery: 4, retentionDays: d }));
+  const [a] = devices;
+  for (let day = 0; day < 20; day++) {
+    clock.now = T0 + day * DAY + 12 * HOUR;
+    a.fs.put('n.md', `day ${day}\n`);
+    if (day === 2) a.fs.put('brief.md', 'brief\n');
+    if (day === 4) a.fs.files.delete('brief.md');
+    if (day === 17) a.fs.put('late.md', 'late\n');
+    if (day === 18) a.fs.files.delete('late.md');
+    await a.sync();
+  }
+  for (const d of devices.slice(1)) await d.sync();
+  clock.now = T0 + 20 * DAY;
+  return { clock, mem, net, devices };
+}
+
+/** Every moment, version of n.md and deleted file the device offers, each read whole. */
+async function offered(d: Device) {
+  const v = await d.engine.view();
+  const moments = (await listCommits(v.repo, v.st.lastSeq, v.cfg, v.now)).map((c) => c.seq);
+  for (const seq of moments) {
+    for (const e of (await tableAt(v.repo, v.st.remote, v.st.lastSeq, v.cfg, v.now, { seq })).files.values()) await download(v.repo, e);
+  }
+  const versions = (await d.engine.history('n.md')).map((x) => x.seq);
+  for (const x of await d.engine.history('n.md')) await download(v.repo, x.entry!);
+  const deleted = await listDeleted(v.repo, v.st.lastSeq, v.cfg, v.now);
+  for (const x of deleted) await download(v.repo, x.entry);
+  const earliest = (await tableAt(v.repo, v.st.remote, v.st.lastSeq, v.cfg, v.now, v.now)).earliest.seq;
+  return { moments, versions, deleted: deleted.map((x) => x.path), earliest };
+}
+
+test('devices that keep versions for different lengths of time offer only what cleanup on any of them has kept', async () => {
+  const { clock, devices: [a, b] } = await daily([3, 30]);
+
+  assert.equal((await offered(b)).moments.length, 20, 'before any cleanup, B offers its whole month');
+  assert.ok((await a.engine.gc()).packsDeleted >= 10);
+  const shortest = await offered(a);
+  assert.deepEqual(shortest.moments, [20, 19, 18, 17, 16]);
+  assert.deepEqual(await offered(b), shortest, 'B offers nothing cleanup on A removed');
+
+  // Cleanup on B goes no further back than A's did, and takes nothing A or B offers.
+  await b.engine.gc();
+  assert.deepEqual(await offered(a), shortest);
+  assert.deepEqual(await offered(b), shortest);
+
+  // Days later B, by its own window, still offers what A's cleanup kept, and its own cleanup moves the record
+  // neither back nor on; once A cleans up again, B follows it forward.
+  for (let day = 20; day < 24; day++) {
+    clock.now = T0 + day * DAY + 12 * HOUR;
+    a.fs.put('n.md', `day ${day}\n`);
+    await a.sync();
+  }
+  clock.now = T0 + 25 * DAY;
+  await b.engine.gc();
+  assert.equal((await offered(b)).earliest, shortest.earliest);
+  assert.ok((await offered(a)).earliest > shortest.earliest, 'A offers less by its own window');
+  await a.engine.gc();
+  const later = await offered(a);
+  assert.deepEqual(later.moments, [24, 23, 22, 21, 20]);
+  assert.deepEqual(await offered(b), later);
+  assert.deepEqual((await b.engine.verify({ deep: true })).problems, []);
+});
+
+/** Storage that runs `on` around each read and write. */
+class Taps implements RemoteStore {
+  inner: RemoteStore;
+  on?: (when: 'before' | 'after', op: 'get' | 'put', key: string) => Promise<void>;
+  constructor(inner: RemoteStore) {
+    this.inner = inner;
+  }
+  private async tap<T>(key: string, op: 'get' | 'put', f: () => Promise<T>): Promise<T> {
+    await this.on?.('before', op, key);
+    const out = await f();
+    await this.on?.('after', op, key);
+    return out;
+  }
+  get(k: string, range?: { start: number; end: number }) {
+    return this.tap(k, 'get', () => this.inner.get(k, range));
+  }
+  put(k: string, data: Uint8Array, opts?: { ifNoneMatch?: boolean }) {
+    return this.tap(k, 'put', () => this.inner.put(k, data, opts));
+  }
+  delete(k: string) {
+    return this.inner.delete(k);
+  }
+  list(prefix: string, startAfter?: string) {
+    return this.inner.list(prefix, startAfter);
+  }
+}
+
+test('two cleanups at once with different windows leave the record at the further one', async () => {
+  const pruned = async (d: Device) => (await d.engine.view()).repo.prunedTo();
+  const taps = (net: SimStore) => new Taps(net);
+  // A keeps 3 days and cleans up to snapshot 16; B keeps 10 and would clean up to 8.
+
+  // A's cleanup runs whole after B has read the record and worked out what to keep, before B writes it: B
+  // reads it again first.
+  {
+    const { devices: [a, b] } = await daily([3, 10], taps);
+    let once = true;
+    (b.store as Taps).on = async (when, op, key) => {
+      if (when === 'after' && key.startsWith('snap/') && once) {
+        once = false;
+        await a.engine.gc();
+      }
+    };
+    await b.engine.gc();
+    assert.equal(await pruned(b), 16);
+    assert.deepEqual(await offered(b), await offered(a));
+  }
+  // B's write lands just after A's, before A deletes: A looks again once it has deleted.
+  {
+    const { devices: [a, b] } = await daily([3, 10], taps);
+    let wrote!: () => void;
+    let landed!: () => void;
+    const aWrote = new Promise<void>((r) => (wrote = r));
+    const bLanded = new Promise<void>((r) => (landed = r));
+    let gcA: Promise<unknown> | undefined;
+    (a.store as Taps).on = async (when, op, key) => {
+      if (key === 'pruned' && when === 'after' && op === 'put' && wrote) {
+        wrote();
+        wrote = undefined!;
+        await bLanded;
+      }
+    };
+    (b.store as Taps).on = async (when, op, key) => {
+      if (key !== 'pruned' || op !== 'put') return;
+      if (when === 'before') {
+        gcA = a.engine.gc();
+        await aWrote;
+      } else landed();
+    };
+    await b.engine.gc();
+    await gcA;
+    assert.equal(await pruned(b), 16);
+    assert.deepEqual(await offered(b), await offered(a));
   }
 });
 
@@ -641,6 +786,45 @@ test('a history index written by a version that drops the move flag does not tur
   const r = await a.engine.gc();
   assert.equal(r.packsDeleted, 1, 'n7.md\'s first place: moment 8 reads the copy, the move being part of it, not a moment of its own');
   assert.deepEqual((await a.engine.verify({ deep: true })).problems, []);
+});
+
+test('a history index an older version wrote is written again by the first reader that has all its commits', async () => {
+  const { devices: [a, b], mem, net } = await grown(8);
+  assert.equal((await a.engine.gc()).packsCombined, 8); // 9: a move
+  a.fs.put('n3.md', 'edited\n');
+  await a.sync(); // 10: a snapshot, and the index of 1-10
+  await b.sync();
+  const before = await seen(a);
+  const { repo } = await a.engine.view();
+  const read = async (r: Repo) => {
+    net.reset();
+    const walk = new Forward(new Reads(r, a.config), 1, 10);
+    const moved: number[] = [];
+    for (let c: Commit | undefined; (c = await walk.next()); ) if (c.moved) moved.push(c.seq);
+    return { gets: net.stats.get, puts: net.stats.put, moved };
+  };
+
+  await oldIndex(mem, 10);
+  assert.deepEqual(await read(repo), { gets: 11, puts: 1, moved: [9] }, 'the index, each commit, and the index written again');
+  assert.deepEqual(await read(repo), { gets: 1, puts: 0, moved: [9] });
+  assert.equal((await repo.readDigest(10, 10))?.[8].moved, true);
+
+  // A version from before the flags writing it again only starts the cycle over.
+  await oldIndex(mem, 10);
+  assert.equal(await seen(b), before);
+  assert.equal((await read(repo)).gets, 1, 'mended by the history B read');
+
+  // A reader that cannot write still reads.
+  await oldIndex(mem, 10);
+  const refusing: RemoteStore = {
+    get: (k, range) => net.get(k, range),
+    put: async (k, data, opts) => (k.startsWith('idx/') ? Promise.reject(new Error('injected: no writing')) : net.put(k, data, opts)),
+    delete: (k) => net.delete(k),
+    list: (prefix, after) => net.list(prefix, after),
+  };
+  const readOnly = await Repo.open(refusing, 'test passphrase', { kdfIterations: a.config.kdfIterations, chunk: a.config.chunk });
+  assert.deepEqual((await read(readOnly)).moved, [9]);
+  assert.equal(await repo.readDigest(10, 10), null);
 });
 
 test('verify passes after compaction and names a move that points at missing data', async () => {

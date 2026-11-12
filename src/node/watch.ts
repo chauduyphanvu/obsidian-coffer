@@ -119,6 +119,7 @@ export class SyncLoop {
 
 /** Reports each change in the vault except in the state folder and the echoes of `fs`'s own writes. A path of '' is a change of unknown location. */
 export function watchVault(root: string, fs: NodeFS, stateDir: string, onChange: (path: string) => void, onError: (e: Error) => void): FSWatcher {
+  fs.rememberOwn();
   const self = basename(root);
   const changed = async (path: string) => {
     if (path === stateDir || path.startsWith(`${stateDir}/`)) return;

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { WrongPassphraseError } from '../src/core/crypto.ts';
-import { SafetyError, type SyncResult } from '../src/core/engine.ts';
+import { HistoryError, SafetyError, type SyncResult } from '../src/core/engine.ts';
 import { MissingFolderError } from '../src/core/scopedfs.ts';
 import { plural } from '../src/core/text.ts';
 import { describeFailure, inShare, keysMissingProblem, missingProblem, resultProblems, staleProblem, statusText, summarize, targetProblems, type Problem } from '../src/plugin/status.ts';
@@ -42,20 +42,23 @@ test('failures are described by what the user can do about them', () => {
 });
 
 test('a history in storage other than the one this device saw offers to carry on from it; other damage does not', () => {
-  const kind = (message: string) => {
-    const p = describeFailure(new Error(message));
+  const kind = (e: Error) => {
+    const p = describeFailure(e);
     return [p.id, p.action ?? null];
   };
-  for (const message of [
+  const forked = [
     'Remote commit 3, the newest this device has seen, is missing: the log was rolled back or tampered with',
     'Remote commit 3 is not the one this device saw: the log was tampered with or forked',
     'Remote commit 4 does not follow the commit before it as this device saw it: the log was tampered with or forked',
-  ]) {
-    assert.deepEqual(kind(message), ['history', 'accept-storage'], message);
+  ];
+  for (const message of forked) {
+    assert.deepEqual(kind(new HistoryError(message)), ['history', 'accept-storage'], message);
+    assert.deepEqual(kind(new Error(message)), ['damaged', null], `told by its type, not its words: ${message}`);
   }
-  const p = describeFailure(new Error('Remote commit 3 is not the one this device saw: the log was tampered with or forked'));
+  const p = describeFailure(new HistoryError('Remote commit 3 is not the one this device saw: the log was tampered with or forked'));
   assert.match(p.detail, /restored from a backup/);
   assert.match(p.detail, /If nobody did that on purpose, leave sync stopped/);
+  const kindOf = (message: string) => kind(new Error(message));
   for (const message of [
     'Remote log has a gap before commit 7',
     'Commit 7 is listed but cannot be read',
@@ -64,7 +67,7 @@ test('a history in storage other than the one this device saw offers to carry on
     'Remote pack abc is missing',
     'Remote data failed authentication (x:pack/1): corrupted or tampered with',
   ]) {
-    assert.deepEqual(kind(message), ['damaged', null], message);
+    assert.deepEqual(kindOf(message), ['damaged', null], message);
   }
 });
 

@@ -5,8 +5,8 @@ import { deleteLimit, type GcResult } from '../core/engine.ts';
 import { diffCounts, lineDiff, type DiffRegion } from '../core/merge.ts';
 import { ext, vaultKey } from '../core/paths.ts';
 import { DAY } from '../core/retention.ts';
-import { plural } from '../core/text.ts';
-import type { RestorePlan } from '../core/timeline.ts';
+import { errorText, plural } from '../core/text.ts';
+import type { CommitSummary, RestorePlan } from '../core/timeline.ts';
 import type { Entry, FileStat } from '../core/types.ts';
 import type { VerifyReport } from '../core/verify.ts';
 import { MAX_COMPARE_BYTES, asText, sameBytes } from './status.ts';
@@ -131,7 +131,7 @@ export async function applyRestore(
       }
       done.push(s);
     } catch (e) {
-      failed.push({ path: s.path, message: e instanceof Error ? e.message : String(e) });
+      failed.push({ path: s.path, message: errorText(e) });
     }
   };
   const removals = steps.filter((s) => s.kind === 'remove');
@@ -188,7 +188,10 @@ export function momentLabel(time: number, now: number): string {
   return `${day === 'Today' || day === 'Yesterday' ? day.toLowerCase() : `on ${day}`} at ${timeLabel(time)}`;
 }
 
-/** Items in their order, under a heading for each day. */
+/**
+ * Items in their order, under a heading each time the day differs from the item before. Lists of the past keep the
+ * order things were synced in, and devices whose clocks disagree can stamp them out of order, so a day can come again.
+ */
 export function byDay<T>(items: T[], timeOf: (item: T) => number, now: number): { day: string; items: T[] }[] {
   const out: { day: string; items: T[] }[] = [];
   for (const item of items) {
@@ -197,6 +200,63 @@ export function byDay<T>(items: T[], timeOf: (item: T) => number, now: number): 
     else out.push({ day, items: [item] });
   }
   return out;
+}
+
+/** Whether a day heads more than one group, which the list should explain. */
+export const repeatsDay = (groups: { day: string }[]) => new Set(groups.map((g) => g.day)).size < groups.length;
+
+/**
+ * The times one place can be restored to, a page at a time, newest first, read from a history that `open` gives once.
+ * `reset` starts over for another place and drops what is still loading for the one before, so a slow answer can
+ * not fill the list, or the history later pages come from, with another place's times.
+ */
+export class MomentPages<L> {
+  look?: L;
+  moments: CommitSummary[] = [];
+  more = true;
+  loading = false;
+  private generation = 0;
+  private open: () => Promise<L>;
+  private page: (look: L, beforeSeq: number | undefined) => Promise<CommitSummary[]>;
+  private size: number;
+
+  /** `page` gives up to `size` moments, the newest first, before the commit `beforeSeq` (from the newest when undefined). */
+  constructor(open: () => Promise<L>, page: (look: L, beforeSeq: number | undefined) => Promise<CommitSummary[]>, size: number) {
+    this.open = open;
+    this.page = page;
+    this.size = size;
+  }
+
+  reset(): void {
+    this.generation++;
+    this.look = undefined;
+    this.moments = [];
+    this.more = true;
+    this.loading = false;
+  }
+
+  /** Loads the next page. False when nothing was added: one was loading already, or `reset` came meanwhile. */
+  async next(): Promise<boolean> {
+    if (this.loading) return false;
+    const generation = this.generation;
+    const current = () => generation === this.generation;
+    this.loading = true;
+    try {
+      const look = this.look ?? (await this.open());
+      if (!current()) return false;
+      this.look = look;
+      const page = await this.page(look, this.moments.at(-1)?.seq);
+      if (!current()) return false;
+      this.moments.push(...page);
+      this.more = page.length === this.size;
+      return true;
+    } catch (e) {
+      if (!current()) return false;
+      throw e;
+    } finally {
+      if (current()) this.loading = false;
+    }
+  }
 }
 
 export const deviceLabel = (device: string, me: string) => (device === me ? 'this device' : device);

@@ -7,7 +7,9 @@ import { PackTable, decEntry, encEntry, type WireEntry } from './wire.ts';
 
 const FORMAT = 1;
 const HEADER_KEY = 'vault.json';
+const PRUNED_KEY = 'pruned';
 const RESERVED = /^(log|snap|idx|pack)\//;
+const reserved = (key: string) => key === HEADER_KEY || key === PRUNED_KEY || RESERVED.test(key);
 
 interface Header {
   format: number;
@@ -58,6 +60,7 @@ const seqOf = (key: string) => Number(key.slice(key.lastIndexOf('/') + 1));
  *   snap/<seq>   full file table at that commit, and that commit's digest, so new devices skip the log
  *   idx/<seq>    the commits of one snapshot interval in a single object, for fast history
  *   pack/<id>    encrypted chunks back to back, addressed by (offset, length)
+ *   pruned       how far back cleanup has removed history (`prunedTo`), so no device offers what is gone
  *   dev/<id>     one device's heartbeat, an encrypted document
  *   any other    encrypted documents outside the log (readDoc, writeDoc)
  * Log objects are never deleted: a missing next key must always mean "nothing newer".
@@ -139,9 +142,32 @@ export class Repo {
 
   /** Null when there is none, or its writer lost the commits' flags (see `WireCommit.f`): then only the commits tell. */
   async readDigest(seq: number, count: number): Promise<Commit[] | null> {
+    return (await this.loadDigest(seq, count)).commits;
+  }
+
+  /**
+   * As `readDigest`, and whether a reader holding the commits should write it again: when there is none, or
+   * it lost the flags. Whether a digest without them holds a move or a confirmed commit cannot be told from
+   * it, since its writer dropped every field it did not know, so it is never trusted.
+   */
+  async loadDigest(seq: number, count: number): Promise<{ commits: Commit[] | null; stale: boolean }> {
     const w = await this.openJson<WireCommit[]>(seqKey('idx', seq));
-    if (!w || w.length !== count || !w.every((c) => c.f)) return null;
-    return w.map((c, i) => decCommit(seq - count + 1 + i, c));
+    if (!w) return { commits: null, stale: true };
+    if (w.length !== count) return { commits: null, stale: false };
+    if (!w.every((c) => c.f)) return { commits: null, stale: true };
+    return { commits: w.map((c, i) => decCommit(seq - count + 1 + i, c)), stale: false };
+  }
+
+  /**
+   * The furthest floor snapshot any cleanup has used, 0 before the first: history from before the earliest
+   * moment it gives is no longer whole, whatever retention the device reading it keeps.
+   */
+  async prunedTo(): Promise<number> {
+    return (await this.openJson<{ floor: number }>(PRUNED_KEY))?.floor ?? 0;
+  }
+
+  async setPrunedTo(floor: number): Promise<void> {
+    await this.store.put(PRUNED_KEY, await this.sealJson(PRUNED_KEY, { floor }));
   }
 
   async changePassphrase(oldPassphrase: string, newPassphrase: string): Promise<void> {
@@ -237,7 +263,7 @@ export class Repo {
   }
 
   private docKey(key: string): string {
-    if (!key || key === HEADER_KEY || RESERVED.test(key)) throw new Error(`"${key}" is not a document key`);
+    if (!key || reserved(key)) throw new Error(`"${key}" is not a document key`);
     return key;
   }
 
@@ -252,7 +278,7 @@ export class Repo {
 
   async listDocs(prefix: string): Promise<{ key: string; modified: number }[]> {
     const found = await this.store.list(this.docKey(prefix));
-    return found.filter((o) => o.key !== HEADER_KEY && !RESERVED.test(o.key)).map((o) => ({ key: o.key, modified: o.modified }));
+    return found.filter((o) => !reserved(o.key)).map((o) => ({ key: o.key, modified: o.modified }));
   }
 
   async deleteDoc(key: string): Promise<void> {

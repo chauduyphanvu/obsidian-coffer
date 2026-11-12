@@ -11,6 +11,7 @@ import type SelfSyncPlugin from './main.ts';
 import type { Failed, Look, RestoreOutcome } from './main.ts';
 import type { Share } from './settings.ts';
 import {
+  MomentPages,
   byDay,
   changesLabel,
   countSteps,
@@ -21,6 +22,7 @@ import {
   matchesQuery,
   momentLabel,
   previewVersion,
+  repeatsDay,
   restoreSteps,
   scopeName,
   sizeLabel,
@@ -75,7 +77,9 @@ function checkRow(parent: HTMLElement, checked: boolean, onChange: (checked: boo
 function days<T>(parent: HTMLElement, items: T[], timeOf: (item: T) => number, each: (parent: HTMLElement, item: T, time: string) => void): void {
   const times = timeLabels(items.map(timeOf));
   const at = new Map(items.map((x, i) => [x, times[i]]));
-  for (const d of byDay(items, timeOf, Date.now())) {
+  const groups = byDay(items, timeOf, Date.now());
+  if (repeatsDay(groups)) parent.createDiv({ cls: 'self-sync-hint', text: "Your devices' clocks disagree, so a day can come up more than once: the list keeps the order things were synced in." });
+  for (const d of groups) {
     parent.createDiv({ cls: 'self-sync-day', text: d.day });
     for (const x of d.items) each(parent, x, at.get(x)!);
   }
@@ -549,15 +553,13 @@ export class RestoreEarlierModal extends Modal {
   private share?: Share;
   /** Inside the vault or the shared folder; '' for all of it. */
   private folder: string;
-  /** Bumped when the vault or shared folder changes, so times still loading for the one before are dropped. */
-  private generation = 0;
   private step: 'choose' | 'review' | 'working' | 'done' = 'choose';
-  private look?: Look;
-  private moments: CommitSummary[] = [];
-  private more = true;
-  private loading = false;
+  /** The times of the vault's or the shared folder's history; reset when that changes. */
+  private pages: MomentPages<Look>;
   private error = '';
   private note = '';
+  /** Why the time tapped last could not be worked out, shown over the list loaded again after it. */
+  private gone = '';
   /** The moment being worked out, so a slower answer for one tapped earlier is dropped. */
   private asked?: CommitSummary;
   private past?: PastVault;
@@ -573,6 +575,11 @@ export class RestoreEarlierModal extends Modal {
     const place = folder ? plugin.placeOf(folder) : { path: '' };
     this.share = place.share;
     this.folder = place.path;
+    this.pages = new MomentPages(
+      () => plugin.look(this.share),
+      (l, beforeSeq) => listCommits(l.repo, l.lastSeq, l.cfg, l.now, { limit: PAGE, beforeSeq }),
+      PAGE,
+    );
   }
 
   onOpen(): void {
@@ -592,12 +599,9 @@ export class RestoreEarlierModal extends Modal {
     const moved = share?.id !== this.share?.id;
     this.share = share;
     this.folder = folder;
+    this.gone = '';
     if (!moved) return this.render();
-    this.generation++;
-    this.look = undefined;
-    this.moments = [];
-    this.more = true;
-    this.loading = false;
+    this.pages.reset();
     void this.loadMore();
   }
 
@@ -607,22 +611,16 @@ export class RestoreEarlierModal extends Modal {
   }
 
   private async loadMore(): Promise<void> {
-    if (this.loading) return;
-    const generation = this.generation;
-    this.loading = true;
+    if (this.pages.loading) return;
+    const loading = this.pages.next();
     this.error = '';
     this.render();
     try {
-      const l = (this.look ??= await this.plugin.look(this.share));
-      const page = await listCommits(l.repo, l.lastSeq, l.cfg, l.now, { limit: PAGE, beforeSeq: this.moments.at(-1)?.seq });
-      if (generation !== this.generation) return;
-      this.moments.push(...page);
-      this.more = page.length === PAGE;
+      // Dropped: the place changed meanwhile, and its own load draws the list.
+      if (!(await loading)) return;
     } catch (e) {
-      if (generation !== this.generation) return;
       this.error = `Could not load earlier times: ${failure(e)}`;
     }
-    this.loading = false;
     if (this.step === 'choose') this.render();
   }
 
@@ -658,17 +656,19 @@ export class RestoreEarlierModal extends Modal {
 
     c.createDiv({ cls: 'self-sync-pick-label', text: 'Bring it back to how it was' });
     c.createDiv({ cls: 'self-sync-hint', text: `Each time is when a device synced. The numbers say what that sync changed across ${this.share ? 'the shared folder' : 'the vault'}.` });
+    message(c, this.gone);
     const me = this.plugin.settings.deviceName;
+    const { moments, loading, more } = this.pages;
     const list = c.createDiv({ cls: 'self-sync-list' });
-    days(list, this.moments, (m) => m.time, (el, m, time) => {
+    days(list, moments, (m) => m.time, (el, m, time) => {
       row(el, time, `${deviceLabel(m.device, me)} · ${changesLabel(m)}`, () => void this.review(m));
     });
     message(c, this.error);
-    if (this.loading) c.createDiv({ cls: 'self-sync-hint', text: 'Loading…' });
-    else if (!this.moments.length && !this.error) c.createEl('p', { cls: 'self-sync-intro', text: 'Nothing has synced yet, so there is no earlier time to go back to.' });
+    if (loading) c.createDiv({ cls: 'self-sync-hint', text: 'Loading…' });
+    else if (!moments.length && !this.error) c.createEl('p', { cls: 'self-sync-intro', text: 'Nothing has synced yet, so there is no earlier time to go back to.' });
     const r = buttonRow(c);
     button(r, 'Cancel', () => this.close());
-    if (this.more && !this.loading && this.moments.length) button(r, 'Show earlier times', () => this.loadMore());
+    if (more && !loading && moments.length) button(r, 'Show earlier times', () => this.loadMore());
   }
 
   private chooseFolder(): void {
@@ -687,25 +687,32 @@ export class RestoreEarlierModal extends Modal {
 
   private async review(m: CommitSummary): Promise<void> {
     const asked = (this.asked = m);
+    const { share, folder } = this;
     this.step = 'review';
     this.past = undefined;
-    this.error = this.note = '';
+    this.error = this.note = this.gone = '';
     this.render();
     try {
-      const look = (this.look = await this.plugin.look(this.share));
+      const look = await this.plugin.look(share);
       // By its number: device clocks disagree, and two moments can share a millisecond, so its time may name another.
       const past = await tableAt(look.repo, look.remote, look.lastSeq, look.cfg, look.now, { seq: m.seq });
-      const { steps, left } = restoreSteps(planRestore(look.remote, past.files, this.folder), look.remote, this.plugin.keptOut(this.share));
+      const { steps, left } = restoreSteps(planRestore(look.remote, past.files, folder), look.remote, this.plugin.keptOut(share));
       if (this.asked !== asked) return;
       this.past = past;
       this.steps = steps;
       this.left = left;
     } catch (e) {
       if (this.asked !== asked) return;
-      this.error =
+      // The time may no longer be kept since the list was made: say why over the list as it is now.
+      this.asked = undefined;
+      this.step = 'choose';
+      this.gone =
         e instanceof TooOldError
-          ? `That is too far back: the earliest time that can be restored is ${momentLabel(e.earliest.time, Date.now())}.`
+          ? `That is too far back now: the earliest time that can be restored is ${momentLabel(e.earliest.time, Date.now())}.`
           : `Could not work out what would change: ${failure(e)}`;
+      this.pages.reset();
+      void this.loadMore();
+      return;
     }
     this.render();
   }
@@ -720,10 +727,7 @@ export class RestoreEarlierModal extends Modal {
   private renderReview(c: HTMLElement): void {
     const past = this.past;
     if (!past) {
-      if (this.error) {
-        message(c, this.error);
-        button(buttonRow(c), 'Back', () => this.back());
-      } else c.createEl('p', { cls: 'self-sync-intro', text: 'Working out what would change…' });
+      c.createEl('p', { cls: 'self-sync-intro', text: 'Working out what would change…' });
       return;
     }
     const me = this.plugin.settings.deviceName;

@@ -6,14 +6,14 @@ import { SafetyError, type GcResult, type SyncEngine, type SyncResult } from '..
 import { fileName, vaultKey } from '../core/paths.ts';
 import type { Repo } from '../core/repo.ts';
 import type { ScopedFS } from '../core/scopedfs.ts';
-import { plural } from '../core/text.ts';
+import { errorText, plural } from '../core/text.ts';
 import { planRestore, type DeletedFile } from '../core/timeline.ts';
 import type { Entry, Version } from '../core/types.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
 import { ChangeLog, fromEvents, type Why } from './changes.ts';
 import { ObsidianFS, PluginState, lookup, obsidianHttp } from './obsidianfs.ts';
-import { Pauses, nextPollDelay, pollPlaces } from './polling.ts';
+import { Pauses, Retries, nextPollDelay, pollPlaces, receivedChanges } from './polling.ts';
 import {
   cleanupDue,
   decodeSetupCode,
@@ -70,8 +70,6 @@ import {
 import { DeletedModal, RestoreEarlierModal, VerifyModal, VersionsModal } from './timemachine.ts';
 import { ProblemsModal, SettingsTab } from './views.ts';
 
-const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
-
 type SecretKey = 'accessKeySecret' | 'secretKeySecret' | 'passphraseSecret' | 'webdavPasswordSecret';
 const SECRET_KEYS: SecretKey[] = ['accessKeySecret', 'secretKeySecret', 'passphraseSecret', 'webdavPasswordSecret'];
 
@@ -119,7 +117,6 @@ interface Tracked {
   found: Problem[];
   /** Files a restore removed, which the next sync to finish deletes from storage as confirmed (`allowDeletes`). */
   restored?: Set<string>;
-  lastHeartbeat: number;
 }
 
 /** `true` lets the vault's sync delete many files; a share's id lets that shared folder's. */
@@ -138,6 +135,9 @@ export default class SelfSyncPlugin extends Plugin {
   private tracking = new Map<string, Tracked>();
   private changes = new ChangeLog(() => this.settings.shares);
   private pauses = new Pauses();
+  private retries = new Retries();
+  /** Whether a sync started for `why`, or a poll, includes a place: not while it is paused or waits after failing. */
+  private gate = { includes: (id: string, why: Why) => this.pauses.includes(id, why) && this.retries.includes(id, why, Date.now()) };
   private changedWhileRunning = false;
   private statusEl?: HTMLElement;
   private ribbonEl?: HTMLElement;
@@ -149,6 +149,8 @@ export default class SelfSyncPlugin extends Plugin {
   private pollTimer?: number;
   private pollDue = 0;
   private polling = false;
+  private retryTimer?: number;
+  private lastHeartbeat = 0;
   /** When something last suggested another device may be involved; see nextPollDelay. */
   private lastActivity = Date.now();
   private dirty = false;
@@ -224,11 +226,11 @@ export default class SelfSyncPlugin extends Plugin {
     );
 
     this.register(() => this.stopPoll());
+    this.register(() => window.clearTimeout(this.retryTimer));
     this.app.workspace.onLayoutReady(() => {
       // `places` are the ids of the places the change is in: a place paused before a mass delete may sync again.
       const changed = (...places: (string | string[])[]) => {
         for (const id of places.flat()) this.pauses.lift(id);
-        this.noteActivity();
         this.dirty = true;
         if (this.running) this.changedWhileRunning = true;
         else this.schedule();
@@ -312,7 +314,7 @@ export default class SelfSyncPlugin extends Plugin {
     this.pollTimer = undefined;
   }
 
-  /** Keeps one poll timer. A pending one is only ever pulled sooner, so a burst of edits cannot keep postponing it. */
+  /** Keeps one poll timer. A pending one is only ever pulled sooner, so activity cannot keep postponing it. */
   private armPoll(): void {
     const delay = nextPollDelay(this.settings.pollSeconds, this.lastActivity, Date.now());
     if (delay === undefined) return;
@@ -334,15 +336,14 @@ export default class SelfSyncPlugin extends Plugin {
 
   /**
    * Storage cannot notify devices, so ask each one: a tiny request each, and a real sync only when something is there.
-   * A place paused before a mass delete is not asked (see Pauses).
+   * A place paused before a mass delete, or waiting after a failed sync, is not asked (see Pauses and Retries).
    */
   private async poll(): Promise<void> {
     if (this.polling || this.running || document.visibilityState !== 'visible' || !this.configured()) return;
     this.polling = true;
     try {
       const places = new Map(this.targets().map((share) => [keyOf(share), share]));
-      if (!(await pollPlaces([...places.keys()], this.pauses, (id) => this.getEngine(places.get(id)).remoteChanged()))) return;
-      this.noteActivity();
+      if (!(await pollPlaces([...places.keys()], this.gate, (id) => this.getEngine(places.get(id)).remoteChanged()))) return;
       await this.auto('poll');
     } finally {
       this.polling = false;
@@ -407,7 +408,7 @@ export default class SelfSyncPlugin extends Plugin {
 
   private tracked(share?: Share): Tracked {
     let t = this.tracking.get(keyOf(share));
-    if (!t) this.tracking.set(keyOf(share), (t = { found: [], lastHeartbeat: 0 }));
+    if (!t) this.tracking.set(keyOf(share), (t = { found: [] }));
     return t;
   }
 
@@ -557,14 +558,16 @@ export default class SelfSyncPlugin extends Plugin {
     return this.sync(false, false, false, why);
   }
 
-  /** Tells the other devices where this one is: once per session, then every 30 minutes. Runs under the sync lock. */
-  private async heartbeat(share?: Share): Promise<void> {
-    const t = this.tracked(share);
-    if (!heartbeatDue(t.lastHeartbeat, Date.now())) return;
-    t.lastHeartbeat = Date.now();
+  /**
+   * Tells the vault's other devices where this one is: once per session, then every 30 minutes. Runs under the sync
+   * lock. Never in a shared folder, whose storage other people may read.
+   */
+  private async heartbeat(): Promise<void> {
+    if (!heartbeatDue(this.lastHeartbeat, Date.now())) return;
+    this.lastHeartbeat = Date.now();
     try {
       const platform = Platform.isIosApp ? 'iOS' : Platform.isAndroidApp ? 'Android' : Platform.isMacOS ? 'macOS' : Platform.isWin ? 'Windows' : Platform.isLinux ? 'Linux' : 'Unknown';
-      await writeHeartbeat(await this.getEngine(share).view(), { platform, version: this.manifest.version });
+      await writeHeartbeat(await this.getEngine().view(), { platform, version: this.manifest.version });
     } catch {
       // Storage may be down or refuse the write; the next try is in 30 minutes.
     }
@@ -591,8 +594,8 @@ export default class SelfSyncPlugin extends Plugin {
   }
 
   /**
-   * One place's sync and, when due, its cleanup and heartbeat. Throws when the sync fails. It looks only at the files
-   * the vault's events named when they are all there is to see; otherwise it lists every file.
+   * One place's sync and, when due, its cleanup and the vault's heartbeat. Throws when the sync fails. It looks only at
+   * the files the vault's events named when they are all there is to see; otherwise it lists every file.
    */
   private async syncOne(share: Share | undefined, force: boolean, why: Why): Promise<SyncResult> {
     const t = this.tracked(share);
@@ -605,9 +608,10 @@ export default class SelfSyncPlugin extends Plugin {
     );
     const r = await engine.sync({ force, changed, allowDeletes: t.restored });
     this.pauses.lift(keyOf(share));
+    this.retries.reset(keyOf(share));
     t.restored = undefined;
     if (!share && (r.pulled || r.deletedLocal)) this.files?.forgetConfigListing();
-    if (r.pushed || r.pulled || r.deletedLocal || r.deletedRemote || r.merged) this.noteActivity();
+    if (receivedChanges(r)) this.noteActivity();
     t.failure = undefined;
     rec.lastSuccess = Date.now();
     rec.conflictCopies = [...new Set([...rec.conflictCopies, ...r.conflictCopies])];
@@ -617,7 +621,7 @@ export default class SelfSyncPlugin extends Plugin {
       await engine.gc();
       rec.lastCleanup = Date.now();
     }
-    await this.heartbeat(share);
+    if (!share) await this.heartbeat();
     return r;
   }
 
@@ -625,9 +629,26 @@ export default class SelfSyncPlugin extends Plugin {
     const t = this.tracked(share);
     t.failure = describeFailure(e);
     this.changes.failed(share);
-    if (e instanceof SafetyError) this.pauses.pause(keyOf(share));
-    else this.engines.delete(keyOf(share));
+    if (e instanceof SafetyError) {
+      this.pauses.pause(keyOf(share));
+      this.retries.reset(keyOf(share));
+    } else {
+      this.engines.delete(keyOf(share));
+      this.retries.failed(keyOf(share), Date.now());
+    }
     return t.failure;
+  }
+
+  /** One timer, for when the soonest wait after a failed sync ends: the syncs it held back are owed then. */
+  private armRetry(): void {
+    window.clearTimeout(this.retryTimer);
+    this.retryTimer = undefined;
+    const due = this.retries.due(Date.now());
+    if (due === undefined) return;
+    this.retryTimer = window.setTimeout(() => {
+      this.retryTimer = undefined;
+      void this.auto('retry');
+    }, due - Date.now());
   }
 
   /** A sync of the vault and then of each shared folder, while the caller holds `running`. One failing does not stop the rest. */
@@ -650,7 +671,7 @@ export default class SelfSyncPlugin extends Plugin {
         this.settings,
         this.lookup,
         (share) => this.syncOne(share, share ? force === share.id : force === true, why),
-        (share) => this.pauses.includes(keyOf(share), why),
+        (share) => this.gate.includes(keyOf(share), why),
       );
       const out: SyncOutcome = { shares: new Map() };
       for (const o of outcomes) {
@@ -665,6 +686,7 @@ export default class SelfSyncPlugin extends Plugin {
       this.progress = '';
       this.progressNotice?.hide();
       this.progressNotice = undefined;
+      this.armRetry();
       this.report();
     }
   }
@@ -824,6 +846,7 @@ export default class SelfSyncPlugin extends Plugin {
       }
       this.tracking.delete(share.id);
       this.pauses.lift(share.id);
+      this.retries.reset(share.id);
       await this.removeState(share);
       await this.saveSettings();
     });

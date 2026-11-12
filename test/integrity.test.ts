@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { HistoryError } from '../src/core/engine.ts';
 import type { RemoteStore } from '../src/core/types.ts';
 import { describeFailure } from '../src/plugin/status.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
@@ -117,6 +118,7 @@ test('a device notices when the newest commit it saw is gone from storage', asyn
   b.restart(); // checked at start
   const e = await failure(b.sync());
   assert.match(e.message, /commit 3, the newest this device has seen, is missing/);
+  assert.ok(e instanceof HistoryError);
   assert.equal(describeFailure(e).id, 'history');
 
   // A device that keeps running and sees nothing new checks again within the hour,
@@ -124,7 +126,20 @@ test('a device notices when the newest commit it saw is gone from storage', asyn
   await a.sync();
   clock.now += HOUR;
   a.fs.put('n.md', '4\n');
-  await assert.rejects(a.sync(), /is missing/);
+  await assert.rejects(a.sync(), (x) => x instanceof HistoryError && /is missing/.test(x.message));
+
+  // Each carries on from storage as it is once told to.
+  await b.engine.acceptStorage();
+  await b.sync();
+  await a.engine.acceptStorage();
+  await a.sync();
+  await b.sync();
+  await a.sync();
+  assert.deepEqual(a.snapshot(), b.snapshot());
+  // Storage's version under the name, each device's own beside it.
+  assert.equal(a.fs.text('n.md'), '2\n');
+  assert.deepEqual([...a.fs.files.keys()].filter((p) => p !== 'n.md').map((p) => a.fs.text(p)).sort(), ['3\n', '4\n']);
+  assert.deepEqual((await a.engine.verify()).problems, []);
 });
 
 test('a device notices when storage shows devices different versions of the log', async () => {
@@ -151,6 +166,7 @@ test('a device notices when storage shows devices different versions of the log'
   toB.target = mem;
   const e = await failure(b.sync());
   assert.match(e.message, /commit 3 does not follow the commit before it/);
+  assert.ok(e instanceof HistoryError);
   assert.equal(describeFailure(e).id, 'history');
   assert.equal(b.fs.text('a.md'), undefined, 'nothing from the other version was written');
 
@@ -159,7 +175,20 @@ test('a device notices when storage shows devices different versions of the log'
   c.restart();
   const e2 = await failure(c.sync());
   assert.match(e2.message, /commit 2 is not the one this device saw/);
+  assert.ok(e2 instanceof HistoryError);
   assert.equal(describeFailure(e2).id, 'history');
+
+  // Each carries on from the storage it is shown once told to, keeping its own edit.
+  await b.engine.acceptStorage();
+  await b.sync();
+  await a.sync();
+  assert.equal(a.fs.text('b.md'), 'from B\n');
+  assert.equal(b.fs.text('a.md'), 'from A, again\n');
+  assert.deepEqual(a.snapshot(), b.snapshot());
+  await c.engine.acceptStorage();
+  await c.sync();
+  assert.equal(c.fs.text('b.md'), 'from B\n');
+  assert.deepEqual((await b.engine.verify()).problems, []);
 });
 
 test('a commit from a version that does not chain the log is accepted, and the chain picks up after it', async () => {
@@ -177,9 +206,12 @@ test('a commit from a version that does not chain the log is accepted, and the c
   assert.equal(b.fs.text('n.md'), 'one\ntwo\n');
   assert.deepEqual((await b.engine.verify()).problems, []);
 
-  // A link to anything but the commit before is refused.
+  // A link to anything but the commit before is refused. Storage's own commits disagree, which accepting it would find again.
   await repo.writeCommit({ seq: 4, device: 'X', time: clock.now, changes: [], prev: 'not the digest of commit 3' });
-  assert.match((await failure(b.sync())).message, /commit 4 does not follow/);
+  const e = await failure(b.sync());
+  assert.match(e.message, /commit 4 does not follow/);
+  assert.ok(!(e instanceof HistoryError));
+  await assert.rejects(b.engine.acceptStorage(), (x) => !(x instanceof HistoryError) && /commit 4 does not follow/.test((x as Error).message));
   assert.deepEqual((await a.engine.verify()).problems.map((p) => p.object), [key('log', 4)]);
 });
 
@@ -221,7 +253,52 @@ test('a device that starts from a snapshot checks it against the commit it was t
   await repo.writeSnapshot(2, files, 'the digest of some other commit 2');
   const e = await failure(fresh().sync());
   assert.match(e.message, /snapshot 2 was taken at a different commit 2/);
+  assert.ok(!(e instanceof HistoryError), 'a device starting afresh, as accepting storage does, finds it again');
   assert.equal(describeFailure(e).id, 'damaged');
+});
+
+test('damage within storage is a plain error, which accepting storage would only find again', async () => {
+  const commits = async (d: Device, texts: string[]) => {
+    for (const text of texts) {
+      d.fs.put('n.md', text);
+      await d.sync();
+    }
+  };
+  // The newest commit this device saw is gone while later ones are stored: a hole in the log, not a log cut back.
+  {
+    const { devices: [a, b], mem } = setup();
+    await commits(a, ['1\n', '2\n']);
+    await b.sync();
+    await commits(a, ['3\n', '4\n']);
+    mem.objects.delete(key('log', 2));
+    b.restart();
+    const e = await failure(b.sync());
+    assert.match(e.message, /commit 2, the newest this device has seen, is missing/);
+    assert.ok(!(e instanceof HistoryError));
+    await assert.rejects(b.engine.acceptStorage(), (x) => !(x instanceof HistoryError) && /gap before commit 3/.test((x as Error).message));
+  }
+  // A gap past it.
+  {
+    const { devices: [a, b], mem } = setup();
+    await commits(a, ['1\n']);
+    await b.sync();
+    await commits(a, ['2\n', '3\n', '4\n', '5\n']);
+    mem.objects.delete(key('log', 4));
+    const e = await failure(b.sync());
+    assert.match(e.message, /gap before commit 5/);
+    assert.ok(!(e instanceof HistoryError));
+    await assert.rejects(b.engine.acceptStorage(), (x) => !(x instanceof HistoryError) && /gap before commit 5/.test((x as Error).message));
+  }
+  // A snapshot whose commit is gone.
+  {
+    const { devices: [a, b], mem } = setup(['A', 'B'], { snapshotEvery: 2 });
+    await commits(a, ['1\n', '2\n', '3\n']);
+    mem.objects.delete(key('log', 2));
+    const e = await failure(b.sync());
+    assert.match(e.message, /commit 2 is missing, though a snapshot was taken at it/);
+    assert.ok(!(e instanceof HistoryError));
+    await assert.rejects(b.engine.acceptStorage(), /commit 2 is missing, though a snapshot was taken at it/);
+  }
 });
 
 test('checking that the newest commit is still there costs one more read, at start and then hourly', async () => {
@@ -356,13 +433,15 @@ test('documents outside the log are encrypted, listed and deleted, and cannot re
   await repo.deleteDoc('dev/phone');
   assert.deepEqual((await repo.listDocs('dev/')).map((d) => d.key), ['dev/laptop']);
 
-  for (const k of [key('log', 1), key('snap', 1), key('idx', 1), 'pack/x', 'vault.json', '']) {
+  for (const k of [key('log', 1), key('snap', 1), key('idx', 1), 'pack/x', 'vault.json', 'pruned', '']) {
     await assert.rejects(repo.writeDoc(k, {}), /not a document key/);
     await assert.rejects(repo.readDoc(k), /not a document key/);
     await assert.rejects(repo.deleteDoc(k), /not a document key/);
     await assert.rejects(repo.listDocs(k), /not a document key/);
   }
   assert.deepEqual(await repo.listDocs('v'), [], 'the key header is not a document');
+  await repo.setPrunedTo(1);
+  assert.deepEqual(await repo.listDocs('p'), [], 'nor is the record of how far cleanup has gone');
   assert.ok(mem.objects.has(key('log', 1)) && mem.objects.has('vault.json'));
 });
 

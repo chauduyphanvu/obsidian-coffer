@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { SafetyError } from '../src/core/engine.ts';
 import { lineDiff } from '../src/core/merge.ts';
-import { planRestore, tableAt } from '../src/core/timeline.ts';
+import { planRestore, tableAt, type CommitSummary } from '../src/core/timeline.ts';
 import type { Entry } from '../src/core/types.ts';
 import type { VerifyReport } from '../src/core/verify.ts';
 import {
@@ -17,12 +17,14 @@ import {
   describeVerify,
   deviceLabel,
   diffLines,
+  MomentPages,
   keepOut,
   lineChanges,
   matchesQuery,
   momentLabel,
   placeRestored,
   previewVersion,
+  repeatsDay,
   restoreSteps,
   sameSteps,
   scopeName,
@@ -244,6 +246,74 @@ test('days and times read as a person says them, with seconds only where two sha
 
   const items = [now - 1000, now - 2000, now - 86_400_000 * 1.5, now - 86_400_000 * 2];
   assert.deepEqual(byDay(items, (x) => x, now).map((d) => [d.day, d.items.length]), [['Today', 2], ['Yesterday', 1], [dayLabel(items[3], now), 1]]);
+  assert.equal(repeatsDay(byDay(items, (x) => x, now)), false);
+});
+
+test('a list of the past keeps the order things were synced in when clocks disagree, with a day heading again where the day changes back', () => {
+  const now = new Date(2026, 10, 11, 15, 0).getTime();
+  const today = new Date(2026, 10, 11, 0, 10).getTime();
+  // A phone whose clock is behind synced in between, stamping yesterday.
+  const items = [today + 60_000, new Date(2026, 10, 10, 23, 58).getTime(), today, new Date(2026, 10, 10, 23, 50).getTime()];
+  const groups = byDay(items, (x) => x, now);
+  assert.deepEqual(groups.map((d) => [d.day, d.items]), [['Today', [items[0]]], ['Yesterday', [items[1]]], ['Today', [items[2]]], ['Yesterday', [items[3]]]]);
+  assert.equal(repeatsDay(groups), true);
+});
+
+const moment = (seq: number): CommitSummary => ({ seq, time: seq * 1000, device: 'd', added: 1, changed: 0, deleted: 0 });
+
+/** Pages over two histories, opened when the test says; `place` is what is chosen when one is opened. */
+function pagesOver(histories: Record<string, number[]>) {
+  const h = { place: 'vault', opening: [] as { place: string; open: () => void; fail: (e: Error) => void }[] };
+  const pages = new MomentPages<string>(
+    () =>
+      new Promise((resolve, reject) => {
+        const place = h.place;
+        h.opening.push({ place, open: () => resolve(place), fail: reject });
+      }),
+    async (look, beforeSeq) => histories[look].filter((seq) => beforeSeq === undefined || seq < beforeSeq).slice(0, 2).map(moment),
+    2,
+  );
+  return { h, pages };
+}
+
+test("earlier times: a slow answer for the place chosen before never fills the list, nor the history its next pages come from", async () => {
+  const { h, pages } = pagesOver({ vault: [90, 80, 70], share: [9, 8, 7, 6, 5] });
+  const vault = pages.next();
+  assert.equal(pages.loading, true);
+  h.place = 'share';
+  pages.reset();
+  const share = pages.next();
+  h.opening[1].open();
+  assert.equal(await share, true);
+  assert.deepEqual(pages.moments.map((m) => m.seq), [9, 8]);
+  h.opening[0].open();
+  assert.equal(await vault, false, 'the vault, chosen first, answers last');
+  assert.equal(pages.look, 'share');
+  assert.equal(pages.loading, false);
+  assert.equal(await pages.next(), true);
+  assert.equal(await pages.next(), true);
+  assert.deepEqual(pages.moments.map((m) => m.seq), [9, 8, 7, 6, 5]);
+  assert.equal(pages.more, false);
+  assert.equal(h.opening.length, 2, 'the history is opened once per place');
+});
+
+test('earlier times: a failure for the place chosen before is dropped; one for the place shown is thrown, and the next try opens it again', async () => {
+  const { h, pages } = pagesOver({ vault: [3, 2, 1], share: [1] });
+  const vault = pages.next();
+  assert.equal(await pages.next(), false, 'one page at a time');
+  h.place = 'share';
+  pages.reset();
+  const share = pages.next();
+  h.opening[0].fail(new Error('offline'));
+  assert.equal(await vault, false);
+  assert.equal(pages.loading, true);
+  h.opening[1].fail(new Error('offline'));
+  await assert.rejects(share, /offline/);
+  assert.equal(pages.loading, false);
+  const again = pages.next();
+  h.opening[2].open();
+  assert.equal(await again, true);
+  assert.deepEqual(pages.moments.map((m) => m.seq), [1]);
 });
 
 test('sizes, filters and which files are worth counting lines for', () => {
