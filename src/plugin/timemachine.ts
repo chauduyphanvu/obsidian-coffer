@@ -528,7 +528,7 @@ export class DeletedModal extends Modal {
     c.empty();
     if (placed.length) {
       statusLine(c, `${plural(placed.length, 'file')} brought back`, failed.length ? 'warning' : 'ok');
-      c.createDiv({ cls: 'self-sync-sub', text: 'The next sync sends them to your other devices.' });
+      c.createDiv({ cls: 'self-sync-sub', text: `The next sync sends ${placed.length === 1 ? 'it' : 'them'} to your other devices.` });
       const list = c.createDiv({ cls: 'self-sync-files' });
       for (const p of placed) {
         const r = list.createDiv({ cls: 'self-sync-file' });

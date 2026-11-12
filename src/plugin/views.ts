@@ -7,7 +7,7 @@ import { describeStorage, hasStorageAddress, parseNumberSetting, type Settings, 
 import { SetupModal } from './setup.ts';
 import { renderDevices } from './devices.ts';
 import { confirmStopSharing, downloadAgain, renderShares } from './sharing.ts';
-import type { Problem } from './status.ts';
+import { isConflictProblem, type Problem } from './status.ts';
 import { button, buttonRow, field, message, openLink, statusLine } from './ui.ts';
 
 type SecretKey = 'accessKeySecret' | 'secretKeySecret' | 'passphraseSecret' | 'webdavPasswordSecret';
@@ -258,7 +258,7 @@ export class ProblemsModal extends Modal {
       }, 'cta');
       return;
     }
-    if (!problems.length) c.createEl('p', { cls: 'self-sync-intro', text: 'Everything is in sync.' });
+    if (!problems.length && !plugin.running) c.createEl('p', { cls: 'self-sync-intro', text: 'Everything is in sync.' });
     for (const p of problems) this.problem(c, p);
     button(buttonRow(c), plugin.running ? 'Syncing…' : 'Sync now', () => plugin.sync(true), problems.length ? 'plain' : 'cta').setDisabled(plugin.running);
   }
@@ -277,7 +277,7 @@ export class ProblemsModal extends Modal {
       for (const path of p.files.slice(0, 20)) {
         const row = list.createDiv({ cls: 'self-sync-file' });
         row.createSpan({ text: path });
-        if (p.id.startsWith('conflicts')) {
+        if (isConflictProblem(p)) {
           openLink(row, this.app, 'Original', conflictOriginal(path), close);
           openLink(row, this.app, 'Copy', path, close);
           button(row, 'Resolve', () => resolveConflict(plugin, path), 'cta');

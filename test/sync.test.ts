@@ -400,7 +400,9 @@ test('remote corruption is detected, not written into the vault', async () => {
   a.fs.put('n.md', 'important\n'.repeat(100));
   await a.sync();
   for (const [key, o] of mem.objects) if (key.startsWith('pack/')) o.data[o.data.length >> 1] ^= 0xff;
-  await assert.rejects(b.sync(), /authentication/);
+  const r = await b.sync();
+  assert.deepEqual(r.errors.map((e) => e.path), ['n.md']);
+  assert.match(r.errors[0].message, /authentication/);
   assert.equal(b.fs.files.size, 0);
 });
 

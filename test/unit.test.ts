@@ -194,6 +194,18 @@ test('doctor passes on a conforming store and catches a store without create-if-
   assert.match(report.checks.find((c) => !c.ok)!.name, /overwrite/);
 });
 
+test('doctor stops after the first check when storage cannot be reached, rather than trying every check', async () => {
+  let calls = 0;
+  const fail = async (): Promise<never> => {
+    calls++;
+    throw new Error('fetch failed');
+  };
+  const report = await checkStore({ get: fail, put: fail, delete: fail, list: fail });
+  assert.ok(!report.ok);
+  assert.deepEqual(report.checks.map((c) => [c.name, c.ok, c.detail]), [['read a missing object', false, 'fetch failed']]);
+  assert.equal(calls, 1);
+});
+
 test('setup codes open only with the right passphrase', async () => {
   const { sealWithPassphrase, openWithPassphrase } = await import('../src/core/crypto.ts');
   const code = await sealWithPassphrase('{"bucket":"b","secret":"s3cr3t"}', 'pass', 1000);

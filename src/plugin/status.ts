@@ -177,7 +177,10 @@ export function resultProblems(r: Pick<SyncResult, 'errors' | 'tooLarge'>, confl
       id: `too-large:${r.tooLarge.join('|')}`,
       severity: 'warning',
       title: `${plural(r.tooLarge.length, 'file')} too large to sync here`,
-      detail: `Over the ${maxFileSizeMB} MB limit set on this device, so they are not synced to or from it. Raise the limit in settings to include them.`,
+      detail:
+        r.tooLarge.length === 1
+          ? `Over the ${maxFileSizeMB} MB limit set on this device, so it is not synced to or from it. Raise the limit in settings to include it.`
+          : `Over the ${maxFileSizeMB} MB limit set on this device, so they are not synced to or from it. Raise the limit in settings to include them.`,
       files: r.tooLarge,
       action: 'settings',
     });
@@ -195,6 +198,23 @@ function conflictProblem(conflictCopies: string[]): Problem | undefined {
     files: conflictCopies,
     action: 'files',
   };
+}
+
+/** The vault's conflict copies, or a shared folder's (whose id `inShare` prefixes): the list offers to resolve each. */
+export const isConflictProblem = (p: Problem) => /^(share:[^:]*:)?conflicts:/.test(p.id);
+
+/** Why a storage check failed: what to check, in the words of that kind of storage, then the storage's own words. */
+export function connectError(cause: string, storageType: 's3' | 'webdav'): string {
+  const advice: Record<string, string> = {
+    access:
+      storageType === 'webdav'
+        ? 'The server refused this user name and password. Check them, and that they may read and write this folder.'
+        : 'The storage refused these keys. Check them, and that they may read and write this bucket.',
+    bucket: 'Bucket not found. Check its name and the region.',
+    offline: "Can't reach the storage. Check the address and the connection.",
+  };
+  const kind = describeFailure(new Error(cause)).id;
+  return `${advice[kind] ?? 'Connecting failed.'}\n${cause}`;
 }
 
 /** `problems` with the conflict entry made to match `conflictCopies` now, since copies are resolved between syncs. */

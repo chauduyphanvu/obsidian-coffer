@@ -9,7 +9,7 @@ import { openRemote } from '../stores/open.ts';
 import type SelfSyncPlugin from './main.ts';
 import { obsidianHttp } from './obsidianfs.ts';
 import { PROVIDERS, codeKind, folderFor, remoteSpec, secretName, setupCodeFrom, storageSettings, type Provider, type Settings, type Storage, type StorageForm } from './settings.ts';
-import { describeFailure, summarize } from './status.ts';
+import { connectError, summarize } from './status.ts';
 import { button, buttonRow, choice, field, message } from './ui.ts';
 
 type Step = 'start' | 'provider' | 'storage' | 'passphrase' | 'join' | 'syncing' | 'done';
@@ -24,17 +24,6 @@ export interface Keys {
   access: string;
   secret: string;
   password: string;
-}
-
-/** Why connecting failed: what to check, then the storage's own words. */
-function connectError(cause: string): string {
-  const advice: Record<string, string> = {
-    access: 'The storage refused these keys. Check them, and that they may read and write this bucket.',
-    bucket: 'Bucket not found. Check its name and the region.',
-    offline: "Can't reach the storage. Check the address and the connection.",
-  };
-  const kind = describeFailure(new Error(cause)).id;
-  return `${advice[kind] ?? 'Connecting failed.'}\n${cause}`;
 }
 
 /** The fields `provider` needs, filling in `f` and `k` as they are typed, for the vault's storage or a shared folder's. */
@@ -82,7 +71,7 @@ export function storageFields(c: HTMLElement, provider: Provider, f: StorageForm
 /** The storage settings the form describes, or an error saying what is missing. */
 export function formStorage(provider: Provider, f: StorageForm, k: Keys): Partial<Settings> {
   const storage = storageSettings(provider, f);
-  if (provider === 'webdav' ? !k.password : !k.access.trim() || !k.secret.trim()) throw new Error('Enter the keys.');
+  if (provider === 'webdav' ? !k.password : !k.access.trim() || !k.secret.trim()) throw new Error(provider === 'webdav' ? 'Enter the password.' : 'Enter the keys.');
   return storage;
 }
 
@@ -97,7 +86,7 @@ export async function tryStorage(base: Storage, storage: Partial<Storage>, k: Ke
     if (bad) throw new Error(bad.detail ?? bad.name);
     return await Repo.exists(store);
   } catch (e) {
-    throw new Error(connectError(errorText(e)));
+    throw new Error(connectError(errorText(e), trial.storageType));
   }
 }
 

@@ -4,7 +4,7 @@ import { WrongPassphraseError } from '../src/core/crypto.ts';
 import { HistoryError, SafetyError, type SyncResult } from '../src/core/engine.ts';
 import { MissingFolderError } from '../src/core/scopedfs.ts';
 import { plural } from '../src/core/text.ts';
-import { describeFailure, inShare, keysMissingProblem, missingProblem, resultProblems, staleProblem, statusText, summarize, targetProblems, type Problem } from '../src/plugin/status.ts';
+import { connectError, describeFailure, inShare, isConflictProblem, keysMissingProblem, missingProblem, resultProblems, staleProblem, statusText, summarize, targetProblems, type Problem } from '../src/plugin/status.ts';
 
 const result = (over: Partial<SyncResult> = {}): SyncResult => ({
   pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0, conflictCopies: [], skipped: 0, tooLarge: [], errors: [], commits: 0, rounds: 1, ...over,
@@ -81,6 +81,28 @@ test('failed, conflicting and oversized files each become one problem, keyed by 
   ]);
   assert.match(ps[2].detail, /200 MB/);
   assert.deepEqual(resultProblems(result(), [], 200), []);
+});
+
+test('a conflict in a shared folder is still a conflict, so the problem list offers to resolve it', () => {
+  const [vault] = resultProblems(result(), ['n (conflict phone 20261111-1200).md'], 200);
+  assert.ok(isConflictProblem(vault));
+  assert.ok(isConflictProblem(inShare(vault, { id: 'w1', folder: 'Work' })));
+  assert.ok(!isConflictProblem(inShare(describeFailure(new WrongPassphraseError()), { id: 'w1', folder: 'Work' })));
+});
+
+test('one file too large reads as one file', () => {
+  assert.match(resultProblems(result({ tooLarge: ['v.mov'] }), [], 200)[0].detail, /so it is not synced/);
+  assert.match(resultProblems(result({ tooLarge: ['v.mov', 'w.mov'] }), [], 200)[0].detail, /so they are not synced/);
+});
+
+test('a failed storage check says what to check in the words of that kind of storage, then its own words', () => {
+  const refused = 'WebDAV refused the login or the folder (HTTP 401)';
+  assert.match(connectError(refused, 'webdav'), /user name and password/);
+  assert.doesNotMatch(connectError(refused, 'webdav'), /keys|bucket/);
+  assert.ok(connectError(refused, 'webdav').endsWith(refused));
+  assert.match(connectError('S3 GET failed with HTTP 403 AccessDenied', 's3'), /keys/);
+  assert.match(connectError('net::ERR_CONNECTION_REFUSED', 'webdav'), /^Can't reach the storage/);
+  assert.match(connectError('something odd', 's3'), /^Connecting failed\.\nsomething odd$/);
 });
 
 test('a day without a successful sync is a problem; never having synced is not this one', () => {

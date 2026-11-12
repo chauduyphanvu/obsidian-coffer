@@ -362,6 +362,49 @@ test('verify finds nothing wrong with a healthy vault, quick or deep, and change
   assert.equal(a.state.data, state);
 });
 
+test('a missing, short or damaged pack fails only the files stored in it: a new device downloads every other file and reports those', async () => {
+  const { devices: [a, b], mem } = setup(['A', 'B'], { packMaxBlobBytes: 4096 });
+  for (const [i, name] of ['a.bin', 'b.bin', 'c.bin', 'd.bin'].entries()) a.fs.put(name, random(20_000, i + 1));
+  a.fs.put('note.md', 'kept\n');
+  a.fs.put('copy of d.bin', a.fs.files.get('d.bin')!.data);
+  await a.sync();
+  const { st } = await a.engine.view();
+  const pack = (path: string) => `pack/${st.remote.get(path)!.chunks[0].pack}`;
+  mem.objects.delete(pack('a.bin'));
+  const short = mem.objects.get(pack('b.bin'))!;
+  short.data = short.data.slice(0, short.data.length - 10);
+  mem.objects.get(pack('c.bin'))!.data[40] ^= 1;
+
+  const r = await b.sync();
+  assert.deepEqual(r.errors.map((e) => e.path).sort(), ['a.bin', 'b.bin', 'c.bin']);
+  assert.match(r.errors.find((e) => e.path === 'a.bin')!.message, /Remote pack .* is missing/);
+  assert.deepEqual([...b.fs.files.keys()].sort(), ['copy of d.bin', 'd.bin', 'note.md']);
+  assert.deepEqual(b.fs.files.get('d.bin')!.data, a.fs.files.get('d.bin')!.data);
+  const again = await b.sync();
+  assert.deepEqual(again.errors.map((e) => e.path).sort(), ['a.bin', 'b.bin', 'c.bin'], 'tried again, never written half');
+  assert.equal(b.fs.files.has('a.bin'), false);
+});
+
+test('a conflict whose other version cannot be downloaded keeps the file as it is and makes no copy, however often it is tried', async () => {
+  const { devices: [a, b], mem } = setup(['A', 'B'], { packMaxBlobBytes: 4096 });
+  a.fs.put('x.bin', random(20_000, 1));
+  await a.sync();
+  await b.sync();
+  a.fs.put('x.bin', random(20_000, 2));
+  await a.sync();
+  const { st } = await a.engine.view();
+  mem.objects.delete(`pack/${st.remote.get('x.bin')!.chunks[0].pack}`);
+  const mine = random(20_000, 3);
+  b.fs.put('x.bin', mine);
+  for (let i = 0; i < 2; i++) {
+    const r = await b.sync();
+    assert.deepEqual(r.errors.map((e) => e.path), ['x.bin']);
+    assert.deepEqual(r.conflictCopies, []);
+  }
+  assert.deepEqual([...b.fs.files.keys()], ['x.bin']);
+  assert.deepEqual(b.fs.files.get('x.bin')!.data, mine);
+});
+
 test('verify names the files a missing or short pack affects, and deep mode finds a damaged chunk', async () => {
   const { devices: [a], mem } = setup(['A'], { packMaxBlobBytes: 4096 }); // every chunk in a pack of its own
   for (const [i, name] of ['a.bin', 'b.bin', 'c.bin'].entries()) a.fs.put(name, random(20_000, i + 1));

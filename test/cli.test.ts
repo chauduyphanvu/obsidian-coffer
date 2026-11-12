@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { SafetyError, type SyncResult } from '../src/core/engine.ts';
 import type { RemoteStore } from '../src/core/types.ts';
-import { NodeFS } from '../src/node/nodefs.ts';
+import { FolderStore, NodeFS } from '../src/node/nodefs.ts';
 import { SyncLoop, watchVault, type LoopOptions } from '../src/node/watch.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
 import { Device } from './helpers.ts';
@@ -301,6 +301,129 @@ test('cli: verify exits 0 on a healthy remote, and 1 naming the files affected a
     assert.match(bad.stdout, /: 1 problem\n$/);
   } finally {
     t.done();
+  }
+});
+
+test('cli: an option the command does not know stops it before it does anything, so a mistyped --dry-run never restores for real', () => {
+  const t = setup({});
+  try {
+    put(t.vault, 'a.md', 'a\n');
+    t.cli('sync');
+    put(t.vault, 'b.md', 'b\n');
+    t.cli('sync');
+    const typo = t.run('restore-at', '1', '--dryrun');
+    assert.equal(typo.status, 2);
+    assert.match(typo.stderr, /^unknown option for restore-at: --dryrun$/m);
+    assert.deepEqual(files(t.vault), { 'a.md': 'a\n', 'b.md': 'b\n' });
+    assert.match(t.run('sync', '--forse').stderr, /^unknown option for sync: --forse$/m);
+    assert.match(t.run('log', '--deep').stderr, /^unknown option for log: --deep$/m);
+    assert.equal(t.run('verify', '--deep').status, 0);
+    const unknown = t.run('frobnicate');
+    assert.equal(unknown.status, 2);
+    assert.match(unknown.stderr, /^unknown command: frobnicate$/m);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli: restore leaves alone a file with changes not synced yet, which no stored version holds', () => {
+  const t = setup({});
+  try {
+    put(t.vault, 'a.md', 'one\n');
+    t.cli('sync');
+    put(t.vault, 'a.md', 'two\n');
+    t.cli('sync');
+    put(t.vault, 'a.md', 'three, typed and not synced\n');
+    const refused = t.run('restore', 'a.md', '1');
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, /a\.md has changes on this device that are not synced yet; run sync first/);
+    assert.equal(readFileSync(join(t.vault, 'a.md'), 'utf8'), 'three, typed and not synced\n');
+    t.cli('sync');
+    assert.match(t.cli('restore', 'a.md', '1'), /^restored a\.md as of /);
+    assert.equal(readFileSync(join(t.vault, 'a.md'), 'utf8'), 'one\n');
+  } finally {
+    t.done();
+  }
+});
+
+test('cli: says what went wrong with the config file, a path with no stored versions, and how to force a refused sync', () => {
+  const t = setup({ maxDeleteCount: 1 });
+  try {
+    const missing = spawnSync('node', [CLI, 'sync', `--config=${join(t.dir, 'nope.json')}`], { encoding: 'utf8', env: { ...process.env, SELFSYNC_PASSPHRASE: 'pw' } });
+    assert.equal(missing.status, 1);
+    assert.match(missing.stderr, /^config file .*nope\.json not found; pass --config=<file>$/m);
+    writeFileSync(join(t.dir, 'bad.json'), '{"vault": "x",\n');
+    const bad = spawnSync('node', [CLI, 'sync', `--config=${join(t.dir, 'bad.json')}`], { encoding: 'utf8', env: { ...process.env, SELFSYNC_PASSPHRASE: 'pw' } });
+    assert.match(bad.stderr, /^config file .*bad\.json is not valid JSON: /m);
+
+    const none = t.run('history', 'nothing/here.md');
+    assert.equal(none.status, 1);
+    assert.match(none.stderr, /^no stored versions of nothing\/here\.md$/m);
+
+    for (const n of ['a', 'b', 'c']) put(t.vault, `${n}.md`, `${n}\n`);
+    t.cli('sync');
+    for (const n of ['a', 'b', 'c']) rmSync(join(t.vault, `${n}.md`));
+    const refused = t.run('sync');
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, /^Refusing to sync: .*\nto delete them anyway, run sync --force$/m);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli: a half-written file left by a sync that was killed is never sent as a note of its own', () => {
+  const a = setup({});
+  const b = setup({}, a);
+  try {
+    put(a.vault, 'a.md', 'a\n');
+    put(a.vault, 'sub/b.md.selfsync-tmp', 'half of b');
+    assert.match(a.cli('sync'), /^sent 1,/);
+    b.cli('sync');
+    assert.deepEqual(files(b.vault), { 'a.md': 'a\n' });
+  } finally {
+    a.done();
+  }
+});
+
+test('cli: a storage folder that is gone, as a drive not mounted, fails the sync instead of being recreated empty and committed to', () => {
+  const t = setup({});
+  try {
+    put(t.vault, 'a.md', 'a\n');
+    t.cli('sync');
+    const remote = join(t.dir, 'remote');
+    const away = join(t.dir, 'remote-away');
+    renameSync(remote, away);
+    put(t.vault, 'a.md', 'edited while the drive was away\n');
+    const gone = t.run('sync');
+    assert.equal(gone.status, 1);
+    assert.match(gone.stderr, /storage folder .*remote is missing; .* check that it is mounted/);
+    assert.equal(existsSync(remote), false);
+    renameSync(away, remote);
+    assert.match(t.cli('sync'), /^sent 1,/);
+    assert.equal(t.run('verify').status, 0);
+  } finally {
+    t.done();
+  }
+});
+
+test('a folder remote that disappears is reported missing by every operation and never recreated; a first run may create it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'selfsync-folder-'));
+  try {
+    const root = join(dir, 'remote');
+    const store = new FolderStore(root);
+    assert.equal(await store.get('vault.json'), null);
+    assert.equal(await store.put('log/000000000001', new Uint8Array([1]), { ifNoneMatch: true }), true);
+    rmSync(root, { recursive: true });
+    await assert.rejects(store.get('log/000000000002', { start: 0, end: 1 }), /storage folder .* is missing/);
+    await assert.rejects(store.put('log/000000000002', new Uint8Array([2]), { ifNoneMatch: true }), /is missing/);
+    await assert.rejects(store.put('pack/abc', new Uint8Array([2])), /is missing/);
+    await assert.rejects(store.list('log/'), /is missing/);
+    await assert.rejects(store.delete('log/000000000001'), /is missing/);
+    assert.equal(existsSync(root), false);
+    await assert.rejects(new FolderStore(root, { create: false }).get('vault.json'), /is missing/);
+    assert.equal(existsSync(root), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

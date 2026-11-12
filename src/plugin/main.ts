@@ -1,7 +1,7 @@
 import { Notice, Platform, Plugin, TFile, TFolder, TextFileView, debounce, setIcon } from 'obsidian';
 import { pool } from '../core/bytes.ts';
 import type { SyncConfig } from '../core/config.ts';
-import { heartbeatDue, writeHeartbeat } from '../core/devices.ts';
+import { forgetDevice, heartbeatDue, writeHeartbeat } from '../core/devices.ts';
 import { SafetyError, type GcResult, type SyncEngine, type SyncResult } from '../core/engine.ts';
 import { fileName, vaultKey } from '../core/paths.ts';
 import type { Repo } from '../core/repo.ts';
@@ -56,6 +56,7 @@ import { ShareModal, pickTarget } from './sharing.ts';
 import { resolveFirstConflict } from './resolve.ts';
 import { applyRestore, deleteLimitCrossed, describeCleanup, keepOut, momentLabel, placeRestored, restoreSteps, sameSteps, type Failed, type Step } from './restore.ts';
 import {
+  connectError,
   describeFailure,
   inShare,
   keysMissingProblem,
@@ -151,6 +152,8 @@ export default class SelfSyncPlugin extends Plugin {
   private polling = false;
   private retryTimer?: number;
   private lastHeartbeat = 0;
+  /** The device name this session's last heartbeat went under. */
+  private heartbeatName = '';
   /** When something last suggested another device may be involved; see nextPollDelay. */
   private lastActivity = Date.now();
   private dirty = false;
@@ -563,11 +566,17 @@ export default class SelfSyncPlugin extends Plugin {
    * lock. Never in a shared folder, whose storage other people may read.
    */
   private async heartbeat(): Promise<void> {
-    if (!heartbeatDue(this.lastHeartbeat, Date.now())) return;
+    const name = this.settings.deviceName;
+    // Renamed since the last one: the record goes under the new name now, and the one under the old name goes.
+    const renamed = this.heartbeatName && this.heartbeatName !== name ? this.heartbeatName : '';
+    if (!renamed && !heartbeatDue(this.lastHeartbeat, Date.now())) return;
     this.lastHeartbeat = Date.now();
     try {
       const platform = Platform.isIosApp ? 'iOS' : Platform.isAndroidApp ? 'Android' : Platform.isMacOS ? 'macOS' : Platform.isWin ? 'Windows' : Platform.isLinux ? 'Linux' : 'Unknown';
-      await writeHeartbeat(await this.getEngine().view(), { platform, version: this.manifest.version });
+      const view = await this.getEngine().view();
+      await writeHeartbeat(view, { platform, version: this.manifest.version });
+      this.heartbeatName = name;
+      if (renamed) await forgetDevice(view, renamed);
     } catch {
       // Storage may be down or refuse the write; the next try is in 30 minutes.
     }
@@ -875,13 +884,16 @@ export default class SelfSyncPlugin extends Plugin {
       new Notice('Fill in the storage address first.');
       return;
     }
-    const report = await checkStore(this.store());
+    const checking = new Notice('Checking the storage…', 0);
+    let report: Awaited<ReturnType<typeof checkStore>>;
+    try {
+      report = await checkStore(this.store());
+    } finally {
+      checking.hide();
+    }
     const bad = report.checks.find((c) => !c.ok);
     if (!bad) new Notice('Storage works: all checks passed.', 5000);
-    else {
-      const p = describeFailure(new Error(bad.detail ?? bad.name));
-      new Notice(this.fragment(p.id.startsWith('failed') ? `Storage check failed: ${bad.name}` : p.title, p.detail), 20_000);
-    }
+    else new Notice(this.fragment('Storage check failed', connectError(bad.detail ?? bad.name, this.settings.storageType)), 20_000);
   }
 
   /** Cleans up the vault's storage and every shared folder's. Syncs, and changes to shared folders, wait meanwhile. */
@@ -982,6 +994,15 @@ export default class SelfSyncPlugin extends Plugin {
     return { placed: outcome.filter((x) => 'to' in x), failed: outcome.filter((x) => 'message' in x) };
   }
 
+  /** Saves what any open editor of vault path `path` holds. An editor with nothing unsaved writes nothing. */
+  private async saveEditorOf(path: string): Promise<void> {
+    const saving: Promise<void>[] = [];
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      if (leaf.view instanceof TextFileView && leaf.view.file && vaultKey(leaf.view.file.path) === vaultKey(path)) saving.push(leaf.view.save());
+    });
+    await Promise.all(saving);
+  }
+
   private say(progress: string): void {
     this.progress = progress;
     this.updateStatus();
@@ -1028,7 +1049,12 @@ export default class SelfSyncPlugin extends Plugin {
         steps,
         last,
         {
-          stat: (path) => fs.stat(at(path)),
+          // Typing in an open note reaches the disk only when its editor saves: save it first, or the check below
+          // would pass and the restore would overwrite what was typed.
+          stat: async (path) => {
+            await this.saveEditorOf(fs.pathOf(at(path)));
+            return fs.stat(at(path));
+          },
           write: (path, data) => this.writeFile(share, at(path), data),
           remove: (path) => fs.remove(at(path)),
           read: (entry) => engine.readVersion(entry),

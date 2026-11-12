@@ -14,6 +14,8 @@ export async function checkStore(store: RemoteStore): Promise<{ ok: boolean; che
     }
   };
   await check('read a missing object', async () => (await store.get(key)) === null);
+  // Unreachable or refusing storage fails every check the same way, each after its own retries: say so at once.
+  if (!checks[0].ok) return { ok: false, checks };
   await check('create an object', async () => store.put(key, data, { ifNoneMatch: true }));
   await check('refuse to overwrite on create-if-absent', async () =>
     (await store.put(key, data, { ifNoneMatch: true })) === false ||

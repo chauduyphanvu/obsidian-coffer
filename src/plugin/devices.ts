@@ -25,7 +25,9 @@ async function load(box: HTMLElement, plugin: SelfSyncPlugin): Promise<void> {
     const devices = await listDevices(view);
     box.empty();
     if (!devices.length) note('No device has reported yet. Each one appears after its next sync.');
-    for (const d of devices) row(box, d, view, () => confirmForget(plugin, box, view, d.name));
+    // This device's record is written at most every 30 minutes; when it last synced is known here exactly.
+    const seen = (d: DeviceStatus) => (d.isSelf ? { ...d, lastSeen: Math.max(d.lastSeen, plugin.settings.lastSuccess) } : d);
+    for (const d of devices) row(box, seen(d), view, () => confirmForget(plugin, box, view, d.name));
   } catch (e) {
     box.empty();
     note(`Could not load the devices: ${errorText(e)}`);

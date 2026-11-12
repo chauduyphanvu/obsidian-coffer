@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -8,7 +9,7 @@ import { vaultKey } from '../core/paths.ts';
 import { errorText, plural } from '../core/text.ts';
 import { TooOldError, listCommits, listDeleted, planRestore, tableAt } from '../core/timeline.ts';
 import type { RemoteStore } from '../core/types.ts';
-import { applyRestore, countSteps, deleteLimitCrossed, keepOut, restoreSteps } from '../plugin/restore.ts';
+import { applyRestore, countSteps, deleteLimitCrossed, keepOut, restoreSteps, sizeLabel, unsent } from '../plugin/restore.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
 import type { S3Config } from '../stores/s3.ts';
@@ -54,7 +55,24 @@ const USAGE = `Usage: node src/node/cli.ts <command> [--config=selfsync.json]
 Secrets come from the environment: SELFSYNC_PASSPHRASE, and for S3
 SELFSYNC_ACCESS_KEY and SELFSYNC_SECRET_KEY, for WebDAV SELFSYNC_WEBDAV_PASSWORD.`;
 
+/** Each command's options besides --config. */
+const OPTIONS: Record<string, string[]> = {
+  sync: ['force'],
+  watch: ['poll', 'interval'],
+  check: [],
+  history: [],
+  restore: [],
+  deleted: [],
+  log: ['limit'],
+  'restore-at': ['dry-run'],
+  verify: ['deep'],
+  clean: [],
+  'change-passphrase': [],
+  'accept-storage': [],
+};
+
 const STATE_DIR = '.self-sync';
+const FORCE_HINT = 'to delete them anyway, run sync --force';
 const ACCEPT_HINT = 'if storage was put back to a backup or an older copy on purpose, run accept-storage to carry on from it as it is now';
 const WATCH_SETTLE_MS = 3000;
 
@@ -64,8 +82,9 @@ const env = (name: string) => {
   return v;
 };
 
-function makeStore(remote: CliConfig['remote']): RemoteStore {
-  if (remote.type === 'folder') return new FolderStore(resolve(remote.path));
+/** `firstRun`: this device has not synced yet, so a missing storage folder is created rather than taken for one not mounted. */
+function makeStore(remote: CliConfig['remote'], firstRun: boolean): RemoteStore {
+  if (remote.type === 'folder') return new FolderStore(resolve(remote.path), { create: firstRun });
   if (remote.type === 'webdav') return openRemote({ type: 'webdav', url: remote.url, username: remote.username, password: env('SELFSYNC_WEBDAV_PASSWORD') });
   return openRemote({ ...remote, pathStyle: remote.pathStyle ?? true, prefix: remote.prefix ?? '', accessKey: env('SELFSYNC_ACCESS_KEY'), secretKey: env('SELFSYNC_SECRET_KEY') });
 }
@@ -161,8 +180,32 @@ async function main(): Promise<number> {
     console.log(USAGE);
     return 2;
   }
-  const cli = JSON.parse(await readFile(flags.get('config') || 'selfsync.json', 'utf8')) as CliConfig;
-  const store = makeStore(cli.remote);
+  if (!Object.hasOwn(OPTIONS, command)) {
+    console.error(`unknown command: ${command}\n\n${USAGE}`);
+    return 2;
+  }
+  // An option that is ignored can make a command do more than asked, as a mistyped --dry-run.
+  const unknown = [...flags.keys()].filter((f) => f !== 'config' && !OPTIONS[command].includes(f));
+  if (unknown.length) {
+    console.error(`unknown option for ${command}: ${unknown.map((f) => `--${f}`).join(', ')}`);
+    return 2;
+  }
+  const configFile = flags.get('config') || 'selfsync.json';
+  const cli = await readFile(configFile, 'utf8').then(
+    (text) => {
+      try {
+        return JSON.parse(text) as CliConfig;
+      } catch (e) {
+        throw new Error(`config file ${resolve(configFile)} is not valid JSON: ${errorText(e)}`);
+      }
+    },
+    (e: NodeJS.ErrnoException) => {
+      throw e.code === 'ENOENT' ? new Error(`config file ${resolve(configFile)} not found; pass --config=<file>`) : e;
+    },
+  );
+  const vault = resolve(cli.vault);
+  const stateFile = join(vault, STATE_DIR, 'state.json');
+  const store = makeStore(cli.remote, !existsSync(stateFile));
 
   if (command === 'check') {
     const report = await checkStore(store);
@@ -170,12 +213,11 @@ async function main(): Promise<number> {
     return report.ok ? 0 : 1;
   }
 
-  const vault = resolve(cli.vault);
   const fs = new NodeFS(vault);
   const engine = new SyncEngine({
     fs,
     store,
-    stateStore: new FileState(join(vault, STATE_DIR, 'state.json')),
+    stateStore: new FileState(stateFile),
     passphrase: env('SELFSYNC_PASSPHRASE'),
     config: resolveConfig({
       deviceName: hostname().split('.')[0],
@@ -227,6 +269,7 @@ async function main(): Promise<number> {
       onFailure: (e, retryMs) => {
         const message = errorText(e);
         console.error(`${stamp()} ${e instanceof SafetyError ? `${message} Not retrying until something changes.` : `sync failed: ${message}; retrying in ${retryMs! / 1000}s`}`);
+        if (e instanceof SafetyError) console.error(`${stamp()} ${FORCE_HINT}`);
         if (e instanceof HistoryError) console.error(`${stamp()} ${ACCEPT_HINT}`);
       },
       debounceMs: WATCH_SETTLE_MS,
@@ -245,15 +288,26 @@ async function main(): Promise<number> {
     return 0;
   }
   if (command === 'history' && rest[0]) {
-    for (const v of await engine.history(vaultKey(rest[0]))) {
+    const versions = await engine.history(vaultKey(rest[0]));
+    if (!versions.length) {
+      console.error(`no stored versions of ${rest[0]}`);
+      return 1;
+    }
+    for (const v of versions) {
       console.log(`${String(v.seq).padStart(6)}  ${new Date(v.time).toISOString()}  ${v.device.padEnd(16)} ${v.entry ? `${v.entry.size} bytes` : 'deleted'}`);
     }
     return 0;
   }
   if (command === 'restore' && rest[1]) {
-    const version = (await engine.history(vaultKey(rest[0]))).find((v) => v.seq === Number(rest[1]));
+    const key = vaultKey(rest[0]);
+    const version = (await engine.history(key)).find((v) => v.seq === Number(rest[1]));
     if (!version?.entry) throw new Error(`No restorable version ${rest[1]} of ${rest[0]}`);
-    await new NodeFS(vault).write(rest[0], await engine.readVersion(version.entry));
+    const data = await engine.readVersion(version.entry);
+    const { st } = await engine.view();
+    if (unsent(await fs.stat(rest[0]), st.synced.get(key))) {
+      throw new Error(`${rest[0]} has changes on this device that are not synced yet; run sync first, so they are kept as a version, then restore`);
+    }
+    await fs.write(rest[0], data);
     console.log(`restored ${rest[0]} as of ${new Date(version.time).toISOString()}; run sync to send it to other devices`);
     return 0;
   }
@@ -289,13 +343,12 @@ async function main(): Promise<number> {
   }
   if (command === 'clean') {
     const r = await engine.gc();
-    const mb = (bytes: number) => `${(bytes / 1e6).toFixed(1)} MB`;
-    const deleted = [r.packsDeleted && `${plural(r.packsDeleted, 'pack')} (${mb(r.bytesFreed)})`, r.snapshotsDeleted && plural(r.snapshotsDeleted, 'snapshot')].filter(Boolean);
+    const deleted = [r.packsDeleted && `${plural(r.packsDeleted, 'pack')} (${sizeLabel(r.bytesFreed)})`, r.snapshotsDeleted && plural(r.snapshotsDeleted, 'snapshot')].filter(Boolean);
     if (deleted.length) console.log(`deleted ${deleted.join(' and ')} that no kept version needs`);
     if (r.packsCombined) {
       console.log(
-        `copied the data still in use out of ${plural(r.packsCombined, 'small or mostly unused pack')} into ${plural(r.packsWritten, 'new pack')} (${mb(r.bytesMoved)}); ` +
-          `a later clean deletes the old ones (${mb(r.bytesFreedLater)}) once no kept version reads them`,
+        `copied the data still in use out of ${plural(r.packsCombined, 'small or mostly unused pack')} into ${plural(r.packsWritten, 'new pack')} (${sizeLabel(r.bytesMoved)}); ` +
+          `a later clean deletes the old ones (${sizeLabel(r.bytesFreedLater)}) once no kept version reads them`,
       );
     }
     if (!deleted.length && !r.packsCombined) console.log('nothing to clean: no stored version has expired, and no pack is worth combining');
@@ -317,6 +370,7 @@ main().then(
   (e) => {
     console.error(errorText(e));
     if (e instanceof HistoryError) console.error(ACCEPT_HINT);
+    if (e instanceof SafetyError) console.error(FORCE_HINT);
     process.exit(1);
   },
 );

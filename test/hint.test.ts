@@ -330,23 +330,23 @@ test('a hinted sync finds a file by the name it has on disk when that is another
 });
 
 test('a conflict copy left behind when taking the remote version fails is sent by the next hinted sync', async () => {
-  const { devices: [a, b], net } = setup();
+  const { devices: [a, b] } = setup();
   a.fs.put('p.bin', random(2000, 1));
   await a.sync();
   await b.sync();
   b.fs.put('p.bin', random(2000, 2));
   await b.sync();
   a.fs.put('p.bin', random(2000, 3));
-  const get = net.get.bind(net);
-  net.get = async (key, range) => {
-    if (key.startsWith('pack/')) throw new Error('offline');
-    return get(key, range);
+  const write = a.fs.write.bind(a.fs);
+  a.fs.write = async (path, data, mtime) => {
+    if (path === 'p.bin') throw new Error('disk full');
+    return write(path, data, mtime);
   };
   const r = await hinted(a, 'p.bin');
   assert.deepEqual(r.errors.map((e) => e.path), ['p.bin']);
   const copy = [...a.fs.files.keys()].find((p) => p.includes('conflict'))!;
   assert.ok(copy, 'this device\'s version was moved aside before the failure');
-  net.get = get;
+  a.fs.write = write;
   await hinted(a);
   await b.sync();
   assert.equal(Buffer.compare(b.fs.files.get(copy)!.data, random(2000, 3)), 0);

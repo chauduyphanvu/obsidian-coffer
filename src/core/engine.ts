@@ -728,13 +728,24 @@ export class SyncEngine {
           // unreadable: download everything
         }
       }
-      await this.fetchChunks(need.filter((c) => slots.has(c.id)), (ref, plain) => {
-        if (plain.length !== ref.size) throw new Error(`Remote chunk ${ref.id} has the wrong size`);
-        place(ref.id, plain);
-      });
+      // Damage in storage fails the files that need it, not the whole sync.
+      const failed = new Map<string, unknown>();
+      await this.fetchChunks(
+        need.filter((c) => slots.has(c.id)),
+        (ref, plain) => {
+          if (plain.length !== ref.size) throw new Error(`Remote chunk ${ref.id} has the wrong size`);
+          place(ref.id, plain);
+        },
+        (ref, e) => failed.set(ref.id, e),
+      );
+      // What `place` did not fill is missing from those buffers.
+      const incomplete = new Map<Uint8Array, unknown>();
+      for (const [id, list] of slots) for (const { buf } of list) incomplete.set(buf, failed.get(id));
       await pool(batch, this.cfg.concurrency, async (key) => {
         try {
-          await this.writeRemote(pass, key, st.remote.get(key)!, files.get(key)!);
+          const data = files.get(key)!;
+          if (incomplete.has(data)) throw incomplete.get(data);
+          await this.writeRemote(pass, key, st.remote.get(key)!, data);
         } catch (err) {
           recordError(res, key, err);
         }
@@ -786,13 +797,15 @@ export class SyncEngine {
       return;
     }
 
-    // Keep both: this device's version moves aside, the remote version takes the original name.
+    // Keep both: this device's version moves aside, the remote version takes the original name. Downloaded first:
+    // a copy made for a version that cannot be read would be made again at every sync.
+    const theirs = await this.readVersion(r);
     const at = new Date(this.now());
     let copy = conflictCopyName(key, this.cfg.deviceName, at);
     for (let n = 2; await fs.stat(copy); n++) copy = conflictCopyName(key, this.cfg.deviceName, at, n);
     const copyStat = await fs.write(copy, mine, l.mtime);
     run.unsettled.add(copy);
-    await this.writeRemote(pass, key, r, await this.readVersion(r));
+    await this.writeRemote(pass, key, r, theirs);
     res.conflictCopies.push(copy);
     return { key: copy, path: copy, ...copyStat };
   }
@@ -824,18 +837,32 @@ export class SyncEngine {
     }
   }
 
-  /** Downloads and decrypts chunks, fetching neighbours in one pack with one request. `sink` gets each chunk once. */
-  private async fetchChunks(refs: ChunkRef[], sink: (ref: ChunkRef, plain: Uint8Array) => void): Promise<void> {
+  /**
+   * Downloads and decrypts chunks, fetching neighbours in one pack with one request. `sink` gets each chunk once.
+   * With `failed`, a chunk whose pack is missing or that cannot be opened goes there instead of failing them all;
+   * a request that fails still does.
+   */
+  private async fetchChunks(refs: ChunkRef[], sink: (ref: ChunkRef, plain: Uint8Array) => void, failed?: (ref: ChunkRef, e: unknown) => void): Promise<void> {
     const { repo } = await this.open();
     const once = new Map<string, ChunkRef>();
     for (const ref of refs) if (!once.has(ref.id)) once.set(ref.id, ref);
     await pool(packRanges([...once.values()], this.cfg.rangeGapBytes, MAX_RANGE), this.cfg.concurrency, async (range) => {
       const data = await repo.getPackRange(range.pack, range.start, range.end);
-      if (!data) throw new Error(`Remote pack ${range.pack} is missing`);
+      if (!data) {
+        const e = new Error(`Remote pack ${range.pack} is missing`);
+        if (!failed) throw e;
+        for (const ref of range.refs) failed(ref, e);
+        return;
+      }
       // Decrypting and inflating run off the main thread, so one range's chunks need not queue behind each other.
       await pool(range.refs, OPEN_PARALLEL, async (ref) => {
         const at = ref.off - range.start;
-        sink(ref, await repo.openChunk(ref.id, data.subarray(at, at + ref.len)));
+        try {
+          sink(ref, await repo.openChunk(ref.id, data.subarray(at, at + ref.len)));
+        } catch (e) {
+          if (!failed) throw e;
+          failed(ref, e);
+        }
       });
     });
   }

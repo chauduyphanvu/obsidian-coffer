@@ -1,5 +1,5 @@
 import { mkdir, readFile, readdir, rename, rmdir, stat, unlink, utimes, writeFile, open } from 'node:fs/promises';
-import { dirname, join, sep } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import type { FileStat, LocalFS, LocalFile, ObjectInfo, RemoteStore, StateStore } from '../core/types.ts';
 
 const toStat = (s: { size: number; mtimeMs: number }): FileStat => ({ size: s.size, mtime: Math.floor(s.mtimeMs) });
@@ -79,7 +79,8 @@ export class NodeFS implements LocalFS {
         (await readdir(dir, { withFileTypes: true })).map(async (d) => {
           const path = rel ? `${rel}/${d.name}` : d.name;
           if (d.isDirectory()) await walk(join(dir, d.name), path);
-          else if (d.isFile()) out.push({ path, ...toStat(await stat(join(dir, d.name))) });
+          // A temporary file of a write that was cut short is not a note.
+          else if (d.isFile() && !d.name.endsWith(TMP)) out.push({ path, ...toStat(await stat(join(dir, d.name))) });
         }),
       );
     };
@@ -158,14 +159,50 @@ export class FileState implements StateStore {
   }
 }
 
-/** A plain folder as the remote: a NAS share, an external drive, or a test directory. */
+/**
+ * A plain folder as the remote: a NAS share, an external drive, or a test directory. The folder itself is
+ * created only with `create`, and never once it has been seen: a share or drive that is not mounted must fail,
+ * not read as empty storage and fill a stand-in folder with commits other devices never see.
+ */
 export class FolderStore implements RemoteStore {
   private root: string;
-  constructor(root: string) {
-    this.root = root;
+  private create: boolean;
+  private seen = false;
+  constructor(root: string, opts: { create?: boolean } = {}) {
+    this.root = resolve(root);
+    this.create = opts.create ?? true;
   }
   private abs(key: string): string {
     return join(this.root, ...key.split('/'));
+  }
+
+  /** Throws unless the folder exists, creating it first when allowed. */
+  private async checkRoot(): Promise<void> {
+    try {
+      await stat(this.root);
+      this.seen = true;
+      return;
+    } catch (e) {
+      if (!missing(e)) throw e;
+    }
+    if (!this.create || this.seen) throw new Error(`The storage folder ${this.root} is missing; if it is on a drive or a network share, check that it is mounted`);
+    await mkdir(this.root, { recursive: true });
+    this.seen = true;
+  }
+
+  /** Creates `dir` and the folders above it up to the root, which only `checkRoot` creates. */
+  private async mkdirIn(dir: string): Promise<void> {
+    if (dir === this.root) return this.checkRoot();
+    const make = () => mkdir(dir).catch((e: NodeJS.ErrnoException) => {
+      if (e.code !== 'EEXIST') throw e;
+    });
+    try {
+      await make();
+    } catch (e) {
+      if (!missing(e)) throw e;
+      await this.mkdirIn(dirname(dir));
+      await make();
+    }
   }
 
   async get(key: string, range?: { start: number; end: number }): Promise<Uint8Array | null> {
@@ -180,14 +217,15 @@ export class FolderStore implements RemoteStore {
         await fh.close();
       }
     } catch (e) {
-      if (missing(e)) return null;
-      throw e;
+      if (!missing(e)) throw e;
+      await this.checkRoot();
+      return null;
     }
   }
 
   async put(key: string, data: Uint8Array, opts?: { ifNoneMatch?: boolean }): Promise<boolean> {
     const abs = this.abs(key);
-    await mkdir(dirname(abs), { recursive: true });
+    await this.mkdirIn(dirname(abs));
     if (opts?.ifNoneMatch) {
       try {
         await writeFile(abs, data, { flag: 'wx' });
@@ -203,8 +241,9 @@ export class FolderStore implements RemoteStore {
   }
 
   async delete(key: string): Promise<void> {
-    await unlink(this.abs(key)).catch((e) => {
+    await unlink(this.abs(key)).catch(async (e) => {
       if (!missing(e)) throw e;
+      await this.checkRoot();
     });
   }
 
@@ -214,8 +253,9 @@ export class FolderStore implements RemoteStore {
     try {
       names = await readdir(this.abs(dir));
     } catch (e) {
-      if (missing(e)) return [];
-      throw e;
+      if (!missing(e)) throw e;
+      await this.checkRoot();
+      return [];
     }
     const out: ObjectInfo[] = [];
     for (const name of names.sort()) {
