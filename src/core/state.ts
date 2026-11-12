@@ -13,15 +13,18 @@ export interface Synced {
 export class LocalState {
   vaultId = '';
   lastSeq = 0;
+  /** Digest of commit `lastSeq` ('' before the first), which the next commit must name. Unknown in a state saved before the log was chained. */
+  head: string | undefined = '';
   remote = new Map<string, Entry>();
   synced = new Map<string, Synced>();
 
   static parse(json: string | null): LocalState {
     const st = new LocalState();
     if (!json) return st;
-    const w = JSON.parse(json) as { id: string; seq: number; p: string[]; f: [string, WireEntry | 0, 0 | [number, number] | [number, number, WireEntry]][] };
+    const w = JSON.parse(json) as { id: string; seq: number; h?: string; p: string[]; f: [string, WireEntry | 0, 0 | [number, number] | [number, number, WireEntry]][] };
     st.vaultId = w.id;
     st.lastSeq = w.seq;
+    st.head = w.h ?? (w.seq ? undefined : '');
     for (const [path, r, s] of w.f) {
       const remote = r ? decEntry(r, w.p) : undefined;
       if (remote) st.remote.set(path, remote);
@@ -39,6 +42,7 @@ export class LocalState {
       touched.add(ch.path);
     }
     this.lastSeq = c.seq;
+    this.head = c.hash;
     return touched;
   }
 
@@ -52,6 +56,6 @@ export class LocalState {
     for (const [path, s] of this.synced) {
       if (!this.remote.has(path)) f.push([path, 0, [s.lsize, s.lmtime, encEntry(s.entry, pt)]]);
     }
-    return JSON.stringify({ id: this.vaultId, seq: this.lastSeq, p: pt.list, f });
+    return JSON.stringify({ id: this.vaultId, seq: this.lastSeq, h: this.head, p: pt.list, f });
   }
 }

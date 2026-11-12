@@ -155,8 +155,79 @@ details.self-sync-section[open] { padding-bottom: var(--size-4-3); }
   border-top: 1px solid var(--background-modifier-border);
   overflow-wrap: anywhere;
 }
-.self-sync-file > span { flex: 1 1 12em; }
+.self-sync-file > span { flex: 1 1 12em; min-width: 0; }
 .self-sync-open { white-space: nowrap; }
+.self-sync-file > button { flex: none; width: auto; margin-inline-start: auto; }
+
+/* Conflict resolver: one change at a time, this device's lines above the other device's. */
+body:not(.is-phone) .modal.self-sync-resolve { --dialog-width: 720px; }
+.self-sync-resolve .modal-title { overflow-wrap: anywhere; }
+.self-sync-resolve-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--size-4-2);
+  margin-bottom: var(--size-4-3);
+}
+.self-sync-resolve-count { flex: 1 1 auto; min-width: 0; font-weight: var(--font-semibold); font-variant-numeric: tabular-nums; }
+.self-sync-resolve-nav > button { flex: none; width: auto; }
+
+.self-sync-hunk { display: flex; flex-direction: column; gap: var(--size-4-2); }
+.self-sync-lines {
+  font-family: var(--font-text);
+  font-size: var(--font-ui-small);
+  line-height: var(--line-height-normal);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  tab-size: 4;
+}
+.self-sync-line { min-height: calc(var(--line-height-normal) * 1em); }
+.self-sync-context {
+  color: var(--text-muted);
+  padding-inline-start: calc(var(--size-4-3) + 4px);
+}
+.self-sync-side {
+  min-width: 0;
+  padding: var(--size-4-2) var(--size-4-3);
+  border: 1px solid var(--background-modifier-border);
+  border-inline-start: 4px solid var(--self-sync-side-color);
+  border-radius: var(--radius-m);
+  background: var(--background-secondary);
+}
+.self-sync-side.is-mine { --self-sync-side-color: rgb(var(--color-blue-rgb)); }
+.self-sync-side.is-theirs { --self-sync-side-color: rgb(var(--color-purple-rgb)); }
+.self-sync-side-label {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--size-2-2) var(--size-4-2);
+  margin-bottom: var(--size-2-2);
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+  color: var(--text-muted);
+}
+.self-sync-side.is-kept { border-color: var(--interactive-accent); border-inline-start-color: var(--self-sync-side-color); }
+.self-sync-side.is-kept .self-sync-side-state { color: var(--text-accent); }
+.self-sync-side.is-dropped .self-sync-changed { color: var(--text-faint); text-decoration: line-through; }
+.self-sync-none { color: var(--text-faint); font-style: italic; font-size: var(--font-ui-small); }
+
+.self-sync-pick-label { margin-top: var(--size-4-3); font-weight: var(--font-semibold); }
+.self-sync-pick {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+  gap: var(--size-4-2);
+  margin-top: var(--size-2-3);
+}
+.self-sync-pick > button { width: 100%; height: auto; min-height: var(--input-height); white-space: normal; padding-inline: var(--size-4-2); }
+.self-sync-pick > button.is-selected,
+.self-sync-pick > button.is-selected:hover { background: var(--interactive-accent); color: var(--text-on-accent); }
+
+.self-sync-options { margin-top: var(--size-4-3); }
+
+/* Touch targets on phones and tablets */
+.is-mobile .self-sync-resolve button,
+.is-mobile .self-sync-file > button { min-height: 44px; }
+.is-mobile .self-sync-resolve-nav > button { min-width: 44px; }
 
 /* Loud notices: they stay until tapped. */
 .notice.self-sync-notice { cursor: pointer; }

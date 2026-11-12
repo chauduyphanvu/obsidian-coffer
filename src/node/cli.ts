@@ -2,13 +2,14 @@ import { readFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DEFAULT_CONFIG, resolveConfig, type SyncConfig } from '../core/config.ts';
-import { SyncEngine } from '../core/engine.ts';
+import { SafetyError, SyncEngine, type SyncResult } from '../core/engine.ts';
 import { vaultKey } from '../core/paths.ts';
 import type { RemoteStore } from '../core/types.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
 import type { S3Config } from '../stores/s3.ts';
 import { FileState, FolderStore, NodeFS } from './nodefs.ts';
+import { SyncLoop, watchVault } from './watch.ts';
 
 interface CliConfig {
   vault: string;
@@ -22,6 +23,8 @@ interface CliConfig {
 const USAGE = `Usage: node src/node/cli.ts <command> [--config=selfsync.json]
 
   sync [--force]         sync the vault once
+  watch                  sync, then keep syncing until stopped; --poll=30 seconds between checks for
+                         remote changes, --interval=300 seconds between full syncs
   check                  test that the remote storage supports everything sync needs
   history <path>         list stored versions of a file
   restore <path> <seq>   write a stored version back into the vault
@@ -32,6 +35,7 @@ Secrets come from the environment: SELFSYNC_PASSPHRASE, and for S3
 SELFSYNC_ACCESS_KEY and SELFSYNC_SECRET_KEY, for WebDAV SELFSYNC_WEBDAV_PASSWORD.`;
 
 const STATE_DIR = '.self-sync';
+const WATCH_SETTLE_MS = 3000;
 
 const env = (name: string) => {
   const v = process.env[name];
@@ -44,6 +48,18 @@ function makeStore(remote: CliConfig['remote']): RemoteStore {
   if (remote.type === 'webdav') return openRemote({ type: 'webdav', url: remote.url, username: remote.username, password: env('SELFSYNC_WEBDAV_PASSWORD') });
   return openRemote({ ...remote, pathStyle: remote.pathStyle ?? true, prefix: remote.prefix ?? '', accessKey: env('SELFSYNC_ACCESS_KEY'), secretKey: env('SELFSYNC_SECRET_KEY') });
 }
+
+const summary = (r: SyncResult) => `sent ${r.pushed}, received ${r.pulled}, deleted ${r.deletedLocal} here and ${r.deletedRemote} remotely, merged ${r.merged}`;
+
+function report(r: SyncResult, at = ''): void {
+  console.log(`${at}${summary(r)}`);
+  for (const copy of r.conflictCopies) console.log(`${at}both versions kept: ${copy}`);
+  for (const path of r.tooLarge) console.error(`${at}not synced, over the size limit: ${path}`);
+  for (const e of r.errors) console.error(`${at}failed: ${e.path}: ${e.message}`);
+}
+
+const didSomething = (r: SyncResult) =>
+  r.pushed + r.pulled + r.deletedLocal + r.deletedRemote + r.merged + r.conflictCopies.length + r.errors.length > 0;
 
 async function main(): Promise<number> {
   const argv = process.argv.slice(2);
@@ -63,8 +79,9 @@ async function main(): Promise<number> {
   }
 
   const vault = resolve(cli.vault);
+  const fs = new NodeFS(vault);
   const engine = new SyncEngine({
-    fs: new NodeFS(vault),
+    fs,
     store,
     stateStore: new FileState(join(vault, STATE_DIR, 'state.json')),
     passphrase: env('SELFSYNC_PASSPHRASE'),
@@ -79,11 +96,42 @@ async function main(): Promise<number> {
 
   if (command === 'sync') {
     const r = await engine.sync({ force: flags.has('force') });
-    console.log(`sent ${r.pushed}, received ${r.pulled}, deleted ${r.deletedLocal} here and ${r.deletedRemote} remotely, merged ${r.merged}`);
-    for (const copy of r.conflictCopies) console.log(`both versions kept: ${copy}`);
-    for (const path of r.tooLarge) console.error(`not synced, over the size limit: ${path}`);
-    for (const e of r.errors) console.error(`failed: ${e.path}: ${e.message}`);
+    report(r);
     return r.errors.length ? 1 : 0;
+  }
+  if (command === 'watch') {
+    const seconds = (name: string, fallback: number) => {
+      const n = flags.has(name) ? Number(flags.get(name)) : fallback;
+      if (!(n > 0)) throw new Error(`--${name} must be a number of seconds above 0`);
+      return n * 1000;
+    };
+    const pollMs = seconds('poll', 30);
+    const intervalMs = seconds('interval', 300);
+    const stamp = () => new Date().toISOString();
+    const loop = new SyncLoop({
+      sync: () => engine.sync(),
+      remoteChanged: () => engine.remoteChanged(),
+      onResult: (r) => {
+        if (didSomething(r)) report(r, `${stamp()} `);
+      },
+      onFailure: (e, retryMs) => {
+        const message = e instanceof Error ? e.message : String(e);
+        console.error(`${stamp()} ${e instanceof SafetyError ? `${message} Not retrying until something changes.` : `sync failed: ${message}; retrying in ${retryMs! / 1000}s`}`);
+      },
+      debounceMs: WATCH_SETTLE_MS,
+      pollMs,
+      intervalMs,
+    });
+    // Watching starts before the first sync so that edits made during it are not missed.
+    const watcher = watchVault(vault, fs, STATE_DIR, () => loop.changed(), (e) => console.error(`${stamp()} watching failed: ${e.message}; relying on the --interval syncs`));
+    const signalled = new Promise<void>((done) => {
+      for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => done());
+    });
+    loop.start();
+    await signalled;
+    watcher.close();
+    await loop.stop();
+    return 0;
   }
   if (command === 'history' && rest[0]) {
     for (const v of await engine.history(vaultKey(rest[0]))) {

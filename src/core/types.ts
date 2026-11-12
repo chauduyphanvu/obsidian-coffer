@@ -24,6 +24,10 @@ export interface Commit {
   device: string;
   time: number;
   changes: Change[];
+  /** `hash` of the commit before this one, '' for the first. Absent in commits written before the log was chained. */
+  prev?: string;
+  /** Digest of this commit as stored. Known for commits read from or written to the log. */
+  hash?: string;
 }
 
 export interface Version {

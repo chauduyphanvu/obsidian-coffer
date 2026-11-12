@@ -4,14 +4,33 @@ import type { FileStat, LocalFS, LocalFile, ObjectInfo, RemoteStore, StateStore 
 
 const toStat = (s: { size: number; mtimeMs: number }): FileStat => ({ size: s.size, mtime: Math.floor(s.mtimeMs) });
 const missing = (e: unknown) => (e as NodeJS.ErrnoException).code === 'ENOENT';
+const TMP = '.selfsync-tmp';
 
 export class NodeFS implements LocalFS {
   private root: string;
+  /** What this FS last left at each path it wrote or removed, and in the folders above: its stat, null when absent, undefined when the operation failed. */
+  private own = new Map<string, Promise<FileStat | null | undefined>>();
   constructor(root: string) {
     this.root = root;
   }
   private abs(path: string): string {
     return join(this.root, ...path.split('/'));
+  }
+
+  /** Whether a change event for `path` is the echo of this FS's own latest write or removal, with nothing since by anyone else. */
+  async isOwnChange(path: string): Promise<boolean> {
+    if (path.endsWith(TMP)) return true;
+    const left = await this.own.get(path);
+    if (left === undefined) return false;
+    const now = await this.stat(path);
+    return left === null ? now === null : !!now && now.size === left.size && now.mtime === left.mtime;
+  }
+
+  /** Starts remembering what `path` and its folders look like once `done` settles. A watcher can report the effects before the operation returns, so this runs as it starts. */
+  private track(path: string, done: Promise<unknown>): void {
+    for (let p = path; p; p = p.slice(0, Math.max(0, p.lastIndexOf('/')))) {
+      this.own.set(p, Promise.all([this.own.get(p), done]).then(() => this.stat(p)).catch(() => undefined));
+    }
   }
 
   async list(): Promise<LocalFile[]> {
@@ -33,18 +52,30 @@ export class NodeFS implements LocalFS {
     return readFile(this.abs(path));
   }
 
-  async write(path: string, data: Uint8Array, mtime?: number): Promise<FileStat> {
+  write(path: string, data: Uint8Array, mtime?: number): Promise<FileStat> {
+    const done = this.put(path, data, mtime);
+    this.track(path, done);
+    return done;
+  }
+
+  private async put(path: string, data: Uint8Array, mtime?: number): Promise<FileStat> {
     const abs = this.abs(path);
     await mkdir(dirname(abs), { recursive: true });
     // Write beside the target and rename, so a crash never leaves a half-written note.
-    const tmp = `${abs}.selfsync-tmp`;
+    const tmp = `${abs}${TMP}`;
     await writeFile(tmp, data);
     if (mtime !== undefined) await utimes(tmp, mtime / 1000, mtime / 1000);
     await rename(tmp, abs);
     return toStat(await stat(abs));
   }
 
-  async remove(path: string): Promise<void> {
+  remove(path: string): Promise<void> {
+    const done = this.drop(path);
+    this.track(path, done);
+    return done;
+  }
+
+  private async drop(path: string): Promise<void> {
     const abs = this.abs(path);
     await unlink(abs).catch((e) => {
       if (!missing(e)) throw e;

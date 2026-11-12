@@ -1,5 +1,5 @@
 // Small building blocks for the plugin's screens, laid out to work at phone width.
-import { ButtonComponent } from 'obsidian';
+import { ButtonComponent, TFile, type App } from 'obsidian';
 
 export interface FieldOptions {
   value?: string;
@@ -41,6 +41,18 @@ export function button(parent: HTMLElement, text: string, onClick: () => unknown
   if (kind === 'cta') b.setCta();
   if (kind === 'warning') b.setWarning();
   return b;
+}
+
+/** A link that opens a vault file in a new tab, after `before` (which closes the dialog); nothing when the file is gone. */
+export function openLink(parent: HTMLElement, app: App, label: string, path: string, before: () => void): void {
+  const file = app.vault.getAbstractFileByPath(path);
+  if (!(file instanceof TFile)) return;
+  const a = parent.createEl('a', { cls: 'self-sync-open', text: label, href: '#' });
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    before();
+    void app.workspace.getLeaf(true).openFile(file);
+  });
 }
 
 export function message(parent: HTMLElement, text: string, cls = 'self-sync-error'): void {

@@ -9,6 +9,9 @@ function extensionDot(path: string): number {
   return dot > path.lastIndexOf('/') ? dot : path.length;
 }
 
+/** The last part of a path: `a/b.md` → `b.md`. */
+export const fileName = (path: string) => path.slice(path.lastIndexOf('/') + 1);
+
 /** Lower-case extension without the dot; empty when the file name has none. */
 export function ext(path: string): string {
   return path.slice(extensionDot(path) + 1).toLowerCase();

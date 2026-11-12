@@ -1,6 +1,9 @@
-// What a sync did and what went wrong, in words a user can act on. No Obsidian import, so it runs under plain Node tests.
+// What a sync did, what went wrong and what a conflict leaves to choose, in words a user can act on.
+// No Obsidian import, so it runs under plain Node tests.
 import { WrongPassphraseError } from '../core/crypto.ts';
 import { SafetyError, type SyncResult } from '../core/engine.ts';
+import { lineDiff, type DiffRegion } from '../core/merge.ts';
+import { ext } from '../core/paths.ts';
 import { DAY } from '../core/retention.ts';
 
 export const plural = (n: number, one: string, many = `${one}s`) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
@@ -99,16 +102,8 @@ export function resultProblems(r: Pick<SyncResult, 'errors' | 'tooLarge'>, confl
       action: 'files',
     });
   }
-  if (conflictCopies.length) {
-    out.push({
-      id: `conflicts:${conflictCopies.join('|')}`,
-      severity: 'warning',
-      title: `${plural(conflictCopies.length, 'file')} changed on two devices`,
-      detail: 'Both versions were kept: the copy has "(conflict …)" in its name. Compare them, keep what you need, then delete the copy.',
-      files: conflictCopies,
-      action: 'files',
-    });
-  }
+  const conflicts = conflictProblem(conflictCopies);
+  if (conflicts) out.push(conflicts);
   if (r.tooLarge.length) {
     out.push({
       id: `too-large:${r.tooLarge.join('|')}`,
@@ -120,6 +115,77 @@ export function resultProblems(r: Pick<SyncResult, 'errors' | 'tooLarge'>, confl
     });
   }
   return out;
+}
+
+function conflictProblem(conflictCopies: string[]): Problem | undefined {
+  if (!conflictCopies.length) return undefined;
+  return {
+    id: `conflicts:${conflictCopies.join('|')}`,
+    severity: 'warning',
+    title: `${plural(conflictCopies.length, 'file')} changed on two devices`,
+    detail: 'Both versions were kept: the copy has "(conflict …)" in its name. Resolve shows what differs and lets you choose what to keep.',
+    files: conflictCopies,
+    action: 'files',
+  };
+}
+
+/** `problems` with the conflict entry made to match `conflictCopies` now, since copies are resolved between syncs. */
+export function withConflicts(problems: Problem[], conflictCopies: string[]): Problem[] {
+  return problems.flatMap((p) => (p.id.startsWith('conflicts:') ? (conflictProblem(conflictCopies) ?? []) : p));
+}
+
+/** Larger files are not read to be compared, only kept or replaced whole. */
+export const MAX_COMPARE_BYTES = 2 * 1024 * 1024;
+
+/** A file as it was shown: its bytes when no larger than `MAX_COMPARE_BYTES`, otherwise only its size and time. */
+export interface Snapshot {
+  size: number;
+  mtime: number;
+  data?: Uint8Array;
+}
+
+const sameBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
+
+/** Whether a file is still as it was shown; undefined stands for no file. */
+export function unchangedSince(before: Snapshot | undefined, now: Snapshot | undefined): boolean {
+  if (!before || !now) return !before && !now;
+  if (before.data && now.data) return sameBytes(before.data, now.data);
+  return before.size === now.size && before.mtime === now.mtime;
+}
+
+/** Why a conflict can only be settled by keeping whole files. */
+export type WholeReason = 'missing' | 'same' | 'large' | 'binary' | 'structured' | 'different';
+
+export type Comparison = { kind: 'lines'; regions: DiffRegion[] } | { kind: 'whole'; reason: WholeReason };
+
+/** Files whose structure lines picked from two versions could break. */
+const STRUCTURED = new Set(['json', 'canvas']);
+
+/** Text with its byte order mark kept, so writing it back changes nothing; undefined for anything that is not text. */
+function asText(data: Uint8Array): string | undefined {
+  try {
+    const s = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(data);
+    return s.includes('\0') ? undefined : s;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * How the two sides of a conflict over `path` can be compared: change by change when both are text that a line
+ * diff can follow, otherwise only as whole files. `mine` is this device's copy, `theirs` the file under the original name.
+ */
+export function compareConflict(path: string, mine: Snapshot, theirs: Snapshot | undefined): Comparison {
+  const whole = (reason: WholeReason): Comparison => ({ kind: 'whole', reason });
+  if (!theirs) return whole('missing');
+  if (!mine.data || !theirs.data) return whole('large');
+  if (sameBytes(mine.data, theirs.data)) return whole('same');
+  const a = asText(mine.data);
+  const b = asText(theirs.data);
+  if (a === undefined || b === undefined) return whole('binary');
+  if (STRUCTURED.has(ext(path))) return whole('structured');
+  const regions = lineDiff(a, b);
+  return regions ? { kind: 'lines', regions } : whole('different');
 }
 
 /** Failing quietly for a day is a problem in itself, even when each failure looked temporary. */

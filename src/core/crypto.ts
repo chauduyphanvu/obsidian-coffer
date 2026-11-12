@@ -126,6 +126,11 @@ export async function open(keys: Keys, sealed: Uint8Array, aad: string): Promise
   return { plain: new Uint8Array(plain), flag };
 }
 
+/** Names an object by its stored bytes, so two devices can tell whether storage showed them the same one. */
+export async function digest(data: Uint8Array): Promise<string> {
+  return toB64(new Uint8Array(await subtle.digest('SHA-256', bs(data)), 0, 16));
+}
+
 /** Keyed, so the storage provider cannot test whether a known file is in the vault. */
 export async function chunkId(keys: Keys, data: Uint8Array): Promise<string> {
   const mac = await subtle.sign('HMAC', keys.id, bs(data));

@@ -1,11 +1,12 @@
-import { Modal, Notice, PluginSettingTab, Setting, SuggestModal, TFile, type App } from 'obsidian';
+import { Modal, Notice, PluginSettingTab, Setting, SuggestModal, type App } from 'obsidian';
 import { conflictOriginal } from '../core/paths.ts';
 import type { Version } from '../core/types.ts';
 import type SelfSyncPlugin from './main.ts';
+import { resolveConflict } from './resolve.ts';
 import { describeStorage, hasStorageAddress, parseNumberSetting, type Settings } from './settings.ts';
 import { SetupModal } from './setup.ts';
 import type { Problem } from './status.ts';
-import { button, buttonRow, field, message, statusLine } from './ui.ts';
+import { button, buttonRow, field, message, openLink, statusLine } from './ui.ts';
 
 export class HistoryModal extends SuggestModal<Version> {
   private plugin: SelfSyncPlugin;
@@ -287,13 +288,15 @@ export class ProblemsModal extends Modal {
     card.createDiv({ cls: 'self-sync-problem-detail', text: p.detail });
     if (p.files?.length) {
       const list = card.createDiv({ cls: 'self-sync-files' });
+      const close = () => this.close();
       for (const path of p.files.slice(0, 20)) {
         const row = list.createDiv({ cls: 'self-sync-file' });
         row.createSpan({ text: path });
         if (p.id.startsWith('conflicts')) {
-          this.openLink(row, 'Original', conflictOriginal(path));
-          this.openLink(row, 'Copy', path);
-        } else this.openLink(row, 'Open', path);
+          openLink(row, this.app, 'Original', conflictOriginal(path), close);
+          openLink(row, this.app, 'Copy', path, close);
+          button(row, 'Resolve', () => resolveConflict(plugin, path), 'cta');
+        } else openLink(row, this.app, 'Open', path, close);
       }
       if (p.files.length > 20) list.createDiv({ cls: 'self-sync-hint', text: `…and ${p.files.length - 20} more` });
     }
@@ -318,17 +321,6 @@ export class ProblemsModal extends Modal {
         button(row, 'Try again', () => plugin.sync(true));
         break;
     }
-  }
-
-  private openLink(parent: HTMLElement, label: string, path: string): void {
-    const file = this.app.vault.getAbstractFileByPath(path);
-    if (!(file instanceof TFile)) return;
-    const a = parent.createEl('a', { cls: 'self-sync-open', text: label, href: '#' });
-    a.addEventListener('click', (e) => {
-      e.preventDefault();
-      this.close();
-      void this.app.workspace.getLeaf(true).openFile(file);
-    });
   }
 }
 

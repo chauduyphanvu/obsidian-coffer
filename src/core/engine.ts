@@ -9,6 +9,9 @@ import { Repo } from './repo.ts';
 import { collectGarbage, listVersions } from './retention.ts';
 import { LocalState } from './state.ts';
 import { hasChunks, type Change, type ChunkRef, type Commit, type Entry, type FileStat, type LocalFS, type RemoteStore, type StateStore, type Version } from './types.ts';
+import { verifyRepo, type VerifyOptions, type VerifyReport } from './verify.ts';
+
+export type { VerifyOptions, VerifyProblem, VerifyReport } from './verify.ts';
 
 export interface EngineOptions {
   fs: LocalFS;
@@ -36,6 +39,15 @@ export interface SyncResult {
   rounds: number;
 }
 
+/** The repo with the remote file table brought up to date, for features that only read. */
+export interface RepoView {
+  repo: Repo;
+  /** This device's state. Read it; changing it changes what the next sync does. */
+  st: LocalState;
+  cfg: SyncConfig;
+  now: number;
+}
+
 /** Thrown instead of syncing when a sync would delete a suspiciously large share of the vault. */
 export class SafetyError extends Error {
   readonly localDeletes: number;
@@ -61,6 +73,7 @@ const MAX_RANGE = 8 << 20;
 const MOVE_CACHE = 64 << 20;
 const OPTIMISTIC_BYTES = 256 << 10;
 const OPEN_PARALLEL = 4;
+const HEAD_CHECK_EVERY = 3_600_000;
 
 const contentKey = (e: Entry) => e.chunks.map((c) => c.id).join(',');
 
@@ -95,7 +108,12 @@ export class SyncEngine {
   private now: () => number;
   private repo?: Repo;
   private st?: LocalState;
-  private dedup?: Map<string, ChunkRef>;
+  /** Chunks a commit may refer to without uploading them, by id. See `reusable`. */
+  private dedup = new Map<string, ChunkRef>();
+  /** Chunks this sync uploaded, by id. */
+  private uploaded = new Map<string, ChunkRef>();
+  /** When the log was last seen to continue from this device's newest commit. */
+  private headSeen = -Infinity;
 
   constructor(options: EngineOptions) {
     this.o = options;
@@ -132,24 +150,47 @@ export class SyncEngine {
   private async fetchRemote(): Promise<Set<string>> {
     const { repo, st } = await this.open();
     const touched = new Set<string>();
-    const add = (c: Commit) => st.apply(c).forEach((p) => touched.add(p));
+    const add = (c: Commit) => {
+      // A commit without `prev` comes from a version that did not chain the log. It is taken as it
+      // is, and the chain restarts from it: the next chained commit names its digest like any other.
+      if (c.prev !== undefined && st.head !== undefined && c.prev !== st.head) {
+        throw new Error(`Remote commit ${c.seq} does not follow the commit before it as this device saw it: the log was tampered with or forked`);
+      }
+      st.apply(c).forEach((p) => touched.add(p));
+      this.headSeen = this.now();
+    };
     const loadSnapshot = async () => {
       const snaps = await repo.snapshots();
       const latest = snaps[snaps.length - 1];
       if (!latest || latest.seq <= st.lastSeq) return;
-      const files = await repo.readSnapshot(latest.seq);
-      if (!files) return;
+      // The chain goes on from the commit the snapshot was taken at, read in the same round trip.
+      const [snap, at] = await Promise.all([repo.readSnapshotWithHead(latest.seq), repo.readCommit(latest.seq)]);
+      if (!snap) return;
+      if (!at) throw new Error(`Remote commit ${latest.seq} is missing, though a snapshot was taken at it`);
+      if (snap.head !== undefined && snap.head !== at.hash) {
+        throw new Error(`Remote snapshot ${latest.seq} was taken at a different commit ${latest.seq} than storage holds: the log was tampered with or forked`);
+      }
       for (const p of st.remote.keys()) touched.add(p);
-      for (const p of files.keys()) touched.add(p);
-      st.remote = files;
+      for (const p of snap.files.keys()) touched.add(p);
+      st.remote = snap.files;
       st.lastSeq = latest.seq;
+      st.head = at.hash;
+      this.headSeen = this.now();
     };
 
     if (st.lastSeq === 0) await loadSnapshot();
     else {
       // The common cases cost one or two cheap GETs: nothing new, or exactly one new commit.
       // Two probes at once: "nothing new" and "exactly one new commit" both finish in a single round trip.
-      const [first, second] = await Promise.all([repo.readCommit(st.lastSeq + 1), repo.readCommit(st.lastSeq + 2)]);
+      // "Nothing new" cannot tell a quiet log from one cut back under this device, so at start and then
+      // hourly a third read in the same round trip checks that this device's newest commit is still there.
+      const checkHead = this.headDue(st);
+      const [first, second, head] = await Promise.all([
+        repo.readCommit(st.lastSeq + 1),
+        repo.readCommit(st.lastSeq + 2),
+        checkHead ? repo.readCommit(st.lastSeq) : undefined,
+      ]);
+      if (head !== undefined) this.checkHead(st, head);
       if (!first) return touched;
       add(first);
       if (!second) return touched;
@@ -170,7 +211,21 @@ export class SyncEngine {
       if (c.seq !== st.lastSeq + 1) throw new Error(`Remote log has a gap before commit ${c.seq}`);
       add(c);
     }
+    this.headSeen = this.now();
     return touched;
+  }
+
+  private headDue(st: LocalState): boolean {
+    return st.head === undefined || this.now() - this.headSeen >= HEAD_CHECK_EVERY;
+  }
+
+  private checkHead(st: LocalState, head: Commit | null): void {
+    if (!head) throw new Error(`Remote commit ${st.lastSeq}, the newest this device has seen, is missing: the log was rolled back or tampered with`);
+    if (st.head !== undefined && head.hash !== st.head) {
+      throw new Error(`Remote commit ${st.lastSeq} is not the one this device saw: the log was tampered with or forked`);
+    }
+    st.head = head.hash;
+    this.headSeen = this.now();
   }
 
   private maxSize(): number {
@@ -196,14 +251,15 @@ export class SyncEngine {
       conflictCopies: [], skipped: 0, tooLarge: [], errors: [], commits: 0, rounds: 0,
     };
     await this.open();
-    this.dedup = undefined;
+    this.uploaded = new Map();
     try {
       for (let round = 0; round < MAX_ROUNDS; round++) {
         res.rounds++;
         if (!(await this.round(res, !!opts.force, round === 0))) break;
       }
     } finally {
-      this.dedup = undefined;
+      this.dedup = new Map();
+      this.uploaded = new Map();
     }
     return res;
   }
@@ -217,8 +273,10 @@ export class SyncEngine {
     let p = planChanges(local, st, this.excluded, maxSize, tooLarge);
     // A small local edit is committed without first asking whether the remote moved: the commit
     // itself fails if it did, and the next pass sorts it out. Saves a round trip on the common case.
+    // Not when the head check is due: a commit on top of a log cut back under this device would succeed.
     const optimistic =
-      first && st.lastSeq > 0 && p.pushes.length + p.pushDeletes.length > 0 && !p.pulls.length && !p.pullDeletes.length && !p.conflicts.length &&
+      first && st.lastSeq > 0 && !this.headDue(st) &&
+      p.pushes.length + p.pushDeletes.length > 0 && !p.pulls.length && !p.pullDeletes.length && !p.conflicts.length &&
       p.pushes.reduce((n, f) => n + f.size, 0) <= OPTIMISTIC_BYTES;
     if (!optimistic && (await this.fetchRemote()).size) p = planChanges(local, st, this.excluded, maxSize, tooLarge);
     res.tooLarge = p.tooLarge.sort();
@@ -495,14 +553,34 @@ export class SyncEngine {
     });
   }
 
+  /**
+   * Chunks a commit may refer to without uploading them again: those of the file table it is
+   * written on top of, and those this sync uploaded. Cleanup keeps the data of every version current
+   * inside the retention window, and every recent pack, but nothing else: a chunk known only from a
+   * table that went out of date long ago, as on a device that was away, may be in a deleted pack.
+   */
+  private reusable(st: LocalState): Map<string, ChunkRef> {
+    const m = new Map(this.uploaded);
+    for (const e of st.remote.values()) for (const c of e.chunks) m.set(c.id, c);
+    return m;
+  }
+
+  /** Points a prepared entry at chunks it may still refer to. False when one of them must be uploaded again. */
+  private rebase(e: Entry): boolean {
+    for (let i = 0; i < e.chunks.length; i++) {
+      const ref = this.dedup.get(e.chunks[i].id);
+      if (!ref) return false;
+      e.chunks[i] = ref;
+    }
+    return true;
+  }
+
   /** Uploads local changes in batches, one commit per batch. Returns true when a later pass must look again. */
   private async push(files: Local[], deletes: string[], res: SyncResult): Promise<boolean> {
     const { repo, st } = await this.open();
-    if (!this.dedup) {
-      this.dedup = new Map();
-      for (const e of st.remote.values()) for (const c of e.chunks) this.dedup.set(c.id, c);
-    }
-    const dedup = this.dedup;
+    // An optimistic pass has not checked that this table is current. If it is not, the commit fails
+    // and `commit` rebases what was prepared onto the table it fetches then.
+    this.dedup = this.reusable(st);
     const packer = new Packer(repo, this.cfg.packTargetBytes, this.cfg.packMaxBlobBytes, this.cfg.concurrency);
     let again = false;
 
@@ -521,13 +599,14 @@ export class SyncEngine {
       const compress = this.cfg.compression && worthCompressing(f.key, f.size);
       const chunks: ChunkRef[] = [];
       for (let i = 0; i < parts.length; i++) {
-        let ref = dedup.get(ids[i]);
+        let ref = this.dedup.get(ids[i]);
         if (!ref) {
           const sealed = await repo.sealChunk(ids[i], parts[i], compress);
-          ref = dedup.get(ids[i]);
+          ref = this.dedup.get(ids[i]);
           if (!ref) {
             ref = packer.add(ids[i], sealed, parts[i].length);
-            dedup.set(ids[i], ref);
+            this.dedup.set(ids[i], ref);
+            this.uploaded.set(ids[i], ref);
             await packer.backpressure();
           }
         }
@@ -571,25 +650,28 @@ export class SyncEngine {
         ...deletes.map((path) => ({ path, entry: null })),
       ];
       const seq = st.lastSeq + 1;
-      if (await repo.writeCommit({ seq, device: this.cfg.deviceName, time: this.now(), changes })) {
-        st.apply({ seq, device: this.cfg.deviceName, time: 0, changes });
+      const hash = await repo.writeCommit({ seq, device: this.cfg.deviceName, time: this.now(), changes, prev: st.head });
+      if (hash) {
+        st.apply({ seq, device: this.cfg.deviceName, time: 0, changes, hash });
         for (const p of prepared) st.synced.set(p.file.key, { entry: p.entry, lsize: p.file.size, lmtime: p.file.mtime });
         for (const path of deletes) st.synced.delete(path);
         res.pushed += prepared.length;
         res.deletedRemote += deletes.length;
         res.commits++;
         if (seq % this.cfg.snapshotEvery === 0) {
-          await repo.writeSnapshot(seq, st.remote);
+          await repo.writeSnapshot(seq, st.remote, hash);
           await this.writeDigest(seq);
         }
         await this.save();
         return contended;
       }
       // Lost the race for this sequence number. Changes to files the winner did not touch are
-      // still valid and go into the next number; the rest go back through planning.
+      // still valid and go into the next number, unless they use chunks the new table no longer
+      // has (see `reusable`); the rest go back through planning.
       contended = true;
       const touched = await this.fetchRemote();
-      prepared = prepared.filter((p) => !touched.has(p.file.key));
+      this.dedup = this.reusable(st);
+      prepared = prepared.filter((p) => !touched.has(p.file.key) && this.rebase(p.entry));
       deletes = deletes.filter((path) => !touched.has(path));
     }
     return contended;
@@ -643,11 +725,25 @@ export class SyncEngine {
     this.o.passphrase = newPassphrase;
   }
 
-  /** Every version of one file still within the retention window, newest first. */
-  async history(path: string): Promise<Version[]> {
+  /** Opens the repo and brings the remote file table up to date, for features that only read. */
+  async view(): Promise<RepoView> {
     const { repo, st } = await this.open();
     await this.fetchRemote();
-    return listVersions(repo, st.lastSeq, path, this.cfg, this.now());
+    return { repo, st, cfg: this.cfg, now: this.now() };
+  }
+
+  /** Checks the remote end to end, without changing it or this device's state. */
+  async verify(opts: VerifyOptions = {}): Promise<VerifyReport> {
+    const { repo, st } = await this.open();
+    return verifyRepo(repo, {
+      ...opts, concurrency: this.cfg.concurrency, rangeGapBytes: this.cfg.rangeGapBytes, seen: { seq: st.lastSeq, head: st.head },
+    });
+  }
+
+  /** Every version of one file still within the retention window, newest first. */
+  async history(path: string): Promise<Version[]> {
+    const { repo, st, cfg, now } = await this.view();
+    return listVersions(repo, st.lastSeq, path, cfg, now);
   }
 
   async readVersion(entry: Entry): Promise<Uint8Array> {
@@ -666,8 +762,7 @@ export class SyncEngine {
 
   /** Deletes stored data that no version inside the retention window needs. */
   async gc(): Promise<{ packsDeleted: number; bytesFreed: number; snapshotsDeleted: number }> {
-    const { repo, st } = await this.open();
-    await this.fetchRemote();
-    return collectGarbage(repo, st, this.cfg, this.now());
+    const { repo, st, cfg, now } = await this.view();
+    return collectGarbage(repo, st, cfg, now);
   }
 }

@@ -113,7 +113,118 @@ export function merge3(base: string, ours: string, theirs: string): string | nul
   return out.join('');
 }
 
-const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+/** Lines both texts share; `aStart`/`bStart` are where they begin in each, counting lines from 0. */
+export interface SameLines {
+  kind: 'same';
+  lines: string[];
+  aStart: number;
+  bStart: number;
+}
+
+/** Where the first text has the lines `a` the second has `b`; one of them may be empty. */
+export interface ChangedLines {
+  kind: 'change';
+  a: string[];
+  b: string[];
+  aStart: number;
+  bStart: number;
+}
+
+export type DiffRegion = SameLines | ChangedLines;
+
+/**
+ * Line diff from `a` to `b` in reading order, shared runs and changes alternating. Lines keep their endings, so one
+ * side's lines joined give that text back byte for byte. Null when the texts differ too much, as for `merge3`.
+ */
+export function lineDiff(a: string, b: string): DiffRegion[] | null {
+  const lines = (s: string) => (s ? s.split(/(?<=\n)/) : []);
+  const ids = new Map<string, number>();
+  const intern = (ls: string[]) => Int32Array.from(ls, (l) => ids.get(l) ?? (ids.set(l, ids.size), ids.size - 1));
+  const A = lines(a);
+  const B = lines(b);
+  const match = lcsMatch(intern(A), intern(B));
+  if (!match) return null;
+  const out: DiffRegion[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < A.length || j < B.length) {
+    const i0 = i;
+    const j0 = j;
+    while (i < A.length && match[i] === j) {
+      i++;
+      j++;
+    }
+    if (i > i0) out.push({ kind: 'same', lines: A.slice(i0, i), aStart: i0, bStart: j0 });
+    const i1 = i;
+    const j1 = j;
+    while (i < A.length && match[i] < 0) i++;
+    j = i < A.length ? match[i] : B.length;
+    if (i > i1 || j > j1) out.push({ kind: 'change', a: A.slice(i1, i), b: B.slice(j1, j), aStart: i1, bStart: j1 });
+  }
+  return out;
+}
+
+/** Lines removed from `a` and added in `b`, over how many changes. */
+export function diffCounts(regions: DiffRegion[]): { changes: number; removed: number; added: number } {
+  const out = { changes: 0, removed: 0, added: 0 };
+  for (const r of regions) {
+    if (r.kind === 'same') continue;
+    out.changes++;
+    out.removed += r.a.length;
+    out.added += r.b.length;
+  }
+  return out;
+}
+
+/** A change with up to `context` shared lines either side of it, for showing it on its own. */
+export interface Hunk {
+  change: ChangedLines;
+  before: string[];
+  after: string[];
+}
+
+export function hunks(regions: DiffRegion[], context: number): Hunk[] {
+  const out: Hunk[] = [];
+  regions.forEach((r, i) => {
+    if (r.kind === 'same') return;
+    const prev = regions[i - 1];
+    const next = regions[i + 1];
+    out.push({
+      change: r,
+      before: prev?.kind === 'same' ? prev.lines.slice(Math.max(0, prev.lines.length - context)) : [],
+      after: next?.kind === 'same' ? next.lines.slice(0, context) : [],
+    });
+  });
+  return out;
+}
+
+/** At one change: `a`'s lines (mine), `b`'s (theirs), or `a`'s followed by `b`'s (both). */
+export type Choice = 'mine' | 'theirs' | 'both';
+
+/** The text `regions` make with `choices[k]` taken at the k-th change. All 'mine' gives `a` back exactly, all 'theirs' `b`. */
+export function applyChoices(regions: DiffRegion[], choices: readonly Choice[]): string {
+  const { changes } = diffCounts(regions);
+  if (choices.length !== changes) throw new Error(`${choices.length} choices for ${changes} changes`);
+  const ending = () => (regions.flatMap((r) => (r.kind === 'same' ? r.lines : [...r.a, ...r.b])).find((l) => l.endsWith('\n'))?.endsWith('\r\n') ? '\r\n' : '\n');
+  const out: string[] = [];
+  let k = 0;
+  for (const r of regions) {
+    if (r.kind === 'same') {
+      out.push(...r.lines);
+      continue;
+    }
+    const a = r.a.join('');
+    const b = r.b.join('');
+    const c = choices[k++];
+    if (c === 'mine') out.push(a);
+    else if (c === 'theirs') out.push(b);
+    // Only a text's last line can lack an ending; without one, `a`'s last line would run into `b`'s first.
+    else out.push(a, a && b && !a.endsWith('\n') ? ending() : '', b);
+  }
+  return out.join('');
+}
+
+const isObject =(v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const isList = (v: unknown): v is (string | number | boolean | null)[] => Array.isArray(v) && v.every((x) => x === null || typeof x !== 'object');
 /** Own keys only, so a key named `__proto__` or `constructor` reads as plain data. */
 const get = (o: Record<string, unknown>, k: string) => (Object.hasOwn(o, k) ? o[k] : undefined);

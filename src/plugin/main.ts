@@ -5,6 +5,7 @@ import type { Version } from '../core/types.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
 import { ObsidianFS, PluginState, obsidianHttp } from './obsidianfs.ts';
+import { nextPollDelay } from './polling.ts';
 import {
   cleanupDue,
   decodeSetupCode,
@@ -20,7 +21,8 @@ import {
   type Settings,
 } from './settings.ts';
 import { SetupModal } from './setup.ts';
-import { describeFailure, plural, resultProblems, staleProblem, summarize, type Problem } from './status.ts';
+import { resolveFirstConflict } from './resolve.ts';
+import { describeFailure, plural, resultProblems, staleProblem, summarize, withConflicts, type Problem } from './status.ts';
 import { HistoryModal, ProblemsModal, SettingsTab } from './views.ts';
 
 const DEFAULTS = defaultSettings(Platform.isMobile);
@@ -51,6 +53,10 @@ export default class SelfSyncPlugin extends Plugin {
   private listeners = new Set<() => void>();
   private timer?: number;
   private pollTimer?: number;
+  private pollDue = 0;
+  private polling = false;
+  /** When something last suggested another device may be involved; see nextPollDelay. */
+  private lastActivity = Date.now();
   private dirty = false;
   private progressNotice?: Notice;
   private schedule = debounce(() => void this.sync(), 10_000, true);
@@ -76,6 +82,7 @@ export default class SelfSyncPlugin extends Plugin {
     this.addCommand({ id: 'force-sync', name: 'Sync now, allowing large deletions', callback: () => void this.sync(true, true) });
     this.addCommand({ id: 'check-storage', name: 'Check storage connection', callback: () => void this.checkStorage() });
     this.addCommand({ id: 'clean-up', name: 'Delete expired versions from storage', callback: () => void this.cleanUp() });
+    this.addCommand({ id: 'resolve-conflict', name: 'Resolve a file changed on two devices', callback: () => resolveFirstConflict(this) });
     this.addCommand({
       id: 'history',
       name: 'Show version history of the current file',
@@ -87,8 +94,10 @@ export default class SelfSyncPlugin extends Plugin {
       },
     });
 
+    this.register(() => this.stopPoll());
     this.app.workspace.onLayoutReady(() => {
       const changed = () => {
+        this.noteActivity();
         this.dirty = true;
         if (this.running) this.changedWhileRunning = true;
         else this.schedule();
@@ -99,6 +108,7 @@ export default class SelfSyncPlugin extends Plugin {
       // Phones suspend the app in the background; catch up the moment it is opened again.
       // Going to the background: send pending edits now, before the system suspends the app.
       this.registerDomEvent(document, 'visibilitychange', () => {
+        if (document.visibilityState === 'visible') this.noteActivity();
         if (document.visibilityState === 'visible' || this.dirty) {
           this.schedule.cancel();
           void this.sync();
@@ -122,27 +132,55 @@ export default class SelfSyncPlugin extends Plugin {
 
   private applySchedule(): void {
     if (this.timer !== undefined) window.clearInterval(this.timer);
-    if (this.pollTimer !== undefined) window.clearInterval(this.pollTimer);
-    this.timer = this.pollTimer = undefined;
+    this.stopPoll();
+    this.timer = undefined;
     this.schedule.cancel();
     this.schedule = debounce(() => void this.sync(), Math.max(2, this.settings.changeDelaySeconds) * 1000, true);
     if (this.settings.intervalMinutes > 0) {
       this.timer = window.setInterval(() => void this.sync(), this.settings.intervalMinutes * 60_000);
       this.registerInterval(this.timer);
     }
-    if (this.settings.pollSeconds > 0) {
-      this.pollTimer = window.setInterval(() => void this.poll(), Math.max(5, this.settings.pollSeconds) * 1000);
-      this.registerInterval(this.pollTimer);
-    }
+    this.armPoll();
+  }
+
+  private stopPoll(): void {
+    window.clearTimeout(this.pollTimer);
+    this.pollTimer = undefined;
+  }
+
+  /** Keeps one poll timer. A pending one is only ever pulled sooner, so a burst of edits cannot keep postponing it. */
+  private armPoll(): void {
+    const delay = nextPollDelay(this.settings.pollSeconds, this.lastActivity, Date.now());
+    if (delay === undefined) return;
+    const due = Date.now() + delay;
+    if (this.pollTimer !== undefined && this.pollDue <= due) return;
+    window.clearTimeout(this.pollTimer);
+    this.pollDue = due;
+    this.pollTimer = window.setTimeout(() => {
+      this.pollTimer = undefined;
+      this.armPoll();
+      void this.poll();
+    }, delay);
+  }
+
+  private noteActivity(): void {
+    this.lastActivity = Date.now();
+    if (this.pollTimer !== undefined) this.armPoll();
   }
 
   /** Storage cannot notify devices, so ask it: one tiny request, and a real sync only when something is there. */
   private async poll(): Promise<void> {
-    if (this.running || document.visibilityState !== 'visible' || !this.configured()) return;
+    if (this.polling || this.running || document.visibilityState !== 'visible' || !this.configured()) return;
+    this.polling = true;
     try {
-      if (await this.getEngine().remoteChanged()) await this.sync();
+      if (await this.getEngine().remoteChanged()) {
+        this.noteActivity();
+        await this.sync();
+      }
     } catch {
       // Offline or unreachable; the next full sync reports it.
+    } finally {
+      this.polling = false;
     }
   }
 
@@ -201,7 +239,7 @@ export default class SelfSyncPlugin extends Plugin {
       const stale = staleProblem(this.settings.lastSuccess, Date.now());
       if (stale) out.push(stale);
     }
-    out.push(...this.found);
+    out.push(...withConflicts(this.found, this.settings.conflictCopies));
     return out.sort((a, b) => (a.severity === b.severity ? 0 : a.severity === 'critical' ? -1 : 1));
   }
 
@@ -297,6 +335,7 @@ export default class SelfSyncPlugin extends Plugin {
     try {
       const r = await this.getEngine().sync({ force });
       if (r.pulled || r.deletedLocal) this.fs?.forgetConfigListing();
+      if (r.pushed || r.pulled || r.deletedLocal || r.deletedRemote || r.merged) this.noteActivity();
       const s = this.settings;
       this.failure = undefined;
       s.lastSuccess = Date.now();

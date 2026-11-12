@@ -1,12 +1,13 @@
 import { pool, randomBytes, toB64, toHex, utf8 } from './bytes.ts';
 import { cutPoints } from './chunker.ts';
 import { deflate, inflate } from './compress.ts';
-import { chunkId, createKeys, open, rewrapKeys, seal, unlockKeys, type KeyHeader, type Keys } from './crypto.ts';
+import { chunkId, createKeys, digest, open, rewrapKeys, seal, unlockKeys, type KeyHeader, type Keys } from './crypto.ts';
 import type { ChunkParams, Commit, Entry, RemoteStore } from './types.ts';
 import { PackTable, decEntry, encEntry, type WireEntry } from './wire.ts';
 
 const FORMAT = 1;
 const HEADER_KEY = 'vault.json';
+const RESERVED = /^(log|snap|idx|pack)\//;
 
 interface Header {
   format: number;
@@ -20,28 +21,33 @@ interface WireCommit {
   t: number;
   p: string[];
   c: [string, WireEntry | null][];
+  /** Older versions ignore it, so adding it needed no format change. */
+  h?: string;
 }
 
 function encCommit(c: Commit): WireCommit {
   const pt = new PackTable();
   const changes = c.changes.map((ch): [string, WireEntry | null] => [ch.path, ch.entry && encEntry(ch.entry, pt)]);
-  return { d: c.device, t: c.time, p: pt.list, c: changes };
+  return { d: c.device, t: c.time, p: pt.list, c: changes, h: c.prev };
 }
 
-function decCommit(seq: number, w: WireCommit): Commit {
-  return { seq, device: w.d, time: w.t, changes: w.c.map(([path, e]) => ({ path, entry: e && decEntry(e, w.p) })) };
+function decCommit(seq: number, w: WireCommit, hash?: string): Commit {
+  return { seq, device: w.d, time: w.t, changes: w.c.map(([path, e]) => ({ path, entry: e && decEntry(e, w.p) })), prev: w.h, hash };
 }
 
-const seqKey = (prefix: string, seq: number) => `${prefix}/${String(seq).padStart(12, '0')}`;
+export const seqKey = (prefix: 'log' | 'snap' | 'idx', seq: number) => `${prefix}/${String(seq).padStart(12, '0')}`;
 const seqOf = (key: string) => Number(key.slice(key.lastIndexOf('/') + 1));
 
 /**
  * Remote layout:
  *   vault.json   key-wrapping header (the only plaintext object)
- *   log/<seq>    one commit each, written create-if-absent: the sequence number is the lock
- *   snap/<seq>   full file table at that commit, so new devices skip the log
+ *   log/<seq>    one commit each, written create-if-absent: the sequence number is the lock.
+ *                Each names the digest of the one before it, so a log cut short or forked shows.
+ *   snap/<seq>   full file table at that commit, and that commit's digest, so new devices skip the log
  *   idx/<seq>    the commits of one snapshot interval in a single object, for fast history
  *   pack/<id>    encrypted chunks back to back, addressed by (offset, length)
+ *   dev/<id>     one device's heartbeat, an encrypted document
+ *   any other    encrypted documents outside the log (readDoc, writeDoc)
  * Log objects are never deleted: a missing next key must always mean "nothing newer".
  */
 export class Repo {
@@ -82,16 +88,22 @@ export class Repo {
     return seal(this.keys, await deflate(utf8.encode(JSON.stringify(value))), `${this.id}:${key}`);
   }
 
-  private async openJson<T>(key: string): Promise<T | null> {
-    const raw = await this.store.get(key);
-    if (!raw) return null;
+  private async decodeJson<T>(key: string, raw: Uint8Array): Promise<T> {
     const { plain } = await open(this.keys, raw, `${this.id}:${key}`);
     return JSON.parse(new TextDecoder().decode(await inflate(plain))) as T;
   }
 
+  private async openJson<T>(key: string): Promise<T | null> {
+    const raw = await this.store.get(key);
+    return raw && this.decodeJson<T>(key, raw);
+  }
+
   async readCommit(seq: number): Promise<Commit | null> {
-    const w = await this.openJson<WireCommit>(seqKey('log', seq));
-    return w && decCommit(seq, w);
+    const key = seqKey('log', seq);
+    const raw = await this.store.get(key);
+    if (!raw) return null;
+    const [w, hash] = await Promise.all([this.decodeJson<WireCommit>(key, raw), digest(raw)]);
+    return decCommit(seq, w, hash);
   }
 
   /** True when another device has committed past `seq - 1`. Costs one tiny request. */
@@ -99,10 +111,12 @@ export class Repo {
     return (await this.store.get(seqKey('log', seq), { start: 0, end: 1 })) !== null;
   }
 
-  /** False when another device already took this sequence number. */
-  async writeCommit(c: Commit): Promise<boolean> {
+  /** The digest of the commit as stored, or null when another device already took this sequence number. */
+  async writeCommit(c: Commit): Promise<string | null> {
     const key = seqKey('log', c.seq);
-    return this.store.put(key, await this.sealJson(key, encCommit(c)), { ifNoneMatch: true });
+    const sealed = await this.sealJson(key, encCommit(c));
+    const hash = await digest(sealed);
+    return (await this.store.put(key, sealed, { ifNoneMatch: true })) ? hash : null;
   }
 
   /** The `count` commits ending at `seq` in one object, so history does not fetch them one by one. */
@@ -134,19 +148,24 @@ export class Repo {
   }
 
   async readSnapshot(seq: number): Promise<Map<string, Entry> | null> {
-    const w = await this.openJson<{ p: string[]; f: WireEntry[] }>(seqKey('snap', seq));
+    return (await this.readSnapshotWithHead(seq))?.files ?? null;
+  }
+
+  /** `head` is the digest of commit `seq`; absent in snapshots written before the log was chained. */
+  async readSnapshotWithHead(seq: number): Promise<{ files: Map<string, Entry>; head?: string } | null> {
+    const w = await this.openJson<{ p: string[]; f: WireEntry[]; h?: string }>(seqKey('snap', seq));
     if (!w) return null;
     const files = new Map<string, Entry>();
     for (const f of w.f) files.set(f[0] as string, decEntry(f, w.p, 1));
-    return files;
+    return { files, head: w.h };
   }
 
-  async writeSnapshot(seq: number, files: Map<string, Entry>): Promise<void> {
+  async writeSnapshot(seq: number, files: Map<string, Entry>, head?: string): Promise<void> {
     const pt = new PackTable();
     const f: WireEntry[] = [];
     for (const [path, e] of files) f.push([path, ...encEntry(e, pt)]);
     const key = seqKey('snap', seq);
-    await this.store.put(key, await this.sealJson(key, { p: pt.list, f }), { ifNoneMatch: true });
+    await this.store.put(key, await this.sealJson(key, { p: pt.list, f, h: head }), { ifNoneMatch: true });
   }
 
   newPackId(): string {
@@ -197,5 +216,33 @@ export class Repo {
   async openChunk(id: string, sealed: Uint8Array): Promise<Uint8Array> {
     const { plain, flag } = await open(this.keys, sealed, id);
     return flag === 1 ? inflate(plain) : plain;
+  }
+
+  /** The id this content is stored under, to check a downloaded chunk against the id it was filed as. */
+  chunkId(plain: Uint8Array): Promise<string> {
+    return chunkId(this.keys, plain);
+  }
+
+  private docKey(key: string): string {
+    if (!key || key === HEADER_KEY || RESERVED.test(key)) throw new Error(`"${key}" is not a document key`);
+    return key;
+  }
+
+  /** An encrypted JSON document outside the log, or null when there is none under `key`. */
+  async readDoc<T>(key: string): Promise<T | null> {
+    return this.openJson<T>(this.docKey(key));
+  }
+
+  async writeDoc(key: string, value: unknown): Promise<void> {
+    await this.store.put(this.docKey(key), await this.sealJson(key, value));
+  }
+
+  async listDocs(prefix: string): Promise<{ key: string; modified: number }[]> {
+    const found = await this.store.list(this.docKey(prefix));
+    return found.filter((o) => o.key !== HEADER_KEY && !RESERVED.test(o.key)).map((o) => ({ key: o.key, modified: o.modified }));
+  }
+
+  async deleteDoc(key: string): Promise<void> {
+    await this.store.delete(this.docKey(key));
   }
 }
