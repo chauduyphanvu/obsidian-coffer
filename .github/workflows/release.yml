@@ -8,6 +8,9 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
 
 jobs:
   release:
@@ -26,6 +29,14 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      # Signed build provenance, so anyone can check the release files came from this workflow and commit:
+      # gh attestation verify main.js --repo chauduyphanvu/obsidian-coffer
+      - uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/main.js
+            dist/manifest.json
+            dist/styles.css
       - name: Create a draft release
         env:
           GH_TOKEN: ${{ github.token }}

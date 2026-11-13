@@ -4,7 +4,7 @@ Sync your Obsidian vault between your devices through storage you own: an S3-com
 
 Coffer runs on desktop and mobile, keeps a version history of every file, merges edits made on two devices, and can bring back deleted files or a whole folder as it was at an earlier time.
 
-> Coffer is young (0.1). It is covered by 272 tests and has been run on macOS and iOS, but keep a backup of a vault you care about while you try it.
+> Coffer is young (0.2). It is covered by 272 tests and has been run on macOS and iOS, but keep a backup of a vault you care about while you try it.
 
 ## What you need to know first
 
@@ -26,6 +26,8 @@ Coffer runs on desktop and mobile, keeps a version history of every file, merges
 - **Command-line tool** (optional) to keep a folder in sync from an always-on computer. See [Command line](#command-line).
 
 ## Install
+
+Coffer needs Obsidian 1.13.1 or later (an older Obsidian gets Coffer 0.1.0).
 
 From Obsidian: **Settings → Community plugins → Browse**, search for **Coffer**, install and enable it.
 

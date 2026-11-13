@@ -1,8 +1,8 @@
 {
   "id": "coffer",
   "name": "Coffer",
-  "version": "0.1.0",
-  "minAppVersion": "1.11.4",
+  "version": "0.2.0",
+  "minAppVersion": "1.13.1",
   "description": "Sync your vault between devices, end-to-end encrypted, through storage you control: any S3-compatible bucket or a WebDAV server.",
   "author": "chauduyphanvu",
   "authorUrl": "https://github.com/chauduyphanvu",

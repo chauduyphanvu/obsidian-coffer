@@ -4,7 +4,6 @@
   background: var(--background-secondary);
   border-radius: var(--radius-l);
   padding: var(--size-4-4);
-  margin-bottom: var(--size-4-4);
 }
 
 .coffer-status-line {
@@ -54,31 +53,11 @@
 .coffer-buttons:empty { display: none; }
 .coffer-buttons > button { flex: 1 1 auto; }
 
-/* Collapsible settings sections */
-details.coffer-section {
-  border-top: 1px solid var(--background-modifier-border);
-}
-details.coffer-section > summary {
-  display: grid;
-  grid-template-columns: 1.2em 1fr;
-  column-gap: var(--size-4-1);
-  row-gap: var(--size-2-1);
-  align-items: baseline;
-  padding: var(--size-4-3) 0;
-  cursor: pointer;
-  list-style: none;
-}
-details.coffer-section > summary::-webkit-details-marker { display: none; }
-details.coffer-section > summary::before {
-  content: "›";
-  grid-row: 1 / span 2;
-  color: var(--text-muted);
-  transition: transform 120ms ease;
-}
-details.coffer-section[open] > summary::before { transform: rotate(90deg); }
-.coffer-section-title { grid-column: 2; font-weight: var(--font-semibold); }
-.coffer-section-summary { grid-column: 2; color: var(--text-muted); font-size: var(--font-ui-small); overflow-wrap: anywhere; }
-details.coffer-section[open] { padding-bottom: var(--size-4-3); }
+/* A settings row that holds one of Coffer's own blocks (the status card, devices, shared folders) */
+.setting-item.coffer-block { display: block; }
+/* The group around the block draws its top edge already. */
+.coffer-device:first-child,
+.coffer-share:first-child { border-top: none; padding-top: 0; }
 
 /* Setup and other dialogs */
 .coffer-modal .modal-content { display: flex; flex-direction: column; }
@@ -398,7 +377,6 @@ details.coffer-plan > summary { cursor: pointer; padding: var(--size-2-3) 0; fon
 .coffer-alert { color: var(--color-red); }
 
 /* Devices block of the settings screen: who else syncs this vault, and whether they keep up. */
-.coffer-devices { margin-bottom: var(--size-4-4); }
 .coffer-device {
   display: flex;
   flex-wrap: wrap;
@@ -447,7 +425,6 @@ body.is-mobile.theme-light .coffer-share-actions > button,
 body.is-mobile.theme-light .coffer-shares .coffer-buttons > button:not(.mod-cta) { background-color: var(--background-primary); }
 
 /* Shared folders block of the settings screen: each folder with its status, where it syncs, and what can be done. */
-.coffer-shares { margin-bottom: var(--size-4-4); }
 .coffer-share {
   display: flex;
   flex-wrap: wrap;

@@ -1,9 +1,9 @@
-import { Modal, Notice, PluginSettingTab, Setting, type App } from 'obsidian';
+import { Modal, Notice, PluginSettingTab, type App, type Setting, type SettingDefinitionItem, type SettingGroupItem } from 'obsidian';
 import { conflictOriginal } from '../core/paths.ts';
 import { errorText } from '../core/text.ts';
 import type CofferPlugin from './main.ts';
 import { resolveConflict } from './resolve.ts';
-import { describeStorage, hasStorageAddress, parseNumberSetting, type Settings, type Share } from './settings.ts';
+import { describeStorage, hasStorageAddress, parseNumberSetting, type Share } from './settings.ts';
 import { SetupModal } from './setup.ts';
 import { renderDevices } from './devices.ts';
 import { confirmStopSharing, downloadAgain, renderShares } from './sharing.ts';
@@ -11,38 +11,230 @@ import { isConflictProblem, type Problem } from './status.ts';
 import { button, buttonRow, field, message, openLink, statusLine } from './ui.ts';
 
 type SecretKey = 'accessKeySecret' | 'secretKeySecret' | 'passphraseSecret' | 'webdavPasswordSecret';
+type TextKey = 'endpoint' | 'region' | 'bucket' | 'prefix' | 'deviceName' | 'webdavUrl' | 'webdavUser';
+type NumberKey = 'intervalMinutes' | 'changeDelaySeconds' | 'pollSeconds' | 'autoCleanDays' | 'retentionDays' | 'maxFileSizeMB' | 'concurrency';
+type ToggleKey = 'pathStyle' | 'syncOnStart' | 'syncConfigDir' | 'compression';
+
+const TRIMMED = new Set<string>(['endpoint', 'region', 'bucket', 'prefix', 'deviceName', 'webdavUrl', 'webdavUser']);
 
 export class SettingsTab extends PluginSettingTab {
   private plugin: CofferPlugin;
-  private unsubscribe?: () => void;
-  private openSections = new Set<string>();
 
   constructor(app: App, plugin: CofferPlugin) {
     super(app, plugin);
     this.plugin = plugin;
   }
 
-  hide(): void {
-    this.unsubscribe?.();
-    this.unsubscribe = undefined;
+  async setControlValue(key: string, value: unknown): Promise<void> {
+    Object.assign(this.plugin.settings, { [key]: typeof value === 'string' && TRIMMED.has(key) ? value.trim() : value });
+    await this.plugin.saveSettings();
+    if (key === 'storageType') this.refreshDomState();
   }
 
-  display(): void {
-    const { containerEl } = this;
+  getSettingDefinitions(): SettingDefinitionItem[] {
     const plugin = this.plugin;
     const s = plugin.settings;
-    const save = () => void plugin.saveSettings();
-    this.hide();
-    containerEl.empty();
-    containerEl.addClass('coffer-settings');
+    const webdav = () => s.storageType === 'webdav';
+    const s3 = () => s.storageType !== 'webdav';
 
-    const card = containerEl.createDiv({ cls: 'coffer-card' });
-    const renderCard = () => {
+    const text = (name: string, desc: string, key: TextKey, placeholder = '', visible?: () => boolean): SettingGroupItem => ({
+      name,
+      desc,
+      visible,
+      control: { type: 'text', key, placeholder },
+    });
+    const toggle = (name: string, desc: string, key: ToggleKey, visible?: () => boolean): SettingGroupItem => ({ name, desc, visible, control: { type: 'toggle', key } });
+    // A plain password box: typing replaces the stored secret; the value itself is never shown.
+    const secret = (name: string, desc: string, key: SecretKey, id: string, visible?: () => boolean): SettingGroupItem => ({
+      name,
+      desc,
+      visible,
+      render: (setting) => {
+        setting.addText((t) => {
+          t.inputEl.type = 'password';
+          t.inputEl.setAttrs({ autocapitalize: 'off', autocorrect: 'off', autocomplete: 'off', spellcheck: 'false' });
+          t.setPlaceholder(plugin.secret(s[key]) ? 'Saved on this device' : 'Not set');
+          t.onChange((v) => v && void plugin.setSecret(key, id, v));
+        });
+      },
+    });
+    // Not Obsidian's number control, which stores 0 when the box is cleared: here a cleared or invalid entry changes nothing.
+    const number = (name: string, desc: string, key: NumberKey, min: number, aliases?: string[]): SettingGroupItem => ({
+      name,
+      desc,
+      aliases,
+      render: (setting) => {
+        setting.addText((t) => {
+          t.inputEl.type = 'number';
+          t.inputEl.inputMode = 'numeric';
+          t.setValue(String(s[key])).onChange((v) => {
+            const n = parseNumberSetting(v, min);
+            if (n === null) return;
+            s[key] = n;
+            void plugin.saveSettings();
+          });
+        });
+      },
+    });
+    const action = (name: string, desc: string, label: string, run: () => unknown, disabled?: () => boolean): SettingGroupItem => ({
+      name,
+      desc,
+      render: (setting) => {
+        setting.addButton((b) => b.setButtonText(label).setDisabled(disabled?.() ?? false).onClick(() => void run()));
+      },
+    });
+
+    return [
+      { name: 'Sync status', searchable: false, render: (setting) => this.renderCard(setting) },
+      {
+        name: 'Add another device',
+        desc: 'Install Coffer there, choose "I already sync another device", and paste this link. It is encrypted with your passphrase.',
+        aliases: ['setup link', 'new device'],
+        visible: () => plugin.configured(),
+        render: (setting) => {
+          setting.addButton((b) =>
+            b.setButtonText('Copy setup link').onClick(async () => {
+              try {
+                // Settings can be their own window, and only the focused window may write to the clipboard.
+                await activeWindow.navigator.clipboard.writeText(await plugin.setupLink());
+                new Notice('Setup link copied.');
+              } catch (e) {
+                new Notice(`Could not copy the setup link: ${errorText(e)}`, 8000);
+              }
+            }),
+          );
+        },
+      },
+      {
+        type: 'group',
+        heading: 'Devices',
+        items: [{ name: 'Devices', aliases: ['forget a device'], render: (setting) => renderDevices(block(setting), plugin) }],
+      },
+      {
+        type: 'group',
+        heading: 'Shared folders',
+        visible: () => plugin.configured(),
+        items: [
+          {
+            name: 'Shared folders',
+            aliases: ['share a folder', 'invite link'],
+            render: (setting) => plugin.onChange(renderShares(block(setting), plugin)),
+          },
+        ],
+      },
+      {
+        type: 'group',
+        items: [
+          {
+            type: 'page',
+            name: 'Storage and passphrase',
+            displayValue: () => (hasStorageAddress(s) ? describeStorage(s) : 'Not set up'),
+            items: [
+              {
+                name: 'Storage type',
+                aliases: ['S3', 'WebDAV', 'bucket'],
+                control: { type: 'dropdown', key: 'storageType', options: { s3: 'S3-compatible bucket', webdav: 'WebDAV folder' } },
+              },
+              text('Folder address', 'Created if missing.', 'webdavUrl', 'https://cloud.example.com/remote.php/dav/files/me/obsidian', webdav),
+              text('User name', '', 'webdavUser', '', webdav),
+              secret('Password', '', 'webdavPasswordSecret', 'coffer-webdav-password', webdav),
+              text('Endpoint', '', 'endpoint', 'https://<account>.r2.cloudflarestorage.com', s3),
+              text('Region', '"auto" for Cloudflare R2.', 'region', 'auto', s3),
+              text('Bucket', '', 'bucket', '', s3),
+              text('Folder in bucket', 'Every device syncing this vault must use the same folder.', 'prefix', '', s3),
+              secret('Access key ID', '', 'accessKeySecret', 'coffer-access-key', s3),
+              secret('Secret access key', '', 'secretKeySecret', 'coffer-secret-key', s3),
+              toggle('Path-style addresses', 'On for R2, B2, MinIO and most others; off for Amazon S3.', 'pathStyle', s3),
+              secret('Passphrase', 'The one every device uses. Typing here only changes it on this device.', 'passphraseSecret', 'coffer-passphrase'),
+              action('Check the connection', 'Writes, reads and deletes a small test object.', 'Check', () => plugin.checkStorage()),
+              action(
+                'Change the passphrase on all devices',
+                'Nothing is re-uploaded. Other devices ask for the new one.',
+                'Change',
+                () => new PassphraseModal(this.app, plugin).open(),
+                () => !plugin.configured(),
+              ),
+              action('Set up again', 'Walks through connecting storage, or joining with a setup link.', 'Start', () => new SetupModal(this.app, plugin, 'start').open()),
+            ],
+          },
+          {
+            type: 'page',
+            name: 'When to sync',
+            displayValue: () => (s.intervalMinutes ? `on changes, every ${s.intervalMinutes} min` : 'on changes'),
+            items: [
+              toggle('When Obsidian starts', '', 'syncOnStart'),
+              number('After an edit (seconds)', 'Waits this long after the last edit.', 'changeDelaySeconds', 2, ['delay']),
+              number('Every (minutes)', '0 turns the timer off.', 'intervalMinutes', 0, ['interval', 'timer']),
+              number(
+                'Look for other devices\' changes every (seconds)',
+                'Only while Obsidian is on screen, six times as often (no faster than every 5 seconds) for two minutes after you switch to it or changes arrive, and half as often after ten minutes without either; 0 turns it off.',
+                'pollSeconds',
+                0,
+                ['poll'],
+              ),
+            ],
+          },
+          {
+            type: 'page',
+            name: 'What to sync',
+            displayValue: () => `files up to ${s.maxFileSizeMB || 'any'} MB`,
+            items: [
+              toggle(
+                'Settings, themes and plugins',
+                `The ${this.app.vault.configDir} folder, except the workspace layout. Settings changed on two devices are combined; where both changed the same one, the device that synced first wins.`,
+                'syncConfigDir',
+              ),
+              number('Largest file (MB)', 'Larger files stay on this device and are listed as problems. 0 means no limit.', 'maxFileSizeMB', 0, ['size limit']),
+              {
+                name: 'Leave out',
+                desc:
+                  'One pattern per line. * matches within a folder, ** across folders, a trailing / a whole folder. ' +
+                  'Files and folders whose name starts with a dot, which Obsidian does not show, are always left out on this device; the settings folder has its own switch above.',
+                aliases: ['exclude', 'ignore'],
+                control: { type: 'textarea', key: 'exclude', placeholder: 'Private/\n*.tmp' },
+              },
+            ],
+          },
+          {
+            type: 'page',
+            name: 'Conflicts and history',
+            displayValue: () => `versions kept ${s.retentionDays} days`,
+            items: [
+              {
+                name: 'A note edited on two devices',
+                desc: 'Overlapping edits and non-text files always keep both versions.',
+                aliases: ['conflict', 'merge'],
+                control: { type: 'dropdown', key: 'conflictStrategy', options: { merge: 'Merge the edits', copy: 'Keep both versions' } },
+              },
+              number('Keep old versions (days)', 'Any synced version can be restored for this long.', 'retentionDays', 1, ['retention', 'version history']),
+              number('Remove expired versions every (days)', '0 leaves it to the command.', 'autoCleanDays', 0, ['cleanup']),
+            ],
+          },
+          {
+            type: 'page',
+            name: 'Advanced',
+            items: [
+              text('Device name', 'Shown in version history and conflict copies.', 'deviceName'),
+              number('Parallel transfers', '', 'concurrency', 1, ['concurrency']),
+              toggle('Compress text before encrypting', '', 'compression'),
+            ],
+          },
+        ],
+      },
+    ];
+  }
+
+  /** The status card at the top: what sync is doing, and the buttons that matter right now. */
+  private renderCard(setting: Setting): () => void {
+    const plugin = this.plugin;
+    const card = block(setting);
+    card.addClass('coffer-card');
+    const draw = () => {
       card.empty();
       const configured = plugin.configured();
       const { text, tone } = plugin.statusLine();
       statusLine(card, text, tone);
-      if (configured) card.createDiv({ cls: 'coffer-sub', text: describeStorage(s) });
+      if (configured) card.createDiv({ cls: 'coffer-sub', text: describeStorage(plugin.settings) });
       if (!configured) {
         card.createEl('p', {
           cls: 'coffer-intro',
@@ -61,165 +253,20 @@ export class SettingsTab extends PluginSettingTab {
         button(row, critical ? (problems.length === 1 ? 'See the problem' : `See ${problems.length} problems`) : 'Review', () => plugin.openStatus(), critical ? 'warning' : 'plain');
       }
     };
-    renderCard();
-    let drawShares: (() => void) | undefined;
-    this.unsubscribe = plugin.onChange(() => {
-      renderCard();
-      drawShares?.();
+    draw();
+    return plugin.onChange(() => {
+      draw();
+      // Finishing setup while this tab is open shows the parts that need a configured vault.
+      this.refreshDomState();
     });
-
-    const section = (id: string, title: string, summary = '') => {
-      const d = containerEl.createEl('details', { cls: 'coffer-section' });
-      d.open = this.openSections.has(id);
-      d.addEventListener('toggle', () => (d.open ? this.openSections.add(id) : this.openSections.delete(id)));
-      const sum = d.createEl('summary');
-      sum.createSpan({ cls: 'coffer-section-title', text: title });
-      if (summary) sum.createSpan({ cls: 'coffer-section-summary', text: summary });
-      return d;
-    };
-    const text = (el: HTMLElement, name: string, desc: string, key: 'endpoint' | 'region' | 'bucket' | 'prefix' | 'deviceName' | 'webdavUrl' | 'webdavUser', placeholder = '') =>
-      new Setting(el).setName(name).setDesc(desc).addText((t) =>
-        t.setPlaceholder(placeholder).setValue(s[key]).onChange((v) => {
-          s[key] = v.trim();
-          save();
-        }),
-      );
-    // A plain password box: typing replaces the stored secret; the value itself is never shown.
-    const secret = (el: HTMLElement, name: string, desc: string, key: SecretKey, id: string) =>
-      new Setting(el).setName(name).setDesc(desc).addText((t) => {
-        t.inputEl.type = 'password';
-        t.inputEl.setAttrs({ autocapitalize: 'off', autocorrect: 'off', autocomplete: 'off', spellcheck: 'false' });
-        t.setPlaceholder(plugin.secret(s[key]) ? 'Saved on this device' : 'Not set');
-        t.onChange((v) => v && void plugin.setSecret(key, id, v));
-      });
-    const number = (el: HTMLElement, name: string, desc: string, key: 'intervalMinutes' | 'changeDelaySeconds' | 'pollSeconds' | 'autoCleanDays' | 'retentionDays' | 'maxFileSizeMB' | 'concurrency', min: number) =>
-      new Setting(el).setName(name).setDesc(desc).addText((t) => {
-        t.inputEl.type = 'number';
-        t.inputEl.inputMode = 'numeric';
-        t.setValue(String(s[key])).onChange((v) => {
-          const n = parseNumberSetting(v, min);
-          if (n === null) return;
-          s[key] = n;
-          save();
-        });
-      });
-    const toggle = (el: HTMLElement, name: string, desc: string, key: 'pathStyle' | 'syncOnStart' | 'syncConfigDir' | 'compression') =>
-      new Setting(el).setName(name).setDesc(desc).addToggle((t) =>
-        t.setValue(s[key]).onChange((v) => {
-          s[key] = v;
-          save();
-        }),
-      );
-
-    if (plugin.configured()) {
-      new Setting(containerEl)
-        .setName('Add another device')
-        .setDesc('Install Coffer there, choose "I already sync another device", and paste this link. It is encrypted with your passphrase.')
-        .addButton((b) =>
-          b.setButtonText('Copy setup link').onClick(async () => {
-            try {
-              // Settings can be their own window, and only the focused window may write to the clipboard.
-              await activeWindow.navigator.clipboard.writeText(await plugin.setupLink());
-              new Notice('Setup link copied.');
-            } catch (e) {
-              new Notice(`Could not copy the setup link: ${errorText(e)}`, 8000);
-            }
-          }),
-        );
-    }
-    renderDevices(containerEl, plugin);
-    if (plugin.configured()) drawShares = renderShares(containerEl, plugin);
-
-    const storage = section('storage', 'Storage and passphrase', hasStorageAddress(s) ? describeStorage(s) : 'Not set up');
-    new Setting(storage)
-      .setName('Storage type')
-      .addDropdown((d) =>
-        d
-          .addOption('s3', 'S3-compatible bucket')
-          .addOption('webdav', 'WebDAV folder')
-          .setValue(s.storageType)
-          .onChange((v) => {
-            s.storageType = v as Settings['storageType'];
-            save();
-            this.display();
-          }),
-      );
-    if (s.storageType === 'webdav') {
-      text(storage, 'Folder address', 'Created if missing.', 'webdavUrl', 'https://cloud.example.com/remote.php/dav/files/me/obsidian');
-      text(storage, 'User name', '', 'webdavUser');
-      secret(storage, 'Password', '', 'webdavPasswordSecret', 'coffer-webdav-password');
-    } else {
-      text(storage, 'Endpoint', '', 'endpoint', 'https://<account>.r2.cloudflarestorage.com');
-      text(storage, 'Region', '"auto" for Cloudflare R2.', 'region', 'auto');
-      text(storage, 'Bucket', '', 'bucket');
-      text(storage, 'Folder in bucket', 'Every device syncing this vault must use the same folder.', 'prefix');
-      secret(storage, 'Access key ID', '', 'accessKeySecret', 'coffer-access-key');
-      secret(storage, 'Secret access key', '', 'secretKeySecret', 'coffer-secret-key');
-      toggle(storage, 'Path-style addresses', 'On for R2, B2, MinIO and most others; off for Amazon S3.', 'pathStyle');
-    }
-    secret(storage, 'Passphrase', 'The one every device uses. Typing here only changes it on this device.', 'passphraseSecret', 'coffer-passphrase');
-    new Setting(storage)
-      .setName('Check the connection')
-      .setDesc('Writes, reads and deletes a small test object.')
-      .addButton((b) => b.setButtonText('Check').onClick(() => void plugin.checkStorage()));
-    new Setting(storage)
-      .setName('Change the passphrase on all devices')
-      .setDesc('Nothing is re-uploaded. Other devices ask for the new one.')
-      .addButton((b) => b.setButtonText('Change').setDisabled(!plugin.configured()).onClick(() => new PassphraseModal(this.app, plugin).open()));
-    new Setting(storage)
-      .setName('Set up again')
-      .setDesc('Walks through connecting storage, or joining with a setup link.')
-      .addButton((b) => b.setButtonText('Start').onClick(() => new SetupModal(this.app, plugin, 'start').open()));
-
-    const when = section('when', 'When to sync', s.intervalMinutes ? `on changes, every ${s.intervalMinutes} min` : 'on changes');
-    toggle(when, 'When Obsidian starts', '', 'syncOnStart');
-    number(when, 'After an edit (seconds)', 'Waits this long after the last edit.', 'changeDelaySeconds', 2);
-    number(when, 'Every (minutes)', '0 turns the timer off.', 'intervalMinutes', 0);
-    number(when, 'Look for other devices\' changes every (seconds)', 'Only while Obsidian is on screen, six times as often (no faster than every 5 seconds) for two minutes after you switch to it or changes arrive, and half as often after ten minutes without either; 0 turns it off.', 'pollSeconds', 0);
-
-    const what = section('what', 'What to sync', `files up to ${s.maxFileSizeMB || 'any'} MB`);
-    toggle(
-      what,
-      'Settings, themes and plugins',
-      `The ${this.app.vault.configDir} folder, except the workspace layout. Settings changed on two devices are combined; where both changed the same one, the device that synced first wins.`,
-      'syncConfigDir',
-    );
-    number(what, 'Largest file (MB)', 'Larger files stay on this device and are listed as problems. 0 means no limit.', 'maxFileSizeMB', 0);
-    new Setting(what)
-      .setName('Leave out')
-      .setDesc(
-        'One pattern per line. * matches within a folder, ** across folders, a trailing / a whole folder. ' +
-          'Files and folders whose name starts with a dot, which Obsidian does not show, are always left out on this device; the settings folder has its own switch above.',
-      )
-      .addTextArea((t) =>
-        t.setPlaceholder('Private/\n*.tmp').setValue(s.exclude).onChange((v) => {
-          s.exclude = v;
-          save();
-        }),
-      );
-
-    const history = section('history', 'Conflicts and history', `versions kept ${s.retentionDays} days`);
-    new Setting(history)
-      .setName('A note edited on two devices')
-      .setDesc('Overlapping edits and non-text files always keep both versions.')
-      .addDropdown((d) =>
-        d
-          .addOption('merge', 'Merge the edits')
-          .addOption('copy', 'Keep both versions')
-          .setValue(s.conflictStrategy)
-          .onChange((v) => {
-            s.conflictStrategy = v as Settings['conflictStrategy'];
-            save();
-          }),
-      );
-    number(history, 'Keep old versions (days)', 'Any synced version can be restored for this long.', 'retentionDays', 1);
-    number(history, 'Remove expired versions every (days)', '0 leaves it to the command.', 'autoCleanDays', 0);
-
-    const advanced = section('advanced', 'Advanced');
-    text(advanced, 'Device name', 'Shown in version history and conflict copies.', 'deviceName');
-    number(advanced, 'Parallel transfers', '', 'concurrency', 1);
-    toggle(advanced, 'Compress text before encrypting', '', 'compression');
   }
+}
+
+/** A settings row emptied to hold one of Coffer's own blocks, laid out as a block rather than a name and a control. */
+function block(setting: Setting): HTMLElement {
+  setting.settingEl.empty();
+  setting.settingEl.addClass('coffer-block');
+  return setting.settingEl;
 }
 
 /** Every open problem with what can be done about it, or "all good". */

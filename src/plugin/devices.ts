@@ -1,15 +1,15 @@
 // The Devices block of the settings screen: who else syncs this vault, and whether they keep up.
-import { Modal, Notice, Setting, type App } from 'obsidian';
+import { Modal, Notice, type App } from 'obsidian';
 import { agoText, forgetDevice, listDevices, statusText, statusTone, type DeviceStatus } from '../core/devices.ts';
 import type { RepoView } from '../core/engine.ts';
 import { errorText } from '../core/text.ts';
 import type CofferPlugin from './main.ts';
 import { button, buttonRow, message } from './ui.ts';
 
-/** Adds the block and fills it in the background, so the rest of the screen is not held up. */
-export function renderDevices(containerEl: HTMLElement, plugin: CofferPlugin): void {
-  new Setting(containerEl).setName('Devices').setHeading();
-  void load(containerEl.createDiv({ cls: 'coffer-devices' }), plugin);
+/** Fills `box` with the device list in the background, so the rest of the screen is not held up. */
+export function renderDevices(box: HTMLElement, plugin: CofferPlugin): void {
+  box.addClass('coffer-devices');
+  void load(box, plugin);
 }
 
 async function load(box: HTMLElement, plugin: CofferPlugin): Promise<void> {

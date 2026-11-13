@@ -1,6 +1,6 @@
 // Shared folders on screen: the list in settings, adding one (sharing a folder or joining with an invite link),
 // copying an invite link, stopping, and choosing the vault or a shared folder for commands that work on one.
-import { Modal, Notice, Setting, SuggestModal, TFile, TFolder, Vault, type App } from 'obsidian';
+import { Modal, Notice, SuggestModal, TFile, TFolder, Vault, type App } from 'obsidian';
 import { DEFAULT_CONFIG } from '../core/config.ts';
 import { WrongPassphraseError } from '../core/crypto.ts';
 import { Repo } from '../core/repo.ts';
@@ -44,10 +44,9 @@ function filesIn(app: App, path: string): number | undefined {
   return n;
 }
 
-/** Adds the Shared folders block. Returns a function that redraws it, for when the status changes. */
-export function renderShares(containerEl: HTMLElement, plugin: CofferPlugin): () => void {
-  new Setting(containerEl).setName('Shared folders').setHeading();
-  const box = containerEl.createDiv({ cls: 'coffer-shares' });
+/** Fills `box` with the shared folders. Returns a function that redraws it, for when the status changes. */
+export function renderShares(box: HTMLElement, plugin: CofferPlugin): () => void {
+  box.addClass('coffer-shares');
   let shown: string | undefined;
   const draw = () => {
     const shares = plugin.settings.shares;
