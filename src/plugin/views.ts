@@ -1,19 +1,20 @@
-import { Modal, Notice, PluginSettingTab, type App, type Setting, type SettingDefinitionItem, type SettingGroupItem } from 'obsidian';
+import { Modal, Notice, PluginSettingTab, type App, type ButtonComponent, type Setting, type SettingDefinitionItem, type SettingGroupItem } from 'obsidian';
 import { conflictOriginal } from '../core/paths.ts';
 import { errorText } from '../core/text.ts';
+import { chooseDeferred } from './deferred.ts';
 import type CofferPlugin from './main.ts';
 import { resolveConflict } from './resolve.ts';
-import { describeStorage, hasStorageAddress, parseNumberSetting, type Share } from './settings.ts';
+import { describeStorage, hasStorageAddress, parseNumberSetting, passphraseProblem, type Share } from './settings.ts';
 import { SetupModal } from './setup.ts';
 import { renderDevices } from './devices.ts';
 import { confirmStopSharing, downloadAgain, renderShares } from './sharing.ts';
-import { isConflictProblem, type Problem } from './status.ts';
-import { button, buttonRow, field, message, openLink, statusLine } from './ui.ts';
+import { isConflictProblem, leftInStorage, quietText, type Problem } from './status.ts';
+import { button, buttonRow, field, message, openLink, passphraseFields, statusLine } from './ui.ts';
 
 type SecretKey = 'accessKeySecret' | 'secretKeySecret' | 'passphraseSecret' | 'webdavPasswordSecret';
 type TextKey = 'endpoint' | 'region' | 'bucket' | 'prefix' | 'deviceName' | 'webdavUrl' | 'webdavUser';
-type NumberKey = 'intervalMinutes' | 'changeDelaySeconds' | 'pollSeconds' | 'autoCleanDays' | 'retentionDays' | 'maxFileSizeMB' | 'concurrency';
-type ToggleKey = 'pathStyle' | 'syncOnStart' | 'syncConfigDir' | 'compression';
+type NumberKey = 'intervalMinutes' | 'changeDelaySeconds' | 'pollSeconds' | 'autoCleanDays' | 'retentionDays' | 'maxFileSizeMB' | 'deferAboveMB' | 'concurrency';
+type ToggleKey = 'pathStyle' | 'syncOnStart' | 'syncConfigDir' | 'compression' | 'readOnly';
 
 const TRIMMED = new Set<string>(['endpoint', 'region', 'bucket', 'prefix', 'deviceName', 'webdavUrl', 'webdavUser']);
 
@@ -72,6 +73,7 @@ export class SettingsTab extends PluginSettingTab {
             if (n === null) return;
             s[key] = n;
             void plugin.saveSettings();
+            this.refreshDomState();
           });
         });
       },
@@ -80,7 +82,10 @@ export class SettingsTab extends PluginSettingTab {
       name,
       desc,
       render: (setting) => {
-        setting.addButton((b) => b.setButtonText(label).setDisabled(disabled?.() ?? false).onClick(() => void run()));
+        let button!: ButtonComponent;
+        setting.addButton((b) => (button = b.setButtonText(label).setDisabled(disabled?.() ?? false).onClick(() => void run())));
+        // What disables it can change while this page is open, as with the toggle on it.
+        if (disabled) return plugin.onChange(() => button.setDisabled(disabled()));
       },
     });
 
@@ -92,17 +97,21 @@ export class SettingsTab extends PluginSettingTab {
         aliases: ['setup link', 'new device'],
         visible: () => plugin.configured(),
         render: (setting) => {
-          setting.addButton((b) =>
-            b.setButtonText('Copy setup link').onClick(async () => {
+          // Made before the tap: making it takes a moment, and a phone only lets the tap itself write to the clipboard.
+          const link = plugin.setupLink();
+          setting.addButton((b) => {
+            const ready = () => void b.setButtonText('Copy setup link').setDisabled(false);
+            b.setButtonText('Preparing…').setDisabled(true).onClick(async () => {
               try {
                 // Settings can be their own window, and only the focused window may write to the clipboard.
-                await activeWindow.navigator.clipboard.writeText(await plugin.setupLink());
+                await activeWindow.navigator.clipboard.writeText(await link);
                 new Notice('Setup link copied.');
               } catch (e) {
                 new Notice(`Could not copy the setup link: ${errorText(e)}`, 8000);
               }
-            }),
-          );
+            });
+            link.then(ready, ready);
+          });
         },
       },
       {
@@ -146,13 +155,21 @@ export class SettingsTab extends PluginSettingTab {
               secret('Secret access key', '', 'secretKeySecret', 'coffer-secret-key', s3),
               toggle('Path-style addresses', 'On for R2, B2, MinIO and most others; off for Amazon S3.', 'pathStyle', s3),
               secret('Passphrase', 'The one every device uses. Typing here only changes it on this device.', 'passphraseSecret', 'coffer-passphrase'),
+              {
+                ...toggle(
+                  'Only receive changes',
+                  'This device never writes to storage, so keys that may only read are enough. What you change or add here stays here and is listed as not sent. A file you delete comes back from storage. If storage changes a file you changed, the two are merged here, or kept side by side.',
+                  'readOnly',
+                ),
+                aliases: ['read-only'],
+              },
               action('Check the connection', 'Writes, reads and deletes a small test object.', 'Check', () => plugin.checkStorage()),
               action(
                 'Change the passphrase on all devices',
                 'Nothing is re-uploaded. Other devices ask for the new one.',
                 'Change',
                 () => new PassphraseModal(this.app, plugin).open(),
-                () => !plugin.configured(),
+                () => !plugin.configured() || s.readOnly,
               ),
               action('Set up again', 'Walks through connecting storage, or joining with a setup link.', 'Start', () => new SetupModal(this.app, plugin, 'start').open()),
             ],
@@ -185,6 +202,25 @@ export class SettingsTab extends PluginSettingTab {
                 'syncConfigDir',
               ),
               number('Largest file (MB)', 'Larger files stay on this device and are listed as problems. 0 means no limit.', 'maxFileSizeMB', 0, ['size limit']),
+              number(
+                'Download only when asked: files larger than (MB)',
+                'Larger files stay in storage and take no room here until you choose them from the list below. 0 downloads every file. Files this device already has keep syncing.',
+                'deferAboveMB',
+                0,
+                ['attachments', 'large files', 'defer'],
+              ),
+              {
+                name: 'Files left in storage',
+                desc: 'Choosing one downloads it and opens it.',
+                aliases: ['download', 'attachments'],
+                visible: () => s.deferAboveMB > 0,
+                render: (setting) => {
+                  setting.addButton((b) => b.setButtonText('Choose…').onClick(() => void chooseDeferred(plugin)));
+                  const draw = () => setting.setName(leftInStorage(plugin.deferredCounts()));
+                  draw();
+                  return plugin.onChange(draw);
+                },
+              },
               {
                 name: 'Leave out',
                 desc:
@@ -305,7 +341,7 @@ export class ProblemsModal extends Modal {
       }, 'cta');
       return;
     }
-    if (!problems.length && !plugin.running) c.createEl('p', { cls: 'coffer-intro', text: 'Everything is in sync.' });
+    if (!problems.length && !plugin.running) c.createEl('p', { cls: 'coffer-intro', text: quietText(plugin.offline(), plugin.waiting()) });
     for (const p of problems) this.problem(c, p);
     button(buttonRow(c), plugin.running ? 'Syncing…' : 'Sync now', () => plugin.sync(true), problems.length ? 'plain' : 'cta').setDisabled(plugin.running);
   }
@@ -478,21 +514,20 @@ class PassphraseModal extends Modal {
   }
 
   onOpen(): void {
-    let first = '';
-    let second = '';
+    const entry = { passphrase: '', repeat: '' };
     const c = this.contentEl;
     this.modalEl.addClass('coffer-modal');
     this.setTitle('Change the passphrase');
     c.createEl('p', { cls: 'coffer-intro', text: 'Nothing is re-uploaded. Each other device asks for the new passphrase once.' });
-    field(c, 'New passphrase', { password: true }, (v) => (first = v));
-    field(c, 'Repeat it', { password: true }, (v) => (second = v));
+    passphraseFields(c, entry, { label: 'New passphrase' });
     button(buttonRow(c), 'Change passphrase', async () => {
-      if (!first || first !== second) {
-        new Notice('The two entries do not match.');
+      const problem = passphraseProblem(entry.passphrase, entry.repeat);
+      if (problem) {
+        new Notice(problem);
         return;
       }
       try {
-        await this.plugin.changePassphrase(first);
+        await this.plugin.changePassphrase(entry.passphrase);
         this.close();
         new Notice('Passphrase changed. Enter the new one on your other devices.');
       } catch (e) {

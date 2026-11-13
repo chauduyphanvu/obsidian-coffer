@@ -210,9 +210,9 @@ test('setup codes open only with the right passphrase', async () => {
   const { sealWithPassphrase, openWithPassphrase } = await import('../src/core/crypto.ts');
   const code = await sealWithPassphrase('{"bucket":"b","secret":"s3cr3t"}', 'pass', 1000);
   assert.ok(!code.includes('s3cr3t'));
-  assert.equal(await openWithPassphrase(code, 'pass', 1000), '{"bucket":"b","secret":"s3cr3t"}');
-  await assert.rejects(openWithPassphrase(code, 'nope', 1000), WrongPassphraseError);
-  await assert.rejects(openWithPassphrase('not a code!', 'pass', 1000), /not a valid setup code/);
+  assert.equal(await openWithPassphrase(code, 'pass'), '{"bucket":"b","secret":"s3cr3t"}');
+  await assert.rejects(openWithPassphrase(code, 'nope'), WrongPassphraseError);
+  await assert.rejects(openWithPassphrase('not a code!', 'pass'), /not a valid setup code/);
 });
 
 test('path rules: extensions, conflict copy names, Unicode forms', () => {

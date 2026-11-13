@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { DEFAULT_CONFIG } from '../src/core/config.ts';
-import { openWithPassphrase } from '../src/core/crypto.ts';
+import { WrongPassphraseError, openWithPassphrase } from '../src/core/crypto.ts';
 import { compileExcludes } from '../src/core/config.ts';
 import {
   besideVault,
@@ -16,9 +16,11 @@ import {
   folderProblem,
   hasStorageAddress,
   isConfigured,
+  linkProblem,
   loadSettings,
   normalFolder,
   parseNumberSetting,
+  passphraseProblem,
   providerOf,
   regionFromEndpoint,
   remoteSpec,
@@ -104,12 +106,22 @@ test('settings: automatic cleanup is due after its interval', () => {
   assert.ok(!cleanupDue(s3({ autoCleanDays: 0, lastCleanup: 0 }), 8 * day));
 });
 
+test('settings: fragmented storage brings automatic cleanup forward to a day after the last, and never past the setting that turns it off', () => {
+  const day = 86_400_000;
+  assert.ok(!cleanupDue(s3({ autoCleanDays: 7, lastCleanup: 6 * day }), 8 * day), 'not fragmented: the interval stands');
+  assert.ok(cleanupDue(s3({ autoCleanDays: 7, lastCleanup: 6 * day }), 8 * day, true));
+  assert.ok(!cleanupDue(s3({ autoCleanDays: 7, lastCleanup: 7 * day }), 8 * day, true), 'not more than once a day');
+  assert.ok(cleanupDue(s3({ autoCleanDays: 7, lastCleanup: 7 * day - 1 }), 8 * day, true));
+  assert.ok(cleanupDue(s3({ autoCleanDays: 7, lastCleanup: 0 }), 8 * day, true));
+  assert.ok(!cleanupDue(s3({ autoCleanDays: 0, lastCleanup: 0 }), 8 * day, true));
+});
+
 test('setup codes carry storage settings and keys under the passphrase', async () => {
-  const code = await encodeSetupCode(s3(), secret);
-  assert.match(code, /^coffer1\./);
+  const code = await encodeSetupCode(s3(), secret, undefined, 1000);
+  assert.match(code, /^coffer2\./);
   assert.ok(!code.includes('SECRET'));
   assert.equal(
-    await openWithPassphrase(code.slice('coffer1.'.length), 'vault pass'),
+    await openWithPassphrase(code.slice('coffer2.'.length), 'vault pass'),
     '{"storageType":"s3","endpoint":" https://s3.example.com ","region":" ","bucket":"bkt ","prefix":"my vault","pathStyle":true,' +
       '"webdavUrl":"","webdavUser":"","accessKey":"AKID","secretKey":"SECRET","webdavPassword":""}',
   );
@@ -126,7 +138,7 @@ test('setup codes carry storage settings and keys under the passphrase', async (
 
 test('each vault gets its own secret names, because a phone keeps one keychain for every vault', async () => {
   const secret = (name: string) => ({ k: 'AKID', s: 'SECRET', p: 'vault pass' })[name] ?? '';
-  const code = await encodeSetupCode({ ...defaultSettings(true), endpoint: 'https://s3.example.com', bucket: 'b', accessKeySecret: 'k', secretKeySecret: 's', passphraseSecret: 'p' }, secret);
+  const code = await encodeSetupCode({ ...defaultSettings(true), endpoint: 'https://s3.example.com', bucket: 'b', accessKeySecret: 'k', secretKeySecret: 's', passphraseSecret: 'p' }, secret, undefined, 1000);
   const vaults = ['Coffer Test', 'Coffer Test 2', '日記', 'メモ', 'coffer test', 'A'.repeat(200)];
   const ids = [];
   for (const vault of vaults) {
@@ -243,6 +255,19 @@ test('what Obsidian does not list is left out: names starting with a dot, except
   for (const path of ['a.md', 'sub/v1.2/a.md', 'sub.d/a.md']) assert.ok(!shared(path), path);
 });
 
+test('settings: the size above which files wait in storage reaches the vault and every shared folder, and only receiving is per place', () => {
+  const vault = s3({ deferAboveMB: 5, readOnly: true });
+  const work = share({ id: 'w', folder: 'Work', readOnly: false });
+  const rest = share({ id: 'r', folder: 'Rest', readOnly: true });
+  assert.equal(syncConfig(vault, '.obsidian', '.obsidian/plugins/coffer').deferAboveMB, 5);
+  assert.equal(shareConfig(vault, work, '.obsidian').deferAboveMB, 5);
+  assert.deepEqual([syncConfig(vault, '.obsidian', '.obsidian/plugins/coffer').readOnly, shareConfig(vault, work, '.obsidian').readOnly, shareConfig(vault, rest, '.obsidian').readOnly], [true, false, true]);
+  assert.deepEqual([defaultSettings(false).deferAboveMB, defaultSettings(false).readOnly, DEFAULT_CONFIG.deferAboveMB, DEFAULT_CONFIG.readOnly], [0, false, 0, false]);
+  const saved = loadSettings({ shares: [{ id: 'old', folder: 'Old' } as Share] }, false);
+  assert.deepEqual([saved.deferAboveMB, saved.readOnly, saved.shares[0].readOnly], [0, false, false], 'what an older version saved reads as before');
+  assert.equal(besideVault(s3({ readOnly: true }), 'Notes', 'x1').readOnly, false, 'a folder kept beside a vault that only receives does not inherit that');
+});
+
 test('a shared folder must be a real folder of the vault, outside the others, the settings folder and what is left out', () => {
   const s = s3({ exclude: 'Private/\n*.tmp', shares: [share({ id: 'w', folder: 'Work' }), share({ id: 'f', folder: 'Family/Photos' })] });
   const problem = (folder: string, id = '') => folderProblem(s, folder, '.obsidian', '.obsidian/plugins/coffer', id);
@@ -300,13 +325,13 @@ test('"same storage as this vault" is a new place inside the vault\'s own, and i
 test('an invite to a shared folder is a setup code of its own kind, opened with the share\'s passphrase', async () => {
   const lookup = (n: string) => ({ ak: 'AKID', sk: 'SECRET', sp: 'share pass', pp: 'vault pass' })[n] ?? '';
   const work = share({ id: 'w1', folder: 'Projects/Work', prefix: 'team', passphraseSecret: 'sp' });
-  const invite = await encodeSetupCode(work, lookup, 'Work');
-  const vault = await encodeSetupCode(s3(), lookup);
+  const invite = await encodeSetupCode(work, lookup, 'Work', 1000);
+  const vault = await encodeSetupCode(s3(), lookup, undefined, 1000);
   assert.equal(codeKind(invite), 'share');
   assert.equal(codeKind(` ${vault}`), 'vault');
   assert.equal(codeKind('hello'), undefined);
   assert.ok(!invite.includes('SECRET'));
-  assert.match(setupLink(invite), /^obsidian:\/\/coffer\?share=coffershare1\./);
+  assert.match(setupLink(invite), /^obsidian:\/\/coffer\?share=coffershare2\./);
   assert.equal(setupCodeFrom(setupLink(invite)), invite);
   assert.match(setupLink(vault), /\?setup=/);
 
@@ -322,6 +347,37 @@ test('an invite to a shared folder is a setup code of its own kind, opened with 
   await assert.rejects(decodeInvite(invite, 'vault pass', 'My Notes', 'j9'), /Wrong passphrase/);
   await assert.rejects(decodeInvite(vault, 'vault pass', 'My Notes', 'j9'), /setup link for a whole vault/);
   await assert.rejects(decodeSetupCode(invite, 'share pass', 'My Notes'), /invite link to a shared folder/);
-  const sneaky = await encodeSetupCode(work, lookup, '../../.obsidian/x');
+  const sneaky = await encodeSetupCode(work, lookup, '../../.obsidian/x', 1000);
   assert.equal((await decodeInvite(sneaky, 'share pass', 'V', 'q')).folder, 'x', "only the last part of the sender's folder name is used");
+});
+
+test('a new passphrase needs the length the setup wizard asks for, wherever it is chosen; one being entered opens whatever its length', () => {
+  assert.equal(passphraseProblem('', ''), 'Enter the passphrase.');
+  assert.equal(passphraseProblem('abc', 'abc'), 'Use at least 8 characters.');
+  assert.equal(passphraseProblem('1234567', '1234567'), 'Use at least 8 characters.');
+  assert.equal(passphraseProblem('12345678', '1234567'), 'The two entries do not match.');
+  assert.equal(passphraseProblem('12345678', '12345678'), '');
+  assert.equal(passphraseProblem('abc', '', true), '', 'a passphrase chosen before this minimum still opens its vault');
+  assert.equal(passphraseProblem('', '', true), 'Enter the passphrase.');
+});
+
+test('a link that did not open says what can be told: the passphrase, or that the link is not whole', async () => {
+  const code = await encodeSetupCode({ ...defaultSettings(false), endpoint: 'https://s3.example.com', bucket: 'bkt', accessKeySecret: 'ak', secretKeySecret: 'sk', passphraseSecret: 'pp' }, secret, undefined, 1000);
+  const tried = async (text: string, pass = 'vault pass') => linkProblem(await decodeSetupCode(text, pass, 'V').then(() => undefined, (e) => e), 'setup');
+  const notWhole = 'That is not a valid or complete setup link. Copy it again on the other device.';
+  assert.equal(await tried(code.slice(0, 20)), notWhole, 'too short to hold what a link holds');
+  assert.equal(await tried('coffer2.not a code!'), notWhole, 'not base64');
+  assert.equal(await tried('coffer2.AAAAAA' + 'A'.repeat(80)), notWhole, 'a count of nothing');
+  assert.equal(await tried('hello'), notWhole);
+  const wrong = await tried(code, 'not it');
+  assert.match(wrong, /^That passphrase does not open this setup link\./);
+  assert.equal(await tried(code.slice(0, -3)), wrong, 'cut short but long enough, it reads as a wrong passphrase, so that text says it may be the link');
+  assert.match(wrong, /copy the link again/);
+  assert.equal(linkProblem(new Error('x'), 'invite'), 'That is not a valid or complete invite link. Copy it again.');
+  assert.match(linkProblem(new WrongPassphraseError(), 'invite'), /^That passphrase does not open this invite link\./);
+});
+
+test('a link cut inside a percent escape is a damaged code, not a crash', () => {
+  assert.equal(setupCodeFrom('obsidian://coffer?setup=coffer2.AAk%E0%A4%A'), 'coffer2.AAk%E0%A4%A');
+  assert.equal(setupCodeFrom('obsidian://coffer?setup=coffer2.AAk%41'), 'coffer2.AAkA');
 });

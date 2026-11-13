@@ -60,9 +60,27 @@ export interface RemoteStore {
   get(key: string, range?: { start: number; end: number }): Promise<Uint8Array | null>;
   /** With `ifNoneMatch`, resolves to false (and writes nothing) when the key already exists. */
   put(key: string, data: Uint8Array, opts?: { ifNoneMatch?: boolean }): Promise<boolean>;
-  delete(key: string): Promise<void>;
+  /** With `once`, a store that retries failed requests makes a single attempt: for a delete that must not be repeated after it may have taken effect. */
+  delete(key: string, opts?: { once?: boolean }): Promise<void>;
   /** Keys under `prefix`, in ascending key order, strictly after `startAfter` when given. */
   list(prefix: string, startAfter?: string): Promise<ObjectInfo[]>;
+}
+
+/** Thrown by a store made with `readOnlyStore` when something tries to write to it. */
+export class ReadOnlyError extends Error {
+  constructor() {
+    super('This device only reads from storage, so nothing was written to it');
+  }
+}
+
+/** `store` as seen by a device that never writes: reads and listings go through, and a write fails before it is sent. */
+export function readOnlyStore(store: RemoteStore): RemoteStore {
+  return {
+    get: (key, range) => store.get(key, range),
+    list: (prefix, startAfter) => store.list(prefix, startAfter),
+    put: () => Promise.reject(new ReadOnlyError()),
+    delete: () => Promise.reject(new ReadOnlyError()),
+  };
 }
 
 export interface FileStat {

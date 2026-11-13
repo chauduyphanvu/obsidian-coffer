@@ -2,11 +2,12 @@
 // No Obsidian import, so it runs under plain Node tests.
 import { SyncEngine, type EngineOptions, type SyncResult } from '../core/engine.ts';
 import { vaultKey } from '../core/paths.ts';
+import { plural } from '../core/text.ts';
 import { MissingFolderError, ScopedFS, below, isAtOrInside, isInside, type FolderFS } from '../core/scopedfs.ts';
 import { LocalState } from '../core/state.ts';
 import type { RemoteStore, StateStore } from '../core/types.ts';
 import type { RemoteSpec } from '../stores/open.ts';
-import { isConfigured, remoteSpec, shareConfig, statePath, storageLocation, storageProblem, syncConfig, type SecretLookup, type Settings, type Share } from './settings.ts';
+import { encodeSetupCode, isConfigured, remoteSpec, shareConfig, statePath, storageLocation, storageProblem, syncConfig, type SecretLookup, type Settings, type Share } from './settings.ts';
 
 /** Where a vault path syncs: inside a shared folder, by its path there, or with the vault, by the same path. */
 export interface Place {
@@ -233,7 +234,27 @@ export async function syncAll<R>(
 /** A share's sync result with the paths it names given as vault paths, for problems that open the files. */
 export function inVault(share: Share, r: SyncResult): SyncResult {
   const at = (p: string) => vaultPath(share, p);
-  return { ...r, errors: r.errors.map((e) => ({ ...e, path: at(e.path) })), tooLarge: r.tooLarge.map(at), conflictCopies: r.conflictCopies.map(at) };
+  return { ...r, errors: r.errors.map((e) => ({ ...e, path: at(e.path) })), tooLarge: r.tooLarge.map(at), deferred: r.deferred.map(at), unsent: r.unsent.map(at), conflictCopies: r.conflictCopies.map(at) };
+}
+
+/**
+ * The code of an invite to `share` for someone who may only read: it carries `keys`, which its owner made to read only,
+ * in place of the ones `secret` finds for the share, and turns on Only receive changes for whoever opens it.
+ */
+export function readOnlyInviteCode(share: Share, keys: { access: string; secret: string; password: string; user: string }, secret: SecretLookup, folder: string, iterations: number): Promise<string> {
+  const keyed = (name: string) =>
+    !name ? '' : name === share.accessKeySecret ? keys.access : name === share.secretKeySecret ? keys.secret : name === share.webdavPasswordSecret ? keys.password : secret(name);
+  return encodeSetupCode({ ...share, readOnly: true, webdavUser: keys.user || share.webdavUser }, keyed, folder, iterations);
+}
+
+/** What joining a shared folder does with the `n` files that are already in the folder it is mounted at, which is not empty. */
+export function mountHint(folder: string, n: number, receivesOnly: boolean): string {
+  const one = n === 1;
+  const has = `“${folder}” already has ${plural(n, 'file')}.`;
+  const same = 'a file with the same name is compared, and both are kept when they differ. Nothing is deleted.';
+  return receivesOnly
+    ? `${has} ${one ? 'It stays' : 'They stay'} on this device and ${one ? 'is' : 'are'} not sent, because this device only receives changes; ${same}`
+    : `${has} ${one ? 'It is' : 'They are'} added to the shared folder, so everyone who shares it sees ${one ? 'it' : 'them'}; ${same}`;
 }
 
 /** An id for a new share: names its state file and secrets, so only a-z and 0-9. */

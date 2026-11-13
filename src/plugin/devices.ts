@@ -24,17 +24,19 @@ async function load(box: HTMLElement, plugin: CofferPlugin): Promise<void> {
     const view = await plugin.getEngine().view();
     const devices = await listDevices(view);
     box.empty();
+    const receivesOnly = view.cfg.readOnly;
+    if (receivesOnly) note('This device only receives changes, so it does not report here, and it cannot forget a device.');
     if (!devices.length) note('No device has reported yet. Each one appears after its next sync.');
     // This device's record is written at most every 30 minutes; when it last synced is known here exactly.
     const seen = (d: DeviceStatus) => (d.isSelf ? { ...d, lastSeen: Math.max(d.lastSeen, plugin.settings.lastSuccess) } : d);
-    for (const d of devices) row(box, seen(d), view, () => confirmForget(plugin, box, view, d.name));
+    for (const d of devices) row(box, seen(d), view, receivesOnly ? undefined : () => confirmForget(plugin, box, view, d.name));
   } catch (e) {
     box.empty();
     note(`Could not load the devices: ${errorText(e)}`);
   }
 }
 
-function row(box: HTMLElement, d: DeviceStatus, view: RepoView, forget: () => void): void {
+function row(box: HTMLElement, d: DeviceStatus, view: RepoView, forget?: () => void): void {
   const el = box.createDiv({ cls: `coffer-device is-${statusTone(d)}` });
   const text = el.createDiv({ cls: 'coffer-device-text' });
   const name = text.createDiv({ cls: 'coffer-device-name', text: d.name });
@@ -45,7 +47,7 @@ function row(box: HTMLElement, d: DeviceStatus, view: RepoView, forget: () => vo
   const status = text.createDiv({ cls: 'coffer-device-status' });
   status.createSpan({ cls: 'coffer-device-dot' });
   status.createSpan({ text: statusText(d, view.now) });
-  if (!d.isSelf) button(el, 'Forget', forget).buttonEl.setAttribute('aria-label', `Forget ${d.name}`);
+  if (forget && !d.isSelf) button(el, 'Forget', forget).buttonEl.setAttribute('aria-label', `Forget ${d.name}`);
 }
 
 function confirmForget(plugin: CofferPlugin, box: HTMLElement, view: RepoView, name: string): void {

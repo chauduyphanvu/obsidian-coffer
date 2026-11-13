@@ -2,6 +2,7 @@
 // time, and a check of what storage holds. Decisions live in restore.ts; this file only shows them.
 import { Modal, Notice, Platform, TFile, type App } from 'obsidian';
 import { fileName, vaultKey } from '../core/paths.ts';
+import type { RepairReport } from '../core/repair.ts';
 import { listVersions } from '../core/retention.ts';
 import { plural } from '../core/text.ts';
 import { TooOldError, listCommits, listDeleted, planRestore, tableAt, type CommitSummary, type DeletedFile, type PastVault } from '../core/timeline.ts';
@@ -13,11 +14,15 @@ import type { Share } from './settings.ts';
 import {
   MomentPages,
   byDay,
+  canRepair,
   changesLabel,
   countSteps,
   countable,
+  describeRepair,
   describeVerify,
   deviceLabel,
+  historyFailure,
+  leftNote,
   lineChanges,
   matchesQuery,
   momentLabel,
@@ -25,6 +30,7 @@ import {
   repeatsDay,
   restoreSteps,
   scopeName,
+  sentNote,
   sizeLabel,
   stepSummary,
   timeLabels,
@@ -33,7 +39,7 @@ import {
   type Preview,
   type Step,
 } from './restore.ts';
-import { MAX_COMPARE_BYTES, describeFailure } from './status.ts';
+import { MAX_COMPARE_BYTES } from './status.ts';
 import { FolderSuggest, button, buttonRow, message, openLink, statusLine } from './ui.ts';
 
 /** Rows drawn at most in one list; typing narrows it. */
@@ -43,10 +49,6 @@ const MAX_LINES = 3000;
 const MAX_CHARS = 200_000;
 const PAGE = 30;
 
-const failure = (e: unknown) => {
-  const p = describeFailure(e);
-  return p.id.startsWith('failed') ? p.detail : `${p.title}. ${p.detail}`;
-};
 const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
 /** Which synced place a screen is about, once the vault has shared folders: each has a history of its own. */
@@ -113,6 +115,14 @@ function showCounts(el: HTMLElement, c: { added: number; removed: number }): voi
   el.setAttr('aria-label', `${plural(c.added, 'line')} added, ${c.removed.toLocaleString()} removed`);
   el.createSpan({ cls: 'is-added', text: `+${c.added.toLocaleString()}` });
   el.createSpan({ cls: 'is-removed', text: `−${c.removed.toLocaleString()}` });
+}
+
+/** The paths a finding is about, the first few of them. */
+function fileList(parent: HTMLElement, files: string[]): void {
+  if (!files.length) return;
+  const list = parent.createDiv({ cls: 'coffer-files' });
+  for (const path of files.slice(0, 20)) list.createDiv({ cls: 'coffer-file', text: path });
+  if (files.length > 20) list.createDiv({ cls: 'coffer-hint', text: `…and ${(files.length - 20).toLocaleString()} more` });
 }
 
 /** Runs jobs two at a time, newest first, so the rows just scrolled to come before ones scrolled past. */
@@ -205,7 +215,7 @@ export class VersionsModal extends Modal {
       const file = this.app.vault.getAbstractFileByPath(this.path);
       this.current = !(file instanceof TFile) ? null : file.stat.size <= MAX_COMPARE_BYTES ? new Uint8Array(await this.app.vault.readBinary(file)) : undefined;
     } catch (e) {
-      this.error = `Could not load the versions: ${failure(e)}`;
+      this.error = `Could not load the versions: ${historyFailure(e)}`;
     }
     if (!this.closed) this.render();
   }
@@ -308,7 +318,7 @@ export class VersionsModal extends Modal {
     try {
       preview = previewVersion(v.entry!.size <= MAX_COMPARE_BYTES ? await this.read(v) : undefined, this.current);
     } catch (e) {
-      if (this.picked === v) this.error = `Could not download this version: ${failure(e)}`;
+      if (this.picked === v) this.error = `Could not download this version: ${historyFailure(e)}`;
     }
     if (this.picked !== v || this.closed) return;
     this.preview = preview;
@@ -368,7 +378,9 @@ export class VersionsModal extends Modal {
     message(p, this.error);
     p.createDiv({
       cls: 'coffer-hint',
-      text: this.current === null ? `Restoring brings “${this.name}” back as it was then.` : `Restoring replaces “${this.name}” with this version. What it holds now stays in its version history.`,
+      text:
+        (this.current === null ? `Restoring brings “${this.name}” back as it was then.` : `Restoring replaces “${this.name}” with this version. What it holds now stays in its version history.`) +
+        (this.plugin.receivesOnly(this.place.share) ? ` ${sentNote(1, true)}` : ''),
     });
     const r = buttonRow(p);
     button(r, 'Close', () => this.close());
@@ -385,7 +397,7 @@ export class VersionsModal extends Modal {
       this.close();
     } catch (e) {
       this.busy = false;
-      this.error = `Could not restore: ${failure(e)}`;
+      this.error = `Could not restore: ${historyFailure(e)}`;
       this.renderPreview();
     }
   }
@@ -424,10 +436,10 @@ export class DeletedModal extends Modal {
   private async load(): Promise<void> {
     try {
       const look = await this.plugin.look(this.share);
-      const kept = this.plugin.keptOut(this.share);
+      const kept = await this.plugin.keptOutFiles(this.share);
       this.files = (await listDeleted(look.repo, look.lastSeq, look.cfg, look.now)).filter((d) => !kept(d.path));
     } catch (e) {
-      this.error = `Could not look for deleted files: ${failure(e)}`;
+      this.error = `Could not look for deleted files: ${historyFailure(e)}`;
     }
     this.loaded = true;
     this.render();
@@ -518,7 +530,7 @@ export class DeletedModal extends Modal {
       this.done(await this.plugin.restoreDeleted(this.files.filter((f) => this.picked.has(f)), this.share));
     } catch (e) {
       this.busy = false;
-      this.error = `Could not restore: ${failure(e)}`;
+      this.error = `Could not restore: ${historyFailure(e)}`;
       this.renderFoot();
     }
   }
@@ -528,7 +540,7 @@ export class DeletedModal extends Modal {
     c.empty();
     if (placed.length) {
       statusLine(c, `${plural(placed.length, 'file')} brought back`, failed.length ? 'warning' : 'ok');
-      c.createDiv({ cls: 'coffer-sub', text: `The next sync sends ${placed.length === 1 ? 'it' : 'them'} to your other devices.` });
+      c.createDiv({ cls: 'coffer-sub', text: sentNote(placed.length, this.plugin.receivesOnly(this.share)) });
       const list = c.createDiv({ cls: 'coffer-files' });
       for (const p of placed) {
         const r = list.createDiv({ cls: 'coffer-file' });
@@ -619,7 +631,7 @@ export class RestoreEarlierModal extends Modal {
       // Dropped: the place changed meanwhile, and its own load draws the list.
       if (!(await loading)) return;
     } catch (e) {
-      this.error = `Could not load earlier times: ${failure(e)}`;
+      this.error = `Could not load earlier times: ${historyFailure(e)}`;
     }
     if (this.step === 'choose') this.render();
   }
@@ -693,10 +705,11 @@ export class RestoreEarlierModal extends Modal {
     this.error = this.note = this.gone = '';
     this.render();
     try {
+      const kept = await this.plugin.keptOutFiles(share);
       const look = await this.plugin.look(share);
       // By its number: device clocks disagree, and two moments can share a millisecond, so its time may name another.
       const past = await tableAt(look.repo, look.remote, look.lastSeq, look.cfg, look.now, { seq: m.seq });
-      const { steps, left } = restoreSteps(planRestore(look.remote, past.files, folder), look.remote, this.plugin.keptOut(share));
+      const { steps, left } = restoreSteps(planRestore(look.remote, past.files, folder), look.remote, kept);
       if (this.asked !== asked) return;
       this.past = past;
       this.steps = steps;
@@ -709,7 +722,7 @@ export class RestoreEarlierModal extends Modal {
       this.gone =
         e instanceof TooOldError
           ? `That is too far back now: the earliest time that can be restored is ${momentLabel(e.earliest.time, Date.now())}.`
-          : `Could not work out what would change: ${failure(e)}`;
+          : `Could not work out what would change: ${historyFailure(e)}`;
       this.pages.reset();
       void this.loadMore();
       return;
@@ -746,7 +759,7 @@ export class RestoreEarlierModal extends Modal {
       for (const path of paths.slice(0, MAX_ROWS)) list.createDiv({ cls: 'coffer-file', text: path });
       if (paths.length > MAX_ROWS) list.createDiv({ cls: 'coffer-hint', text: `…and ${(paths.length - MAX_ROWS).toLocaleString()} more` });
     }
-    if (this.left) c.createDiv({ cls: 'coffer-hint', text: `${plural(this.left, 'file')} excluded from sync on this device ${this.left === 1 ? 'stays as it is' : 'stay as they are'}.` });
+    if (this.left) c.createDiv({ cls: 'coffer-hint', text: leftNote(this.left) });
     if (!this.steps.length) {
       button(buttonRow(c), 'Back', () => this.back());
       return;
@@ -783,7 +796,7 @@ export class RestoreEarlierModal extends Modal {
       }
     } catch (e) {
       this.step = 'review';
-      this.error = `Nothing was restored: ${failure(e)}`;
+      this.error = `Nothing was restored: ${historyFailure(e)}`;
     } finally {
       unsubscribe();
     }
@@ -863,7 +876,7 @@ export class VerifyModal extends Modal {
         this.stored = [...look.remote.values()].reduce((n, e) => n + e.size, 0);
       }
     } catch (e) {
-      if (!this.report) this.error = `The check could not finish: ${failure(e)}`;
+      if (!this.report) this.error = `The check could not finish: ${historyFailure(e)}`;
     }
     this.running = false;
     if (!this.closed) this.render();
@@ -877,7 +890,7 @@ export class VerifyModal extends Modal {
       cls: 'coffer-intro',
       text: this.deep
         ? 'Downloads everything stored for your files as they are now and checks that it decrypts to what was saved. Nothing is changed.'
-        : 'Reads the sync history and checks that the stored data for every file is there. Nothing is changed.',
+        : 'Reads the sync history and checks that the stored data for every file, and for the earlier versions you can restore, is there. Nothing is changed.',
     });
     if (this.running) {
       this.progressEl = statusLine(c, 'Starting…', 'busy');
@@ -895,14 +908,10 @@ export class VerifyModal extends Modal {
     statusLine(c, d.title, d.ok ? 'ok' : 'critical');
     c.createDiv({ cls: 'coffer-sub', text: d.detail });
     for (const f of d.findings) {
-      const card = c.createDiv({ cls: 'coffer-problem is-critical' });
+      const card = c.createDiv({ cls: `coffer-problem${f.tone === 'critical' ? ' is-critical' : ''}` });
       card.createDiv({ cls: 'coffer-problem-title', text: f.title });
       card.createDiv({ cls: 'coffer-problem-detail', text: f.detail });
-      if (f.files.length) {
-        const list = card.createDiv({ cls: 'coffer-files' });
-        for (const path of f.files.slice(0, 20)) list.createDiv({ cls: 'coffer-file', text: path });
-        if (f.files.length > 20) list.createDiv({ cls: 'coffer-hint', text: `…and ${(f.files.length - 20).toLocaleString()} more` });
-      }
+      fileList(card, f.files);
       const more = card.createEl('details', { cls: 'coffer-plan' });
       more.createEl('summary', { text: 'Technical details' });
       more.createDiv({ cls: 'coffer-problem-detail', text: f.messages.join('\n') });
@@ -914,8 +923,96 @@ export class VerifyModal extends Modal {
         text: `Also downloads everything stored for your files${this.stored === undefined ? '' : ` (about ${sizeLabel(this.stored)})`} and checks that it decrypts to what was saved. This can take a long time, and on a phone it may use mobile data.`,
       });
     }
+    const repairable = canRepair(r) && !this.plugin.receivesOnly(this.share);
+    if (repairable) {
+      c.createDiv({ cls: 'coffer-pick-label', text: 'Repair' });
+      c.createDiv({
+        cls: 'coffer-hint',
+        text: 'If this device has the files affected, their missing or damaged data can be stored again from them. Nothing on this device is changed.',
+      });
+    }
     const row = buttonRow(c);
-    button(row, 'Close', () => this.close(), d.ok ? 'cta' : 'plain');
+    button(row, 'Close', () => this.close(), d.ok || repairable ? 'plain' : 'cta');
     if (!r.deep) button(row, 'Run the thorough check', () => this.run(true));
+    if (repairable) {
+      button(row, 'Repair from this device', () => {
+        this.close();
+        new RepairModal(this.app, this.plugin, this.share, r.deep).open();
+      }, 'cta');
+    }
+  }
+}
+
+/** Stores again, from this device's files, the data storage lost, and says what that came to. It starts when it opens. */
+export class RepairModal extends Modal {
+  private plugin: CofferPlugin;
+  private share?: Share;
+  private deep: boolean;
+  private report?: RepairReport;
+  private error = '';
+  private progressEl?: HTMLElement;
+  private closed = false;
+
+  constructor(app: App, plugin: CofferPlugin, share: Share | undefined, deep: boolean) {
+    super(app);
+    this.plugin = plugin;
+    this.share = share;
+    this.deep = deep;
+  }
+
+  onOpen(): void {
+    this.modalEl.addClass('coffer-modal', 'coffer-past');
+    this.setTitle('Repair synced data');
+    void this.run();
+  }
+
+  onClose(): void {
+    this.closed = true;
+    this.contentEl.empty();
+  }
+
+  private async run(): Promise<void> {
+    this.report = undefined;
+    this.error = '';
+    this.render(true);
+    try {
+      this.report = await this.plugin.repair(this.share, this.deep, (p) => this.progressEl?.setText(verifyProgress(p)));
+    } catch (e) {
+      this.error = `The repair could not finish: ${historyFailure(e)}`;
+    }
+    if (!this.closed) this.render(false);
+  }
+
+  private render(running: boolean): void {
+    const c = this.contentEl;
+    c.empty();
+    placeLine(c, this.plugin, this.share);
+    c.createEl('p', {
+      cls: 'coffer-intro',
+      text: 'Looks for stored data that is missing or damaged, and stores it again from the files on this device. Nothing on this device is changed.',
+    });
+    if (running) {
+      this.progressEl = statusLine(c, this.deep ? 'Checking the stored data…' : 'Looking for damage…', 'busy');
+      return;
+    }
+    const r = this.report;
+    if (!r) {
+      message(c, this.error);
+      const row = buttonRow(c);
+      button(row, 'Close', () => this.close());
+      button(row, 'Try again', () => this.run(), 'cta');
+      return;
+    }
+    const d = describeRepair(r, this.deep);
+    statusLine(c, d.title, d.ok ? 'ok' : 'critical');
+    if (d.detail) c.createDiv({ cls: 'coffer-sub', text: d.detail });
+    for (const g of d.groups) {
+      const fixed = g.tone === 'ok';
+      const card = fixed ? c.createDiv() : c.createDiv({ cls: `coffer-problem${g.tone === 'critical' ? ' is-critical' : ''}` });
+      card.createDiv({ cls: fixed ? 'coffer-pick-label' : 'coffer-problem-title', text: g.title });
+      card.createDiv({ cls: fixed ? 'coffer-hint' : 'coffer-problem-detail', text: g.detail });
+      fileList(card, g.files);
+    }
+    button(buttonRow(c), 'Close', () => this.close(), 'cta');
   }
 }

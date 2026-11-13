@@ -7,7 +7,7 @@ import { MissingFolderError, ScopedFS, type FolderFS } from '../src/core/scopedf
 import { ChangeLog, type Why } from '../src/plugin/changes.ts';
 import { defaultSettings, shareWith, statePath, type Settings, type Share } from '../src/plugin/settings.ts';
 import { vaultKey } from '../src/core/paths.ts';
-import { followRename, freeTaken, goneWith, inVault, makeEngine, placeOf, rejoin, rejoinNote, syncAll, takeVaultCopies, vaultPath, type EngineHost } from '../src/plugin/shares.ts';
+import { followRename, freeTaken, goneWith, inVault, makeEngine, mountHint, placeOf, rejoin, rejoinNote, syncAll, takeVaultCopies, vaultPath, type EngineHost } from '../src/plugin/shares.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
 import { MemFS, MemState } from '../src/testing/memfs.ts';
 import { Device, TEST_CONFIG } from './helpers.ts';
@@ -233,8 +233,8 @@ test('routing: a path goes to the innermost shared folder holding it, by its pat
   assert.equal(vaultPath(work, 'a.md'), 'Work/a.md');
   assert.equal(vaultPath(work, ''), 'Work');
   assert.equal(vaultPath(undefined, 'a.md'), 'a.md');
-  const r = inVault(work, { pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0, conflictCopies: ['x (conflict).md'], skipped: 0, tooLarge: ['big.mov'], errors: [{ path: 'e.md', message: 'no' }], commits: 0, rounds: 1 });
-  assert.deepEqual([r.conflictCopies, r.tooLarge, r.errors.map((e) => e.path)], [['Work/x (conflict).md'], ['Work/big.mov'], ['Work/e.md']]);
+  const r = inVault(work, { pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0, conflictCopies: ['x (conflict).md'], skipped: 0, tooLarge: ['big.mov'], deferred: ['d.mov'], unsent: ['u.md'], errors: [{ path: 'e.md', message: 'no' }], commits: 0, rounds: 1 });
+  assert.deepEqual([r.conflictCopies, r.tooLarge, r.deferred, r.unsent, r.errors.map((e) => e.path)], [['Work/x (conflict).md'], ['Work/big.mov'], ['Work/d.mov'], ['Work/u.md'], ['Work/e.md']]);
 });
 
 test('routing: a renamed or moved folder takes the shares in it along; a deleted one names the shares it took', () => {
@@ -686,4 +686,13 @@ test('nothing syncs on a storage location that the vault and a shared folder are
   a.restart();
   ok(await a.syncAll());
   assert.deepEqual(await a.remote(sa), ['s1.md', 'sub/s2.md', 't1.md']);
+});
+
+test('mounting at a folder that has files says what happens to them, for a device that sends and for one that only receives', () => {
+  assert.match(mountHint('Crew', 1, false), /^“Crew” already has 1 file\. It is added to the shared folder, so everyone who shares it sees it; a file with the same name/);
+  assert.match(mountHint('Crew', 4, false), /^“Crew” already has 4 files\. They are added to the shared folder, so everyone who shares it sees them; /);
+  assert.match(mountHint('Crew', 1, true), /^“Crew” already has 1 file\. It stays on this device and is not sent, because this device only receives changes; /);
+  assert.match(mountHint('Crew', 1200, true), /^“Crew” already has 1,200 files\. They stay on this device and are not sent, /);
+  assert.ok(!/everyone who shares/.test(mountHint('Crew', 2, true)));
+  assert.ok(mountHint('Crew', 2, true).endsWith('Nothing is deleted.'));
 });

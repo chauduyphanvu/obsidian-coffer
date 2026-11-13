@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { HistoryError } from '../src/core/engine.ts';
+import { Repo } from '../src/core/repo.ts';
 import type { RemoteStore } from '../src/core/types.ts';
 import { describeFailure } from '../src/plugin/status.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
+import { withRetry } from '../src/stores/retry.ts';
 import { rng, SimStore } from '../src/testing/netsim.ts';
 import { Device } from './helpers.ts';
 
@@ -51,10 +53,60 @@ class Switch implements RemoteStore {
   }
 }
 
+/** A switch whose next delete takes effect and then fails as if its reply were lost, after `meanwhile` has run. */
+class LosesReply extends Switch {
+  meanwhile?: () => Promise<void>;
+  async delete(k: string) {
+    await super.delete(k);
+    const f = this.meanwhile;
+    if (!f) return;
+    this.meanwhile = undefined;
+    await f();
+    throw new Error('connection reset');
+  }
+}
+
 function copyOf(mem: MemoryStore, clock: { now: number }): MemoryStore {
   const out = new MemoryStore(() => clock.now);
   for (const [k, o] of mem.objects) out.objects.set(k, { data: o.data.slice(), modified: o.modified });
   return out;
+}
+
+const logs = (mem: MemoryStore) => [...mem.objects.keys()].filter((k) => k.startsWith('log/')).sort();
+
+/** Storage that runs `hook` ahead of each request, to change what it holds or fail one at a chosen moment, and counts what it is asked to delete. */
+class Tap implements RemoteStore {
+  inner: RemoteStore;
+  hook?: (op: 'get' | 'put' | 'delete' | 'list', k: string) => Promise<void> | void;
+  deletes: string[] = [];
+  /** Requests in flight at once, at most. */
+  peak = 0;
+  private live = 0;
+  constructor(inner: RemoteStore) {
+    this.inner = inner;
+  }
+  private async run<T>(op: 'get' | 'put' | 'delete' | 'list', k: string, request: () => Promise<T>): Promise<T> {
+    this.peak = Math.max(this.peak, ++this.live);
+    try {
+      await this.hook?.(op, k);
+      return await request();
+    } finally {
+      this.live--;
+    }
+  }
+  get(k: string, range?: { start: number; end: number }) {
+    return this.run('get', k, () => this.inner.get(k, range));
+  }
+  put(k: string, data: Uint8Array, opts?: { ifNoneMatch?: boolean }) {
+    return this.run('put', k, () => this.inner.put(k, data, opts));
+  }
+  delete(k: string) {
+    this.deletes.push(k);
+    return this.run('delete', k, () => this.inner.delete(k));
+  }
+  list(prefix: string, startAfter?: string) {
+    return this.run('list', prefix, () => this.inner.list(prefix, startAfter));
+  }
 }
 
 /** A deletes `old.bin`, then cleanup runs long after, while B has been offline since before the delete. */
@@ -107,7 +159,7 @@ test('a device back after the retention window does not commit data cleanup alre
 });
 
 test('a device notices when the newest commit it saw is gone from storage', async () => {
-  const { devices: [a, b], mem, clock } = setup();
+  const { devices: [a, b], mem } = setup();
   for (const text of ['1\n', '2\n', '3\n']) {
     a.fs.put('n.md', text);
     await a.sync();
@@ -121,12 +173,12 @@ test('a device notices when the newest commit it saw is gone from storage', asyn
   assert.ok(e instanceof HistoryError);
   assert.equal(describeFailure(e).id, 'history');
 
-  // A device that keeps running and sees nothing new checks again within the hour,
-  // before an edit of its own would be committed on top of the gap.
+  // A device that keeps running sees nothing new. An edit of its own is committed at once, and the commit
+  // finds the one before it gone: it is taken back, so the log is the one storage had.
   await a.sync();
-  clock.now += HOUR;
   a.fs.put('n.md', '4\n');
   await assert.rejects(a.sync(), (x) => x instanceof HistoryError && /is missing/.test(x.message));
+  assert.deepEqual(logs(mem), [key('log', 1), key('log', 2)], 'the commit was taken back, and nothing else was');
 
   // Each carries on from storage as it is once told to.
   await b.engine.acceptStorage();
@@ -318,17 +370,242 @@ test('checking that the newest commit is still there costs one more read, at sta
   assert.equal(await reads(), 3);
   assert.equal(await reads(), 2);
 
-  // A small edit is committed without reading anything, unless the check is due.
+  // A small edit is committed without looking first, due or not: the commit reads the one before it as it is written.
   b.fs.put('a.md', 'x\ny\n');
   net.reset();
   await b.sync();
-  assert.equal(net.stats.get + net.stats.list, 0);
+  assert.deepEqual([net.stats.get, net.stats.put, net.stats.list], [1, 2, 0]);
   clock.now += HOUR;
   b.fs.put('a.md', 'x\ny\nz\n');
   net.reset();
   await b.sync();
-  assert.equal(net.stats.get, 3);
-  assert.equal(net.stats.put, 2);
+  assert.deepEqual([net.stats.get, net.stats.put, net.stats.list], [1, 2, 0]);
+  assert.equal(await reads(), 2, 'that check counts: the next sync does not read the newest commit again');
+});
+
+test('a commit written on a log replaced under this device is taken back at once, and a device that read it meanwhile carries on after its retry', async () => {
+  const clock = { now: 1_800_000_000_000 };
+  const mem = new MemoryStore(() => clock.now);
+  const toA = new Switch(mem);
+  const a = new Device('A', toA, clock);
+  const b = new Device('B', new Switch(mem), clock);
+  a.fs.put('one.md', 'one\n');
+  await a.sync();
+  await b.sync();
+  // From here B is on a copy of storage, where its commit 2 stands in place of A's.
+  const copy = copyOf(mem, clock);
+  (b.store as Switch).target = copy;
+  b.fs.put('b.md', 'from B\n');
+  await b.sync();
+  a.fs.put('a.md', 'from A\n');
+  await a.sync();
+
+  // A is shown the copy, and its next edit would go on top of a commit 2 that is not its own.
+  const tap = new Tap(copy);
+  toA.target = tap;
+  let meanwhile: Error | undefined;
+  tap.hook = async (op) => {
+    if (op === 'delete') meanwhile = await failure(b.sync());
+  };
+  a.fs.put('a.md', 'from A, again\n');
+  const e = await failure(a.sync());
+  assert.ok(e instanceof HistoryError);
+  assert.match(e.message, /commit 2 is not the one this device saw/);
+  assert.deepEqual(tap.deletes, [key('log', 3)]);
+  assert.deepEqual(logs(copy), [key('log', 1), key('log', 2)]);
+  // Read before it was gone, the commit stops B once; it does not follow B's own commit 2.
+  assert.match(meanwhile!.message, /commit 3 does not follow the commit before it/);
+
+  tap.hook = undefined;
+  assert.deepEqual((await b.sync()).errors, []);
+  assert.deepEqual((await b.engine.verify()).problems, []);
+  await a.engine.acceptStorage();
+  await a.sync();
+  await b.sync();
+  assert.equal(b.fs.text('a.md'), 'from A, again\n');
+  assert.equal(a.fs.text('b.md'), 'from B\n');
+  assert.deepEqual((await b.engine.verify()).problems, []);
+});
+
+/** A on retrying storage, having written commits 1 to 3; then storage loses commit 3, so that A's next commit, 4, finds the one before it gone. */
+async function cutBack() {
+  const clock = { now: 1_800_000_000_000 };
+  const mem = new MemoryStore(() => clock.now);
+  const tap = new Tap(mem);
+  const a = new Device('A', withRetry(tap, 3, 1), clock);
+  for (const text of ['1\n', '2\n', '3\n']) {
+    a.fs.put('n.md', text);
+    await a.sync();
+  }
+  mem.objects.delete(key('log', 3));
+  a.fs.put('n.md', '4\n');
+  return { mem, tap, a };
+}
+
+test('a commit taken back on storage that retries is deleted once, and only if it is still this device\'s', async () => {
+  const { mem, tap, a } = await cutBack();
+  await assert.rejects(a.sync(), (x) => x instanceof HistoryError && /is missing/.test(x.message));
+  assert.deepEqual(tap.deletes, [key('log', 4)]);
+  assert.deepEqual(logs(mem), [key('log', 1), key('log', 2)]);
+
+  // Found changed at the moment it is read again, it is left where it is.
+  const again = await cutBack();
+  again.tap.hook = (op, k) => {
+    if (op === 'get' && k === key('log', 4)) again.mem.objects.get(k)!.data[30] ^= 1;
+  };
+  await assert.rejects(again.a.sync(), (x) => x instanceof HistoryError && /is missing/.test(x.message));
+  assert.deepEqual(again.tap.deletes, []);
+  assert.deepEqual(logs(again.mem), [1, 2, 4].map((n) => key('log', n)));
+});
+
+test('a commit that cannot be taken back is tried for once, and the failure that made it unwanted is still the one reported', async () => {
+  const { mem, tap, a } = await cutBack();
+  tap.hook = (op) => {
+    if (op === 'delete') throw new Error('boom');
+  };
+  await assert.rejects(a.sync(), (x) => x instanceof HistoryError && /is missing/.test(x.message));
+  assert.deepEqual(tap.deletes, [key('log', 4)], 'one request, though the storage retries what fails');
+  assert.deepEqual(logs(mem), [1, 2, 4].map((n) => key('log', n)));
+});
+
+test('a retraction whose reply is lost is not sent again: the commit another device wrote at that number meanwhile stays', async () => {
+  const clock = { now: 1_800_000_000_000 };
+  const mem = new MemoryStore(() => clock.now);
+  const toA = new LosesReply(mem);
+  const a = new Device('A', withRetry(toA, 3, 1), clock);
+  const d = new Device('D', mem, clock);
+  a.fs.put('one.md', 'one\n');
+  await a.sync();
+  await d.sync();
+  // A commits 2 on a copy of storage, as after a restore it was shown; D commits its own 2 on the real one.
+  toA.target = copyOf(mem, clock);
+  a.fs.put('a.md', 'from A\n');
+  await a.sync();
+  toA.target = mem;
+  d.fs.put('d.md', 'from D\n');
+  await d.sync();
+
+  // A's next edit lands at 3 on the real log, where its check finds D's 2, and it takes 3 back. The reply is lost,
+  // and before any second request D commits its own 3.
+  toA.meanwhile = async () => {
+    d.fs.put('d.md', 'from D, again\n');
+    assert.equal((await d.sync()).commits, 1);
+  };
+  a.fs.put('a.md', 'from A, again\n');
+  await assert.rejects(a.sync(), (x) => x instanceof HistoryError && /commit 2 is not the one this device saw/.test(x.message));
+  assert.deepEqual(logs(mem), [1, 2, 3].map((n) => key('log', n)));
+  assert.deepEqual((await d.sync()).errors, []);
+  assert.deepEqual((await d.engine.verify()).problems, []);
+});
+
+test('a commit that loses the race for its number takes nothing back', async () => {
+  const { devices: [a, b], net } = setup();
+  a.fs.put('x.md', 'x\n');
+  await a.sync();
+  await b.sync();
+  a.fs.put('a.md', 'a\n');
+  b.fs.put('b.md', 'b\n');
+  net.reset();
+  const results = await Promise.all([a.sync(), b.sync()]);
+  assert.ok(results.some((r) => r.rounds > 1), 'one of them lost the number');
+  assert.equal(net.stats.delete, 0);
+  await a.sync();
+  await b.sync();
+  assert.deepEqual(a.snapshot(), b.snapshot());
+  assert.deepEqual((await a.engine.verify()).problems, []);
+});
+
+test('a commit that finds its number taken never deletes the commit that took it, though the commit before it is not the one this device saw', async () => {
+  const clock = { now: 1_800_000_000_000 };
+  const mem = new MemoryStore(() => clock.now);
+  const toA = new Switch(mem);
+  const a = new Device('A', toA, clock);
+  const b = new Device('B', new Switch(mem), clock);
+  a.fs.put('one.md', 'one\n');
+  await a.sync();
+  await b.sync();
+  const copy = copyOf(mem, clock);
+  (b.store as Switch).target = copy;
+  for (const text of ['1\n', '2\n']) {
+    b.fs.put('b.md', text);
+    await b.sync(); // commits 2 and 3 of the copy
+  }
+  a.fs.put('a.md', 'from A\n');
+  await a.sync(); // commit 2 of the original
+
+  const tap = new Tap(copy);
+  toA.target = tap;
+  a.fs.put('a.md', 'from A, again\n');
+  const e = await failure(a.sync()); // commit 3 is taken, and commit 2 below it is not A's
+  assert.ok(e instanceof HistoryError);
+  assert.deepEqual(tap.deletes, []);
+  assert.deepEqual(logs(copy), [1, 2, 3].map((n) => key('log', n)));
+  assert.deepEqual((await b.sync()).errors, []);
+  assert.deepEqual((await b.engine.verify()).problems, []);
+});
+
+test('a commit whose predecessor cannot be read is kept: only a commit found missing or different takes it back', async () => {
+  const clock = { now: 1_800_000_000_000 };
+  const mem = new MemoryStore(() => clock.now);
+  const tap = new Tap(mem);
+  const a = new Device('A', tap, clock);
+  const edit = async (text: string) => {
+    a.fs.put('n.md', text);
+    return a.sync();
+  };
+  await edit('1\n');
+  await edit('2\n');
+
+  // The read fails while the write goes through.
+  tap.hook = (op, k) => {
+    if (op === 'get' && k === key('log', 2)) throw new Error('injected: request failed');
+  };
+  assert.equal((await edit('3\n')).commits, 1);
+  assert.ok(mem.objects.has(key('log', 3)));
+
+  // The read finds something that does not open, which says nothing of whether the log was replaced.
+  tap.hook = undefined;
+  mem.objects.get(key('log', 3))!.data[30] ^= 1;
+  assert.equal((await edit('4\n')).commits, 1);
+  assert.deepEqual(tap.deletes, []);
+  assert.deepEqual(logs(mem), [1, 2, 3, 4].map((n) => key('log', n)));
+});
+
+test('a compaction move written onto a log cut back meanwhile is taken back', async () => {
+  const clock = { now: 1_800_000_000_000 };
+  const mem = new MemoryStore(() => clock.now);
+  const tap = new Tap(mem);
+  const a = new Device('A', tap, clock, { snapshotEvery: 10 });
+  for (let i = 0; i < 10; i++) {
+    a.fs.put(`n${i}.md`, `# Note ${i}\n\n${'Some text that is the same in every note. '.repeat(3)}\n${i}\n`);
+    await a.sync();
+    clock.now += HOUR;
+  }
+  clock.now += 2 * DAY;
+  // After cleanup has read the log, and before its move is written: storage loses the newest commit.
+  tap.hook = (op, k) => {
+    if (op !== 'put' || !k.startsWith('pack/')) return;
+    tap.hook = undefined;
+    mem.objects.delete(key('log', 10));
+  };
+  const e = await failure(a.engine.gc());
+  assert.ok(e instanceof HistoryError);
+  assert.match(e.message, /commit 10, the newest this device has seen, is missing/);
+  assert.deepEqual(tap.deletes, [key('log', 11)]);
+  assert.equal(logs(mem).at(-1), key('log', 9));
+});
+
+test('the commit and the read that checks the one before it are in flight together, so the check costs no extra round trip', async () => {
+  const clock = { now: 1_800_000_000_000 };
+  const tap = new Tap(new MemoryStore(() => clock.now));
+  tap.hook = () => new Promise((done) => setTimeout(done, 50));
+  const a = new Device('A', tap, clock);
+  a.fs.put('n.md', '1\n');
+  await a.sync();
+  a.fs.put('n.md', '2\n');
+  tap.peak = 0;
+  await a.sync();
+  assert.ok(tap.peak >= 2, `${tap.peak} request in flight`);
 });
 
 test('verify finds nothing wrong with a healthy vault, quick or deep, and changes nothing', async () => {
@@ -502,4 +779,47 @@ test('view brings the remote file table up to date for features that only read',
   assert.equal(v.now, 1_800_000_000_000);
   await b.sync();
   assert.equal(b.fs.text('m.md'), 'y\n');
+});
+
+test('storage that holds a vault\'s objects but not its vault.json is never given a new header, by sync, a new device or a device that only receives', async () => {
+  const { devices: [a, b], mem, net, clock } = setup(['A', 'B']);
+  a.fs.put('n.md', '1\n');
+  await a.sync();
+  await b.sync();
+  const header = mem.objects.get('vault.json')!;
+  mem.objects.delete('vault.json');
+  const before = [...mem.objects.keys()].sort();
+  net.reset();
+
+  a.fs.put('n.md', '2\n');
+  const message = /vault key file, vault\.json, is missing from storage.*Put it back from a backup or from bucket versioning; nothing was written/;
+  for (const d of [a, new Device('C', net, clock, a.config), new Device('R', net, clock, { ...a.config, readOnly: true })]) {
+    d.restart();
+    await assert.rejects(d.sync(), message, d.name);
+  }
+  assert.equal(net.stats.put + net.stats.delete, 0);
+  assert.deepEqual([...mem.objects.keys()].sort(), before, 'no new vault.json, and nothing else written');
+  assert.match(describeFailure(await failure(a.sync())).title, /damaged/, 'the plugin says the data is damaged and keeps this device\'s files');
+
+  // Which is also what the first step of setup finds, instead of a form for choosing a passphrase.
+  await assert.rejects(Repo.exists(net), message);
+
+  mem.objects.set('vault.json', header);
+  assert.equal((await a.sync()).pushed, 1);
+  assert.equal((await b.sync()).pulled, 1);
+  assert.equal(await Repo.exists(net), true);
+});
+
+test('storage with no vault at all still gets one, and opening a vault asks for no extra list', async () => {
+  const mem = new MemoryStore();
+  const lists: string[] = [];
+  const store: RemoteStore = { get: (k, r) => mem.get(k, r), put: (k, d, o) => mem.put(k, d, o), delete: (k) => mem.delete(k), list: (p, s) => (lists.push(p), mem.list(p, s)) };
+  assert.equal(await Repo.exists(store), false);
+  const create = { kdfIterations: 1000, chunk: { min: 4096, avg: 16384, max: 65536 } };
+  await Repo.open(store, 'a passphrase', create);
+  assert.ok(mem.objects.has('vault.json'));
+  assert.deepEqual(lists.sort(), ['log/', 'log/', 'pack/', 'pack/', 'snap/', 'snap/'], 'each of the three prefixes was looked at once for each of the two calls');
+  lists.length = 0;
+  await Repo.open(store, 'a passphrase', create);
+  assert.deepEqual(lists, []);
 });

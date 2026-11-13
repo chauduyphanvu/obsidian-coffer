@@ -1,7 +1,8 @@
 name: Release
 
 # Pushing a tag such as 0.1.0 (no "v": Obsidian looks the release up by the manifest's version) builds the plugin
-# and creates a draft release with the three files Obsidian installs. Publish the draft to ship it.
+# and the command-line bundle, and creates a draft release with the three files Obsidian installs and coffer.js.
+# Publish the draft to ship it.
 on:
   push:
     tags: ['*']
@@ -29,15 +30,19 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      - name: Run the command-line tests against the bundle
+        run: COFFER_CLI=dist/coffer.js node --test test/cli.test.ts
       # Signed build provenance, so anyone can check the release files came from this workflow and commit:
       # gh attestation verify main.js --repo chauduyphanvu/obsidian-coffer
+      # (the same works for coffer.js)
       - uses: actions/attest@v4
         with:
           subject-path: |
             dist/main.js
             dist/manifest.json
             dist/styles.css
+            dist/coffer.js
       - name: Create a draft release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes dist/main.js dist/manifest.json dist/styles.css
+        run: gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes dist/main.js dist/manifest.json dist/styles.css dist/coffer.js

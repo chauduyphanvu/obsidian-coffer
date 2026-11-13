@@ -118,5 +118,8 @@ if (import.meta.main) {
   }
   if ('chunkAvg' in args) config.chunk = { min: num('chunkAvg', 0) / 4, avg: num('chunkAvg', 0), max: num('chunkAvg', 0) * 4 };
   await run({ notes: num('notes', 2000), net: args.net ?? 'none', imageEvery: num('imageEvery', 50), largeFile: num('largeFile', 20e6), config });
-  if (num('grown', 600)) await grown({ commits: num('grown', 600), net: 'mobile', config });
+  if (num('grown', 600)) {
+    await grown({ commits: num('grown', 600), net: 'mobile', config });
+    await grown({ commits: num('grown', 600), net: 'mobile', config, autoClean: true });
+  }
 }

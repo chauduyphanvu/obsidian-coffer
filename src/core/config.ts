@@ -6,6 +6,10 @@ export interface SyncConfig {
   exclude: string[];
   /** Files larger than this are left alone. 0 means no limit. */
   maxFileSizeMB: number;
+  /** Files larger than this stay in storage until asked for with `SyncOptions.fetch`. 0 downloads everything. */
+  deferAboveMB: number;
+  /** Never writes to storage: local changes stay on this device. See `SyncResult.unsent`. */
+  readOnly: boolean;
   /** The app's settings folder. Its files are merged when two devices change them, never copied. */
   configDir: string;
   /** `merge`: three-way text merge, conflict copy when edits overlap. `copy`: always keep both. */
@@ -29,7 +33,7 @@ export interface SyncConfig {
   /** A sync that would delete more than both of these is refused unless forced. */
   maxDeleteCount: number;
   maxDeleteFraction: number;
-  /** Used only when a new remote vault is created. */
+  /** PBKDF2 iterations for a new remote vault, and the least a passphrase change re-wraps its key with. */
   kdfIterations: number;
   chunk: ChunkParams;
 }
@@ -39,8 +43,10 @@ export const DEFAULT_CONFIG: SyncConfig = {
   exclude: ['.coffer/**', '.obsidian/workspace*.json', '.trash/**', '.git/**', '.DS_Store'],
   configDir: '.obsidian',
   maxFileSizeMB: 500,
+  deferAboveMB: 0,
+  readOnly: false,
   conflictStrategy: 'merge',
-  mergeExtensions: ['md', 'markdown', 'txt'],
+  mergeExtensions: ['md', 'markdown', 'txt', 'canvas'],
   compression: true,
   packTargetBytes: 4 << 20,
   packMaxBlobBytes: 64 << 10,

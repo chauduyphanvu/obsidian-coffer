@@ -4,7 +4,7 @@ Sync your Obsidian vault between your devices through storage you own: an S3-com
 
 Coffer runs on desktop and mobile, keeps a version history of every file, merges edits made on two devices, and can bring back deleted files or a whole folder as it was at an earlier time.
 
-> Coffer is young (0.2). It is covered by 272 tests and has been run on macOS and iOS, but keep a backup of a vault you care about while you try it.
+> Coffer is young (0.3). It is covered by 404 tests and has been run on macOS and iOS, but keep a backup of a vault you care about while you try it.
 
 ## What you need to know first
 
@@ -17,9 +17,9 @@ Coffer runs on desktop and mobile, keeps a version history of every file, merges
 
 - **End-to-end encryption.** AES-256-GCM, with keys derived from your passphrase. File names, folder names, contents and device names are all encrypted.
 - **Efficient transfers.** Files are split into content-defined chunks, so an edit to a large file uploads only the changed part. Identical chunks are stored once, text is compressed before encryption, and small chunks are packed into larger objects so a new device needs few requests to download a vault.
-- **Merges, not overwrites.** A note edited on two devices is merged line by line. Settings files are merged key by key. When a merge is not possible, both versions are kept side by side, and a resolver walks you through the differences.
+- **Merges, not overwrites.** A note edited on two devices is merged line by line, and word by word inside a paragraph; its properties are merged key by key. Canvases are merged node by node, and settings files key by key. When a merge is not possible, both versions are kept side by side, and a resolver walks you through the differences.
 - **History and restore.** Every version is kept for a day, then hourly states for a week, then daily states for the retention window (30 days by default). You can restore a version of a file, bring back deleted files, or return a folder or the whole vault to an earlier time, with a preview of what will change.
-- **Safety checks.** A sync that would delete more than 10 files and half the vault stops and asks first. Each change is chained to the one before it, so a device notices if storage was rolled back or tampered with. A "Check synced data for damage" command checks the stored data end to end.
+- **Safety checks.** A sync that would delete more than 10 files and half the vault stops and asks first. Each change is chained to the one before it, so a device notices if storage was rolled back or tampered with. A "Check synced data for damage" command checks the stored data end to end, and "Repair synced data" stores again, from the files on a device that has them, whatever it finds missing.
 - **Shared folders.** Share one folder with someone else, or with another of your vaults: it gets its own storage and passphrase, and others join through an invite link.
 - **Made for phones too.** Setup works from a phone, a new device joins by opening a setup link, and edits are sent before the app is suspended.
 - **Clear status.** The status bar says when the vault last synced; a problems screen says plainly what is wrong and what to do.
@@ -40,7 +40,7 @@ By hand: download `main.js`, `manifest.json` and `styles.css` from the [latest r
 1. Create a bucket (or a WebDAV folder) and a key for it. See [Storage providers](#storage-providers).
 2. In Obsidian, open the command palette and run **Coffer: Set up sync**, or click the notice that appears after enabling the plugin.
 3. Choose **This is my first device**, pick your provider and fill in its details. Coffer checks that the storage works before going on.
-4. Choose a passphrase of at least 8 characters, and save it in your password manager.
+4. Choose a passphrase of at least 8 characters, or tap **Suggest a passphrase** for a random one (five groups of four letters and digits), and save it in your password manager.
 5. The first sync uploads the vault. When it is done, click **Copy setup link**.
 
 ### More devices
@@ -48,13 +48,13 @@ By hand: download `main.js`, `manifest.json` and `styles.css` from the [latest r
 1. Install Coffer on the device, ideally in a new, empty vault.
 2. Open the setup link there (or run **Set up sync**, choose **I already sync another device** and paste it), enter the passphrase, and click **Connect**.
 
-The setup link carries the storage address and keys, encrypted with your passphrase. Treat it like a password. You can copy it again later under **Settings → Coffer → Add another device**.
+The setup link carries the storage address and keys, encrypted with your passphrase. Treat it like a password. You can copy it again later under **Settings → Coffer → Add another device**. A link takes a moment to prepare, because it is sealed as strongly as the vault key (see [How it works](#how-it-works)). A link made by this version does not open in Coffer 0.2 or earlier, including the 0.1.0 that an Obsidian older than 1.13.1 gets; on such a device, join or update by choosing **This is my first device**, entering the storage details by hand and then the passphrase. Links made by those versions still open here.
 
 Keep a vault in one sync tool only: don't put a Coffer vault inside iCloud Drive, Dropbox or OneDrive, or run Obsidian Sync on it at the same time.
 
 ## Storage providers
 
-Use a key that can reach only the bucket you sync to.
+Use a key that can reach only the bucket you sync to. A device that only receives changes (see [What syncs](#what-syncs)) can use a key that may only read.
 
 | Provider | What Coffer asks for |
 | --- | --- |
@@ -85,6 +85,8 @@ Turning on versioning for the bucket, with a rule that deletes old versions afte
 - Every file in the vault up to the size limit (500 MB on desktop, 200 MB on mobile by default). Larger files stay on their device and are listed as problems.
 - The settings folder (settings, themes and plugins), except the workspace layout. This can be turned off under **Settings → Coffer**. Because plugins sync, installing or updating a plugin on one device brings it to the others.
 - Not synced: names starting with a dot (other than the settings folder), which Obsidian cannot see, and anything matching the patterns under **Leave out**.
+- **Download only when asked** (off by default). Under **Settings → Coffer → What to sync**, set a size above which files stay in storage and take no room on this device, as on a phone. The command **Download a file left in storage** lists them, and choosing one downloads and opens it. A downloaded file syncs like any other, and this device never deletes a file it has not downloaded.
+- **Only receive changes** (off by default, per vault and per shared folder), for a device that must never write to storage, as when its keys can only read. What you edit or add there stays there and is listed as not sent; where storage changes the same file, the two are merged, or this device's version is kept beside it; a file you delete there comes back from storage. Turn it on under **Settings → Coffer → Storage and passphrase**, or when you join. The command-line tool takes `"readOnly": true` under `sync`, and then refuses `clean`, `repair`, `restore`, `restore-at` and `change-passphrase`.
 
 Coffer syncs when Obsidian starts, a few seconds after an edit, every few minutes, and sooner when it notices another device has synced. All of these can be changed in settings.
 
@@ -98,27 +100,31 @@ Coffer syncs when Obsidian starts, a few seconds after an edit, every few minute
 | Sync now, allowing large deletions in the vault | Goes ahead with a sync the safety check stopped |
 | Check storage connection | Tests that the storage supports everything Coffer needs |
 | Show version history of the current file | Lists stored versions, with a diff, and restores one |
+| Download a file left in storage | Lists the files kept in storage by the size setting, and downloads the one you choose |
 | Restore deleted files | Lists deleted files that can still be brought back |
 | Restore the vault or a folder to an earlier time | Previews and applies a point-in-time restore |
 | Resolve a file changed on two devices | Walks through a conflict copy line by line |
 | Check synced data for damage | Verifies the stored data end to end |
-| Delete expired versions from storage | Runs the cleanup now (it also runs weekly) |
+| Repair synced data from this device's files | Stores again what the check found missing or damaged, from the files on this device |
+| Delete expired versions from storage | Runs the cleanup now (it also runs weekly, and after a day when storage has filled up with many small objects) |
 
 ## How it works
 
-- **Storage layout.** `vault.json` holds the vault key, wrapped with a key derived from your passphrase (PBKDF2-SHA-256, 600,000 iterations). It is the only object stored unencrypted, and it reveals nothing but the salt and iteration count. Changes are stored as numbered commits (`log/`), with periodic snapshots of the whole file table (`snap/`), and file contents live in encrypted packs (`pack/`).
+- **Storage layout.** `vault.json` holds the vault key, wrapped with a key derived from your passphrase (PBKDF2-SHA-256, 600,000 iterations for a new vault; setup links and invites are sealed at that cost too, or the vault's own if it is higher). It is the only object stored unencrypted, and it reveals nothing but the salt and iteration count. Changes are stored as numbered commits (`log/`), with periodic snapshots of the whole file table (`snap/`), and file contents live in encrypted packs (`pack/`).
 - **Keys.** Separate keys for encryption and for chunk IDs are derived from the vault key. Chunk IDs are keyed hashes, so storage cannot check whether you hold a particular file.
 - **Commits.** Commits are numbered, and each is written only if its number is still free, so two devices can never overwrite each other's changes. Each commit includes a hash of the one before it.
 - **What the storage provider can see:** how many objects there are, their sizes, and when they are written. Nothing else.
-- **Changing the passphrase** re-wraps the vault key; nothing else is re-uploaded. Other devices ask for the new passphrase on their next sync.
+- **Changing the passphrase** re-wraps the vault key; nothing else is re-uploaded. Other devices ask for the new passphrase on their next sync. A vault made with fewer than 600,000 iterations is raised to that cost at the same time, and a higher cost is never lowered; entering the current passphrase again does only that.
 
 ## Command line
 
-The same engine runs from Node.js 22.18 or later, for an always-on computer that keeps a copy in sync. It is not part of the plugin release; clone this repository and run `npm ci` first.
+The same engine runs from Node.js 22.18 or later, for an always-on computer that keeps a copy in sync. Download `coffer.js` from the release and run it; it is one file with nothing to install. If Node stops with `Cannot use import statement outside a module`, a nearby `package.json` says `"type": "commonjs"`: rename the file to `coffer.mjs`, which Node always reads as a module.
 
 ```sh
-npm run cli -- watch --config=coffer.json
+node coffer.js watch --config=coffer.json
 ```
+
+To check that the file was built by this repository's release workflow, run `gh attestation verify coffer.js --repo chauduyphanvu/obsidian-coffer`. From a clone, `npm ci` and then `npm run cli -- watch --config=coffer.json` run the same code.
 
 `coffer.json`:
 
@@ -130,19 +136,21 @@ npm run cli -- watch --config=coffer.json
 }
 ```
 
-Secrets come from the environment: `COFFER_PASSPHRASE`, and `COFFER_ACCESS_KEY` with `COFFER_SECRET_KEY` for S3, or `COFFER_WEBDAV_PASSWORD` for WebDAV. Other commands: `sync`, `check`, `history`, `restore`, `deleted`, `log`, `restore-at`, `verify`, `clean`, `change-passphrase` and `accept-storage`. Run `npm run cli` for details.
+Secrets come from the environment: `COFFER_PASSPHRASE` (at least 8 characters to make a new vault, and the same for `COFFER_NEW_PASSPHRASE`), and `COFFER_ACCESS_KEY` with `COFFER_SECRET_KEY` for S3, or `COFFER_WEBDAV_PASSWORD` for WebDAV. Other commands: `sync`, `fetch`, `check`, `history`, `restore`, `deleted`, `log`, `restore-at`, `verify`, `repair`, `clean`, `change-passphrase` and `accept-storage`. Run `node coffer.js --help` (from a clone, `npm run cli`) for details, and `--version` for the version.
+
+To keep large files off this machine, set `deferAboveMB` under `sync` to a size in MB: files above it stay in storage, `sync` lists them as not downloaded, and `fetch <path>...` downloads the ones you name, after which they sync like any other file.
 
 ## Known limitations
 
-- If objects are deleted from storage by something other than Coffer, **Check synced data for damage** reports which files are affected, but there is no repair command yet.
-- If storage is put back to an older copy while a device is running, that device can take up to an hour to notice, and may sync on top of the older copy meanwhile.
+- If objects are deleted from storage by something other than Coffer, **Check synced data for damage** reports which files are affected, and **Repair synced data** stores them again from a device that still has those files. What no device has any more cannot be recovered, and neither can an earlier version that no current file shares data with.
+- If storage is put back to an older copy, a device notices when it next sends a change, and at once takes back the one change it sent, or within an hour if it has nothing to send, as a device that only receives never does.
 - In the device list, another device's "changes behind" count can be up to 30 minutes old.
 
 ## Build from source
 
 ```sh
 npm ci
-npm run build      # dist/main.js, dist/manifest.json, dist/styles.css
+npm run build      # dist/main.js, dist/manifest.json, dist/styles.css, dist/coffer.js
 npm test
 ```
 

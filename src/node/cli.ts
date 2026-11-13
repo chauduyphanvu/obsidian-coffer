@@ -3,18 +3,23 @@ import { readFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DEFAULT_CONFIG, resolveConfig, type SyncConfig } from '../core/config.ts';
+import { MIN_PASSPHRASE } from '../core/crypto.ts';
 import { heartbeatDue, writeHeartbeat } from '../core/devices.ts';
 import { HistoryError, SafetyError, SyncEngine, type SyncResult } from '../core/engine.ts';
 import { vaultKey } from '../core/paths.ts';
+import { Repo } from '../core/repo.ts';
 import { errorText, plural } from '../core/text.ts';
 import { TooOldError, listCommits, listDeleted, planRestore, tableAt } from '../core/timeline.ts';
 import type { RemoteStore } from '../core/types.ts';
-import { applyRestore, countSteps, deleteLimitCrossed, keepOut, restoreSteps, sizeLabel, unsent } from '../plugin/restore.ts';
+import { applyRestore, countSteps, deleteLimitCrossed, keepDeferred, keepOut, leftNote, restoreSteps, sizeLabel, unsent } from '../plugin/restore.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
 import type { S3Config } from '../stores/s3.ts';
 import { FileState, FolderStore, NodeFS } from './nodefs.ts';
 import { SyncLoop, watchVault } from './watch.ts';
+
+/** Set at build time in dist/coffer.js; undefined when this file runs from source. */
+declare const COFFER_VERSION: string | undefined;
 
 interface CliConfig {
   vault: string;
@@ -25,9 +30,13 @@ interface CliConfig {
   sync?: Partial<SyncConfig>;
 }
 
-const USAGE = `Usage: node src/node/cli.ts <command> [--config=coffer.json]
+const USAGE = `Usage: node coffer.js <command> [--config=coffer.json]
+       node coffer.js --help | --version
 
   sync [--force]         sync the vault once
+  fetch <path>...        download files that sync.deferAboveMB leaves in storage: set it under "sync" in
+                         coffer.json to a size in MB above which files are not downloaded (0, the default,
+                         downloads everything); sync lists the ones left, and one fetched syncs like any other
   watch                  sync, then keep syncing until stopped; --poll=30 seconds between checks for
                          remote changes, --interval=300 seconds between full syncs
   check                  test that the remote storage supports everything sync needs
@@ -42,10 +51,16 @@ const USAGE = `Usage: node src/node/cli.ts <command> [--config=coffer.json]
                          when device clocks disagree); syncs first, prints what changes, changes it,
                          leaving alone any file with changes that sync could not send, and syncs
                          again to send it, no --force needed for the files it removes
-  verify [--deep]        check the stored data end to end without changing it; --deep also
-                         downloads and checks everything the current files are stored in
+  verify [--deep]        check the stored data end to end without changing it, including that the data of the
+                         earlier versions history offers is still stored; --deep also downloads and checks
+                         everything the current files are stored in
+  repair [--deep]        store again, from the files in this vault, the data a verify finds missing
+                         or damaged, so other devices can download those files; --deep also finds
+                         damaged data inside packs that are there. Exits 1 if some files could not
+                         be repaired, as when this vault does not have them: run it where they are
   clean                  delete versions older than the retention window from storage
-  change-passphrase      re-protect the vault key with COFFER_NEW_PASSPHRASE
+  change-passphrase      re-protect the vault key with COFFER_NEW_PASSPHRASE (8 characters or more), at the
+                         cost sync.kdfIterations sets in coffer.json if that is higher than the vault's now
   accept-storage         when sync stops because the history in storage is not the one this device
                          saw (part of it taken back or replaced), carry on from storage as it is now,
                          then sync: nothing is deleted, and where files differ both versions are kept.
@@ -55,9 +70,13 @@ const USAGE = `Usage: node src/node/cli.ts <command> [--config=coffer.json]
 Secrets come from the environment: COFFER_PASSPHRASE, and for S3
 COFFER_ACCESS_KEY and COFFER_SECRET_KEY, for WebDAV COFFER_WEBDAV_PASSWORD.`;
 
-/** Each command's options besides --config. */
+/** The options that take a value, as `--name=value` or `--name value`; every other option takes none. */
+const VALUED = ['config', 'poll', 'interval', 'limit'];
+
+/** Each command's options besides --config (and --help and --version, which stop any command). */
 const OPTIONS: Record<string, string[]> = {
   sync: ['force'],
+  fetch: [],
   watch: ['poll', 'interval'],
   check: [],
   history: [],
@@ -66,17 +85,32 @@ const OPTIONS: Record<string, string[]> = {
   log: ['limit'],
   'restore-at': ['dry-run'],
   verify: ['deep'],
+  repair: ['deep'],
   clean: [],
   'change-passphrase': [],
   'accept-storage': [],
 };
 
+/** What a device with sync.readOnly cannot do, as each command's reason: they write to storage, or to files it would never send. */
+const WRITES: Record<string, string> = {
+  clean: 'it does not clean up storage',
+  repair: 'it cannot store data in storage again',
+  restore: 'a restored file would never be sent',
+  'restore-at': 'a restore would never be sent',
+  'change-passphrase': 'it cannot change the passphrase in storage',
+};
+
 const STATE_DIR = '.coffer';
 const FORCE_HINT = 'to delete them anyway, run sync --force';
+const READ_ONLY_HINT = 'if these keys may only read, set "readOnly": true under "sync" in the config file, so this device only receives';
 const ACCEPT_HINT = 'if storage was put back to a backup or an older copy on purpose, run accept-storage to carry on from it as it is now';
 const WATCH_SETTLE_MS = 3000;
 /** Node's names for systems, as the devices list shows them. */
 const SYSTEMS: Record<string, string> = { darwin: 'macOS', win32: 'Windows', linux: 'Linux' };
+
+/** Set once the config is read: a refusal to write only suggests `readOnly` to a device that does write. */
+let receivesOnly = false;
+const refusedWriting = (e: unknown) => !receivesOnly && /HTTP 403\b|AccessDenied/.test(errorText(e));
 
 const env = (name: string) => {
   const v = process.env[name];
@@ -91,12 +125,82 @@ function makeStore(remote: CliConfig['remote'], firstRun: boolean): RemoteStore 
   return openRemote({ ...remote, pathStyle: remote.pathStyle ?? true, prefix: remote.prefix ?? '', accessKey: env('COFFER_ACCESS_KEY'), secretKey: env('COFFER_SECRET_KEY') });
 }
 
+const version = async () =>
+  typeof COFFER_VERSION === 'string' ? COFFER_VERSION : (JSON.parse(await readFile(new URL('../../manifest.json', import.meta.url), 'utf8')) as { version: string }).version;
+
+const REMOTE_FIELDS: Record<string, string[]> = { s3: ['endpoint', 'bucket'], webdav: ['url', 'username'], folder: ['path'] };
+
+/** Why `c`, parsed from the config file, cannot be a config, in words that follow "config file <path>". */
+function configProblem(c: unknown): string | undefined {
+  if (typeof c !== 'object' || c === null || Array.isArray(c)) return 'must hold a JSON object';
+  const { vault, remote, sync } = c as Record<string, unknown>;
+  if (typeof vault !== 'string' || !vault) return 'needs "vault", the path of the folder to sync';
+  if (sync !== undefined) {
+    if (typeof sync !== 'object' || sync === null || Array.isArray(sync)) return 'needs "sync" to be a JSON object';
+    // A misspelt key would otherwise be dropped in silence: "readonly" would leave a device sending its changes.
+    for (const [key, value] of Object.entries(sync)) {
+      if (!Object.hasOwn(DEFAULT_CONFIG, key)) return `has "sync.${key}", which is not a setting`;
+      const like = DEFAULT_CONFIG[key as keyof SyncConfig];
+      const fits = Array.isArray(like)
+        ? Array.isArray(value) && value.every((v) => typeof v === 'string')
+        : typeof like === 'number'
+          ? typeof value === 'number' && Number.isFinite(value) && value >= 0
+          : typeof value === typeof like && value !== null && !Array.isArray(value);
+      if (!fits) return `needs "sync.${key}" to be ${Array.isArray(like) ? 'a list of texts' : typeof like === 'number' ? 'a number, 0 or more' : typeof like === 'boolean' ? 'true or false' : typeof like === 'string' ? 'a text' : 'a JSON object'}`;
+    }
+  }
+  if (typeof remote !== 'object' || remote === null) return 'needs "remote", saying where the vault is stored';
+  const { type } = remote as Record<string, unknown>;
+  const fields = typeof type === 'string' && Object.hasOwn(REMOTE_FIELDS, type) ? REMOTE_FIELDS[type] : undefined;
+  if (!fields) return 'needs "remote.type" to be s3, webdav or folder';
+  const missing = fields.find((f) => typeof (remote as Record<string, unknown>)[f] !== 'string');
+  return missing && `needs "remote.${missing}"`;
+}
+
+/** The storage, for a line that says what is being watched. */
+function describeRemote(remote: CliConfig['remote']): string {
+  if (remote.type === 'folder') return `folder ${resolve(remote.path)}`;
+  if (remote.type === 'webdav') return `WebDAV ${remote.url}`;
+  return `S3 bucket ${remote.bucket}${remote.prefix ? `/${remote.prefix}` : ''} at ${remote.endpoint}`;
+}
+
+/** `--name[=value]` options and the words around them. A value option may take its value as the next word. */
+function parseArgs(argv: string[]): { flags: Map<string, string | undefined>; words: string[]; error?: string } {
+  const flags = new Map<string, string | undefined>();
+  const words: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (!arg.startsWith('--')) {
+      words.push(arg);
+      continue;
+    }
+    const eq = arg.indexOf('=');
+    const name = eq < 0 ? arg.slice(2) : arg.slice(2, eq);
+    let value = eq < 0 ? undefined : arg.slice(eq + 1);
+    if (flags.has(name)) return { flags, words, error: `--${name} is given twice` };
+    if (VALUED.includes(name)) {
+      value ??= argv[++i];
+      if (!value || value.startsWith('--')) return { flags, words, error: `--${name} needs a value, as --${name}=<value>` };
+    }
+    flags.set(name, value);
+  }
+  return { flags, words };
+}
+
 const summary = (r: SyncResult) => `sent ${r.pushed}, received ${r.pulled}, deleted ${r.deletedLocal} here and ${r.deletedRemote} remotely, merged ${r.merged}`;
 
-function report(r: SyncResult, at = ''): void {
+/** What a sync left alone, as the lines that say so. */
+const leftAlone = (r: SyncResult) => [
+  ...r.tooLarge.map((path) => `not synced, over the size limit: ${path}`),
+  ...r.unsent.map((path) => `not sent, this device only receives: ${path}`),
+  ...r.deferred.map((path) => `not downloaded, over sync.deferAboveMB (run fetch to download): ${path}`),
+];
+
+/** `notes` is which of the lines about what the sync left alone to print: all, unless the caller says them only once. */
+function report(r: SyncResult, at = '', notes = leftAlone(r)): void {
   console.log(`${at}${summary(r)}`);
   for (const copy of r.conflictCopies) console.log(`${at}both versions kept: ${copy}`);
-  for (const path of r.tooLarge) console.error(`${at}not synced, over the size limit: ${path}`);
+  for (const line of notes) console.error(`${at}${line}`);
   for (const e of r.errors) console.error(`${at}failed: ${e.path}: ${e.message}`);
 }
 
@@ -127,10 +231,12 @@ async function restoreAt(engine: SyncEngine, fs: NodeFS, when: string, folder: s
   const past = await tableAt(v.repo, v.st.remote, v.st.lastSeq, v.cfg, v.now, at).catch((e: unknown) => {
     throw e instanceof TooOldError ? new Error(`${when} is too far back; the earliest time that can be restored is ${iso(e.earliest.time)} (number ${e.earliest.seq})`) : e;
   });
-  const { steps } = restoreSteps(planRestore(v.st.remote, past.files, folder), v.st.remote, keepOut(v.cfg.exclude, []));
+  const kept = await keepDeferred(keepOut(v.cfg.exclude, []), engine);
+  const { steps, left } = restoreSteps(planRestore(v.st.remote, past.files, folder), v.st.remote, kept);
   const scope = folder ? `${vaultKey(folder).replace(/\/+$/, '')}/` : 'the vault';
   console.log(`${scope} as of ${iso(past.commit.time)}, synced by ${past.commit.device}:`);
   for (const s of steps) console.log(`  ${STEP[s.kind].padEnd(10)}  ${s.path}`);
+  if (left) console.log(leftNote(left));
   const c = countSteps(steps);
   if (!steps.length) {
     console.log('nothing to do: it already matches');
@@ -175,9 +281,20 @@ async function restoreAt(engine: SyncEngine, fs: NodeFS, when: string, folder: s
 }
 
 async function main(): Promise<number> {
-  const argv = process.argv.slice(2);
-  const flags = new Map(argv.filter((a) => a.startsWith('--')).map((a): [string, string] => [a.slice(2).split('=')[0], a.split('=')[1] ?? '']));
-  const [command, ...rest] = argv.filter((a) => !a.startsWith('--'));
+  const { flags, words, error } = parseArgs(process.argv.slice(2));
+  if (error) {
+    console.error(error);
+    return 2;
+  }
+  const [command, ...rest] = words;
+  if (flags.has('help') || command === 'help') {
+    console.log(USAGE);
+    return 0;
+  }
+  if (flags.has('version')) {
+    console.log(await version());
+    return 0;
+  }
   if (!command) {
     console.log(USAGE);
     return 2;
@@ -192,35 +309,55 @@ async function main(): Promise<number> {
     console.error(`unknown option for ${command}: ${unknown.map((f) => `--${f}`).join(', ')}`);
     return 2;
   }
-  const configFile = flags.get('config') || 'coffer.json';
+  const stray = [...flags].find(([name, value]) => value !== undefined && !VALUED.includes(name));
+  if (stray) {
+    console.error(`--${stray[0]} takes no value`);
+    return 2;
+  }
+  const configFile = flags.get('config') ?? 'coffer.json';
   const cli = await readFile(configFile, 'utf8').then(
     (text) => {
+      let parsed: unknown;
       try {
-        return JSON.parse(text) as CliConfig;
+        parsed = JSON.parse(text);
       } catch (e) {
         throw new Error(`config file ${resolve(configFile)} is not valid JSON: ${errorText(e)}`);
       }
+      const problem = configProblem(parsed);
+      if (problem) throw new Error(`config file ${resolve(configFile)} ${problem}`);
+      return parsed as CliConfig;
     },
     (e: NodeJS.ErrnoException) => {
       throw e.code === 'ENOENT' ? new Error(`config file ${resolve(configFile)} not found; pass --config=<file>`) : e;
     },
   );
+  receivesOnly = !!cli.sync?.readOnly;
+  // restore-at --dry-run only reads, so a device that only receives may look at what a restore would do.
+  if (cli.sync?.readOnly && WRITES[command] && !(command === 'restore-at' && flags.has('dry-run'))) {
+    console.error(`this device only receives changes, so ${WRITES[command]}; run ${command} from a device that sends them`);
+    return 1;
+  }
   const vault = resolve(cli.vault);
   const stateFile = join(vault, STATE_DIR, 'state.json');
   const store = makeStore(cli.remote, !existsSync(stateFile));
 
   if (command === 'check') {
-    const report = await checkStore(store);
+    const report = await checkStore(store, !!cli.sync?.readOnly);
     for (const c of report.checks) console.log(`${c.ok ? 'ok  ' : 'FAIL'} ${c.name}${c.detail ? `: ${c.detail}` : ''}`);
     return report.ok ? 0 : 1;
   }
 
+  const passphrase = env('COFFER_PASSPHRASE');
+  // Opening empty storage makes a vault, so a short passphrase is refused there. Only a short one pays the request to look.
+  if (passphrase.length < MIN_PASSPHRASE && !receivesOnly && !(await Repo.exists(store))) {
+    throw new Error(`a new vault needs a passphrase of at least ${MIN_PASSPHRASE} characters, and COFFER_PASSPHRASE has ${passphrase.length}`);
+  }
   const fs = new NodeFS(vault);
   const engine = new SyncEngine({
     fs,
     store,
     stateStore: new FileState(stateFile),
-    passphrase: env('COFFER_PASSPHRASE'),
+    passphrase,
     config: resolveConfig({
       deviceName: hostname().split('.')[0],
       ...cli.sync,
@@ -231,9 +368,9 @@ async function main(): Promise<number> {
   });
 
   const heartbeat = async () => {
+    if (cli.sync?.readOnly) return;
     try {
-      const { version } = JSON.parse(await readFile(new URL('../../manifest.json', import.meta.url), 'utf8')) as { version: string };
-      await writeHeartbeat(await engine.view(), { platform: `CLI on ${SYSTEMS[process.platform] ?? process.platform}`, version });
+      await writeHeartbeat(await engine.view(), { platform: `CLI on ${SYSTEMS[process.platform] ?? process.platform}`, version: await version() });
     } catch (e) {
       console.error(`could not record this device's heartbeat: ${errorText(e)}`);
     }
@@ -255,6 +392,7 @@ async function main(): Promise<number> {
     const intervalMs = seconds('interval', 300);
     const stamp = () => new Date().toISOString();
     let lastBeat = 0;
+    let lastLeft = new Set<string>();
     const loop = new SyncLoop({
       sync: async () => {
         const r = await engine.sync();
@@ -266,13 +404,19 @@ async function main(): Promise<number> {
       },
       remoteChanged: () => engine.remoteChanged(),
       onResult: (r) => {
-        if (didSomething(r)) report(r, `${stamp()} `);
+        // A file left alone is said once, when it first is, not at every sync that leaves it alone again.
+        const left = leftAlone(r);
+        const fresh = left.filter((line) => !lastLeft.has(line));
+        lastLeft = new Set(left);
+        if (didSomething(r)) report(r, `${stamp()} `, fresh);
+        else for (const line of fresh) console.error(`${stamp()} ${line}`);
       },
       onFailure: (e, retryMs) => {
         const message = errorText(e);
         console.error(`${stamp()} ${e instanceof SafetyError ? `${message} Not retrying until something changes.` : `sync failed: ${message}; retrying in ${retryMs! / 1000}s`}`);
         if (e instanceof SafetyError) console.error(`${stamp()} ${FORCE_HINT}`);
         if (e instanceof HistoryError) console.error(`${stamp()} ${ACCEPT_HINT}`);
+        if (refusedWriting(e)) console.error(`${stamp()} ${READ_ONLY_HINT}`);
       },
       debounceMs: WATCH_SETTLE_MS,
       pollMs,
@@ -283,11 +427,26 @@ async function main(): Promise<number> {
     const signalled = new Promise<void>((done) => {
       for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => done());
     });
+    console.log(
+      `${stamp()} watching ${vault} against ${describeRemote(cli.remote)}${receivesOnly ? ', receive only' : ''}; ` +
+        `checking for changes every ${pollMs / 1000}s and syncing everything every ${intervalMs / 1000}s`,
+    );
     loop.start();
     await signalled;
     watcher.close();
     await loop.stop();
     return 0;
+  }
+  if (command === 'fetch' && rest.length) {
+    const left = new Set((await engine.deferred()).map((f) => f.path));
+    const not = rest.filter((path) => !left.has(vaultKey(path)));
+    if (not.length) {
+      console.error(`cannot fetch ${not.join(', ')}: not a file left in storage by sync.deferAboveMB; nothing was downloaded`);
+      return 1;
+    }
+    const r = await engine.sync({ fetch: rest });
+    report(r);
+    return r.errors.length ? 1 : 0;
   }
   if (command === 'history' && rest[0]) {
     const versions = await engine.history(vaultKey(rest[0]));
@@ -333,13 +492,30 @@ async function main(): Promise<number> {
     for (const p of r.problems) {
       console.log(`problem: ${p.message}${p.object ? ` (${p.object})` : ''}`);
       for (const path of p.paths ?? []) console.log(`  affects ${path}`);
+      for (const path of p.earlier ?? []) console.log(`  earlier versions of ${path} cannot be restored`);
     }
     const deep = r.deep ? `, ${plural(r.chunks, 'chunk')} (${(r.bytes / 1e6).toFixed(1)} MB downloaded)` : '';
     console.log(`checked ${plural(r.commits, 'commit')}, ${plural(r.files, 'file')}, ${plural(r.packs, 'pack')}${deep}: ${r.problems.length ? plural(r.problems.length, 'problem') : 'no problems'}`);
     return r.problems.length ? 1 : 0;
   }
+  if (command === 'repair') {
+    const deep = flags.has('deep');
+    const r = await engine.repair({ deep });
+    for (const path of r.repaired) console.log(`repaired: ${path}`);
+    for (const path of r.unrepaired) console.error(`still missing: ${path}`);
+    for (const path of r.historyOnly) console.log(`earlier versions cannot be restored: ${path}`);
+    const lost = r.historyOnly.length ? `, ${plural(r.historyOnly.length, 'file')} with earlier versions that cannot be restored` : '';
+    console.log(
+      r.repaired.length || r.unrepaired.length || r.historyOnly.length
+        ? `repaired ${plural(r.repaired.length, 'file')} (${plural(r.chunks, 'chunk')} stored again), ${r.unrepaired.length} still missing${lost}`
+        : `nothing to repair: every stored object is present and whole in size${deep ? ', and the contents the current files use were read and are intact' : ' (repair --deep reads their contents)'}`,
+    );
+    return r.unrepaired.length ? 1 : 0;
+  }
   if (command === 'change-passphrase') {
-    await engine.changePassphrase(env('COFFER_NEW_PASSPHRASE'));
+    const next = env('COFFER_NEW_PASSPHRASE');
+    if (next.length < MIN_PASSPHRASE) throw new Error(`a new passphrase needs at least ${MIN_PASSPHRASE} characters, and COFFER_NEW_PASSPHRASE has ${next.length}`);
+    await engine.changePassphrase(next);
     console.log('passphrase changed; update it on every device');
     return 0;
   }
@@ -373,6 +549,7 @@ main().then(
     console.error(errorText(e));
     if (e instanceof HistoryError) console.error(ACCEPT_HINT);
     if (e instanceof SafetyError) console.error(FORCE_HINT);
+    if (refusedWriting(e)) console.error(READ_ONLY_HINT);
     process.exit(1);
   },
 );

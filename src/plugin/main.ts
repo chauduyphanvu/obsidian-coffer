@@ -2,7 +2,7 @@ import { Notice, Platform, Plugin, TFile, TFolder, TextFileView, debounce, setIc
 import { pool } from '../core/bytes.ts';
 import type { SyncConfig } from '../core/config.ts';
 import { forgetDevice, heartbeatDue, writeHeartbeat } from '../core/devices.ts';
-import { SafetyError, type GcResult, type SyncEngine, type SyncResult } from '../core/engine.ts';
+import { SafetyError, type GcResult, type RepairOptions, type RepairReport, type SyncEngine, type SyncResult } from '../core/engine.ts';
 import { fileName, vaultKey } from '../core/paths.ts';
 import type { Repo } from '../core/repo.ts';
 import type { ScopedFS } from '../core/scopedfs.ts';
@@ -12,10 +12,12 @@ import type { Entry, Version } from '../core/types.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
 import { ChangeLog, fromEvents, type Why } from './changes.ts';
+import { chooseDeferred } from './deferred.ts';
 import { ObsidianFS, PluginState, lookup, obsidianHttp } from './obsidianfs.ts';
 import { Pauses, Retries, nextPollDelay, pollPlaces, receivedChanges } from './polling.ts';
 import {
   cleanupDue,
+  codeIterations,
   decodeSetupCode,
   defaultSettings,
   encodeSetupCode,
@@ -34,14 +36,16 @@ import {
   type Settings,
   type Share,
 } from './settings.ts';
-import { SetupModal } from './setup.ts';
+import { SetupModal, type Keys } from './setup.ts';
 import {
   followRename,
   freeTaken,
   goneWith,
   inVault,
+  locationClash,
   makeEngine,
   placeOf,
+  readOnlyInviteCode,
   rejoin,
   syncAll,
   syncable,
@@ -54,11 +58,12 @@ import {
 } from './shares.ts';
 import { ShareModal, pickTarget } from './sharing.ts';
 import { resolveFirstConflict } from './resolve.ts';
-import { applyRestore, deleteLimitCrossed, describeCleanup, keepOut, momentLabel, placeRestored, restoreSteps, sameSteps, type Failed, type Step } from './restore.ts';
+import { applyRestore, deleteLimitCrossed, describeCleanup, keepDeferred, keepOut, momentLabel, placeRestored, restoreSteps, sameSteps, sentNote, type Failed, type Step } from './restore.ts';
 import {
   connectError,
   describeFailure,
   inShare,
+  keptNote,
   keysMissingProblem,
   missingProblem,
   resultProblems,
@@ -68,7 +73,7 @@ import {
   type Problem,
   type Tone,
 } from './status.ts';
-import { DeletedModal, RestoreEarlierModal, VerifyModal, VersionsModal } from './timemachine.ts';
+import { DeletedModal, RepairModal, RestoreEarlierModal, VerifyModal, VersionsModal } from './timemachine.ts';
 import { ProblemsModal, SettingsTab } from './views.ts';
 
 type SecretKey = 'accessKeySecret' | 'secretKeySecret' | 'passphraseSecret' | 'webdavPasswordSecret';
@@ -116,6 +121,8 @@ interface Tracked {
   failure?: Problem;
   /** What the last finished sync left to look at: failed, conflicting or oversized files. */
   found: Problem[];
+  /** Files the last finished sync left in storage until asked for, by their path in this place. */
+  deferred?: string[];
   /** Files a restore removed, which the next sync to finish deletes from storage as confirmed (`allowDeletes`). */
   restored?: Set<string>;
 }
@@ -181,8 +188,25 @@ export default class CofferPlugin extends Plugin {
     this.addCommand({ id: 'status', name: 'Show sync status and problems', callback: () => this.openStatus() });
     this.addCommand({ id: 'setup', name: 'Set up sync', callback: () => new SetupModal(this.app, this, 'start').open() });
     this.addCommand({ id: 'force-sync', name: 'Sync now, allowing large deletions in the vault', callback: () => void this.sync(true, true) });
+    this.addCommand({
+      id: 'download-deferred',
+      name: 'Download a file left in storage',
+      checkCallback: (checking) => {
+        if (!this.configured() || !this.settings.deferAboveMB) return false;
+        if (!checking) void chooseDeferred(this);
+        return true;
+      },
+    });
     this.addCommand({ id: 'check-storage', name: 'Check storage connection', callback: () => void this.checkStorage() });
-    this.addCommand({ id: 'clean-up', name: 'Delete expired versions from storage', callback: () => void this.cleanUp() });
+    this.addCommand({
+      id: 'clean-up',
+      name: 'Delete expired versions from storage',
+      checkCallback: (checking) => {
+        if (this.targets().every((share) => (share ?? this.settings).readOnly)) return false;
+        if (!checking) void this.cleanUp();
+        return true;
+      },
+    });
     this.addCommand({ id: 'resolve-conflict', name: 'Resolve a file changed on two devices', callback: () => resolveFirstConflict(this) });
     this.addCommand({
       id: 'history',
@@ -213,6 +237,15 @@ export default class CofferPlugin extends Plugin {
       id: 'verify',
       name: 'Check synced data for damage',
       checkCallback: whenConfigured(() => pickTarget(this, 'Check the synced data of', (share) => new VerifyModal(this.app, this, share).open())),
+    });
+    this.addCommand({
+      id: 'repair',
+      name: "Repair synced data from this device's files",
+      checkCallback: (checking) => {
+        if (!this.configured() || this.targets().every((share) => this.receivesOnly(share))) return false;
+        if (!checking) pickTarget(this, 'Repair the synced data of', (share) => new RepairModal(this.app, this, share, false).open(), (share) => !this.receivesOnly(share));
+        return true;
+      },
     });
     this.registerEvent(
       this.app.workspace.on('file-menu', (menu, file) => {
@@ -295,6 +328,8 @@ export default class CofferPlugin extends Plugin {
     await this.saveData(this.settings);
     this.engines.clear();
     this.files = undefined;
+    // A place that stopped only receiving owes a sync for what it kept back.
+    if (this.targets().some((share) => !this.receivesOnly(share) && this.tracked(share).found.some((p) => p.id === 'unsent'))) this.dirty = true;
     this.applySchedule();
     this.updateStatus();
   }
@@ -369,6 +404,11 @@ export default class CofferPlugin extends Plugin {
 
   private pluginDir(): string {
     return `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
+  }
+
+  /** Whether this device never writes to the storage of `share` (the vault's when none). */
+  receivesOnly(share?: Share): boolean {
+    return (share ?? this.settings).readOnly;
   }
 
   /** The vault, then every shared folder that can sync here. */
@@ -456,7 +496,18 @@ export default class CofferPlugin extends Plugin {
     if (share?.missing) return [missingProblem(share.folder)];
     if (share && !isConfigured(share, this.lookup)) return [keysMissingProblem()];
     const t = this.tracked(share);
-    return targetProblems({ failure: t.failure, found: t.found, conflictCopies: this.conflictCopies(share), lastSuccess: (share ?? this.settings).lastSuccess }, Date.now());
+    const rec = share ?? this.settings;
+    return targetProblems({ failure: t.failure, found: t.found, conflictCopies: this.conflictCopies(share), lastSuccess: rec.lastSuccess, readOnly: rec.readOnly }, Date.now());
+  }
+
+  /** Whether the last sync of any place could not reach its storage. */
+  offline(): boolean {
+    return this.targets().some((share) => this.tracked(share).failure?.id === 'offline');
+  }
+
+  /** Whether files were changed here since the last sync began, so that it has not sent them yet. */
+  waiting(): boolean {
+    return this.dirty;
   }
 
   /** Everything the user should know about, worst first; a shared folder's problems say which folder. */
@@ -568,6 +619,7 @@ export default class CofferPlugin extends Plugin {
    * lock. Never in a shared folder, whose storage other people may read.
    */
   private async heartbeat(): Promise<void> {
+    if (this.settings.readOnly) return;
     const name = this.settings.deviceName;
     // Renamed since the last one: the record goes under the new name now, and the one under the old name goes.
     const renamed = this.heartbeatName && this.heartbeatName !== name ? this.heartbeatName : '';
@@ -608,7 +660,7 @@ export default class CofferPlugin extends Plugin {
    * One place's sync and, when due, its cleanup and the vault's heartbeat. Throws when the sync fails. It looks only at
    * the files the vault's events named when they are all there is to see; otherwise it lists every file.
    */
-  private async syncOne(share: Share | undefined, force: boolean, why: Why): Promise<SyncResult> {
+  private async syncOne(share: Share | undefined, force: boolean, why: Why, fetch?: string[]): Promise<SyncResult> {
     const t = this.tracked(share);
     const rec = share ?? this.settings;
     const engine = this.getEngine(share);
@@ -617,18 +669,20 @@ export default class CofferPlugin extends Plugin {
       why,
       share ? { folderMissing: !(lookup(this.app, share.folder) instanceof TFolder) } : { settingsDue: this.files?.configListingDue() ?? true },
     );
-    const r = await engine.sync({ force, changed, allowDeletes: t.restored });
+    const r = await engine.sync({ force, changed, allowDeletes: t.restored, fetch });
     this.pauses.lift(keyOf(share));
     this.retries.reset(keyOf(share));
     t.restored = undefined;
     if (!share && (r.pulled || r.deletedLocal)) this.files?.forgetConfigListing();
     if (receivedChanges(r)) this.noteActivity();
     t.failure = undefined;
+    t.deferred = r.deferred;
     rec.lastSuccess = Date.now();
     rec.conflictCopies = [...new Set([...rec.conflictCopies, ...r.conflictCopies])];
     this.pruneConflictCopies(share);
     t.found = resultProblems(share ? inVault(share, r) : r, this.conflictCopies(share), this.settings.maxFileSizeMB);
-    if (!r.errors.length && cleanupDue({ autoCleanDays: this.settings.autoCleanDays, lastCleanup: rec.lastCleanup }, Date.now())) {
+    // Only a device that just committed asks for an early cleanup, so the one whose commit tipped the count does it.
+    if (!r.errors.length && cleanupDue({ autoCleanDays: this.settings.autoCleanDays, lastCleanup: rec.lastCleanup }, Date.now(), r.commits > 0 && (await engine.compactionDue()))) {
       await engine.gc();
       rec.lastCleanup = Date.now();
     }
@@ -725,8 +779,13 @@ export default class CofferPlugin extends Plugin {
 
   /** The safe answer to a paused mass delete: copy every file back to the side that lost it. */
   async keepAllFiles(share?: Share): Promise<void> {
-    const kept = await this.exclusive('Keeping all files…', () => this.getEngine(share).keepAllFiles());
-    new Notice(`Keeping all files${share ? ` in “${share.folder}”` : ''}: ${plural(kept, 'file')} will be copied back.`);
+    const { kept, left } = await this.exclusive('Keeping all files…', async () => {
+      const engine = this.getEngine(share);
+      const before = new Set((await engine.deferred()).map((f) => f.path));
+      const kept = await engine.keepAllFiles();
+      return { kept, left: (await engine.deferred()).filter((f) => !before.has(f.path)).length };
+    });
+    new Notice(`Keeping all files${share ? ` in “${share.folder}”` : ''}: ${keptNote(kept, left)}`);
     await this.sync(true);
   }
 
@@ -740,19 +799,23 @@ export default class CofferPlugin extends Plugin {
     await this.sync(true);
   }
 
+  /** Slow (key derivation at the vault's cost), so callers make it before the tap that copies it: phones only allow a clipboard write inside the tap. */
   async setupLink(): Promise<string> {
-    return setupLink(await encodeSetupCode(this.settings, this.lookup));
+    const iterations = codeIterations(await this.getEngine().kdfIterations().catch(() => undefined));
+    return setupLink(await encodeSetupCode(this.settings, this.lookup, undefined, iterations));
   }
 
   /** A link that lets someone join `share`, encrypted with its passphrase. It suggests the folder's name. */
   async inviteLink(share: Share): Promise<string> {
-    return setupLink(await encodeSetupCode(share, this.lookup, fileName(share.folder)));
+    const iterations = codeIterations(await this.getEngine(share).kdfIterations().catch(() => undefined));
+    return setupLink(await encodeSetupCode(share, this.lookup, fileName(share.folder), iterations));
   }
 
-  async importSetupCode(code: string, passphrase: string): Promise<void> {
+  /** With `readOnly`, this device never writes to storage; set before the first sync. */
+  async importSetupCode(code: string, passphrase: string, readOnly = false): Promise<void> {
     const { settings, secrets } = await decodeSetupCode(code, passphrase, this.app.vault.getName());
     for (const [id, value] of secrets) this.app.secretStorage.setSecret(id, value);
-    Object.assign(this.settings, settings);
+    Object.assign(this.settings, settings, { readOnly });
     await this.saveSettings();
   }
 
@@ -884,6 +947,36 @@ export default class CofferPlugin extends Plugin {
     return this.outcomeOf(out, share);
   }
 
+  /**
+   * A link that lets someone join `share` and only receive changes, with `keys` that were made to read only: see
+   * `readOnlyInviteCode`.
+   */
+  async readOnlyInviteLink(share: Share, keys: Keys & { user: string }): Promise<string> {
+    const iterations = codeIterations(await this.getEngine(share).kdfIterations().catch(() => undefined));
+    return setupLink(await readOnlyInviteCode(share, keys, this.lookup, fileName(share.folder), iterations));
+  }
+
+  /** How many files are left in storage until asked for, in the vault and in each shared folder that syncs, as of its last sync; undefined before it has run since the app started. */
+  deferredCounts(): (number | undefined)[] {
+    return this.targets().map((share) => this.tracked(share).deferred?.length);
+  }
+
+  /** Downloads the files at `paths` (inside `share`, or the vault's) that are left in storage, with a sync of that place. */
+  async fetchDeferred(paths: string[], share?: Share): Promise<SyncOutcome> {
+    const clash = locationClash(this.settings, share);
+    if (clash) return { problem: { id: 'location', severity: 'critical', title: 'Nothing was downloaded', detail: clash } };
+    return this.exclusive('Downloading…', async () => {
+      try {
+        return { result: await this.syncOne(share, false, 'manual', paths) };
+      } catch (e) {
+        return { problem: this.failed(share, e) };
+      } finally {
+        await this.saveData(this.settings);
+        this.report();
+      }
+    });
+  }
+
   async checkStorage(): Promise<void> {
     if (!hasStorageAddress(this.settings)) {
       new Notice('Fill in the storage address first.');
@@ -892,7 +985,7 @@ export default class CofferPlugin extends Plugin {
     const checking = new Notice('Checking the storage…', 0);
     let report: Awaited<ReturnType<typeof checkStore>>;
     try {
-      report = await checkStore(this.store());
+      report = await checkStore(this.store(), this.settings.readOnly);
     } finally {
       checking.hide();
     }
@@ -906,7 +999,11 @@ export default class CofferPlugin extends Plugin {
     if (!this.configured()) return;
     const total: GcResult = { packsDeleted: 0, bytesFreed: 0, snapshotsDeleted: 0, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0 };
     const failed: string[] = [];
-    const targets = this.targets();
+    const targets = this.targets().filter((share) => !(share ?? this.settings).readOnly);
+    if (!targets.length) {
+      new Notice('This device only receives changes, so it does not clean up storage.');
+      return;
+    }
     await this.exclusive('Cleaning up storage…', async () => {
       for (const share of targets) {
         try {
@@ -919,6 +1016,11 @@ export default class CofferPlugin extends Plugin {
     });
     if (failed.length < targets.length) new Notice(describeCleanup(total), 10_000);
     if (failed.length) new Notice(`Clean-up failed.\n${failed.join('\n')}`, 10_000);
+  }
+
+  /** Stores again, from this device's files, the data `share`'s storage (the vault's when none) lost. Syncs wait meanwhile. */
+  repair(share: Share | undefined, deep: boolean, onProgress?: RepairOptions['onProgress']): Promise<RepairReport> {
+    return this.exclusive('Repairing synced data…', () => this.getEngine(share).repair({ deep, onProgress }));
   }
 
   /** The file table is copied before anything else is awaited: a sync waiting on the engine may change it from then on. */
@@ -936,6 +1038,11 @@ export default class CofferPlugin extends Plugin {
     if (share) return keepOut(shareConfig(this.settings, share, dir).exclude, []);
     const own = this.pluginDir();
     return keepOut(syncConfig(this.settings, dir, own).exclude, this.settings.syncConfigDir ? [own] : [own, dir]);
+  }
+
+  /** As `keptOut` for files, and with those left in storage until asked for, which the engine lists now, not as of the last sync. */
+  keptOutFiles(share?: Share): Promise<(path: string) => boolean> {
+    return keepDeferred(this.keptOut(share), this.getEngine(share));
   }
 
   /** The files of the vault, or of a shared folder, by key, with the path each has there. */
@@ -969,12 +1076,12 @@ export default class CofferPlugin extends Plugin {
     await vault.createBinary(full, buffer);
   }
 
-  /** Puts `version` in place of the file at vault path `path`, or brings it back if there is none; the next sync sends it. */
+  /** Puts `version` in place of the file at vault path `path`, or brings it back if there is none; the next sync sends it, unless the place only receives. */
   async restoreVersion(path: string, version: Version): Promise<void> {
     if (!version.entry) return;
     const { share, path: inside } = this.placeOf(path);
     await this.writeFile(share, inside, await this.getEngine(share).readVersion(version.entry));
-    new Notice(`Restored “${fileName(path)}” as it was ${momentLabel(version.time, Date.now())}.`);
+    new Notice(`Restored “${fileName(path)}” as it was ${momentLabel(version.time, Date.now())}.${this.receivesOnly(share) ? ` ${sentNote(1, true)}` : ''}`);
   }
 
   /** Brings deleted files of the vault, or of `share`, back where they were, or beside whatever has their name now. */
@@ -1021,6 +1128,15 @@ export default class CofferPlugin extends Plugin {
    * not stop the rest. Ends with the sync that sends the result.
    */
   async restoreTo(target: Map<string, Entry>, folder: string, expected: Step[], share?: Share): Promise<RestoreOutcome> {
+    if ((share ?? this.settings).readOnly) {
+      const problem: Problem = {
+        id: 'read-only',
+        severity: 'critical',
+        title: 'This device only receives changes',
+        detail: 'A restore changes files that would then have to be sent to storage, which this device never writes to. Restore from a device that sends changes, or turn off Only receive changes here.',
+      };
+      return { problem, done: [], failed: [] };
+    }
     return this.exclusive('Restoring…', async () => {
       this.say('Syncing recent changes first…');
       const saving: Promise<void>[] = [];
@@ -1042,8 +1158,9 @@ export default class CofferPlugin extends Plugin {
         return { problem, done: [], failed: [] };
       }
       const { engine, fs } = this.scope(share);
+      const kept = await this.keptOutFiles(share);
       const { st, cfg } = await engine.view();
-      const { steps } = restoreSteps(planRestore(st.remote, target, folder), st.remote, this.keptOut(share));
+      const { steps } = restoreSteps(planRestore(st.remote, target, folder), st.remote, kept);
       if (!sameSteps(steps, expected)) return { changed: steps, done: [], failed: [] };
       const synced = st.synced.size;
       const last = new Map([...st.synced].map(([key, s]) => [key, { lsize: s.lsize, lmtime: s.lmtime }]));

@@ -1,19 +1,21 @@
 import { pool } from './bytes.ts';
 import { worthCompressing } from './compress.ts';
-import { copyChunks, placeKey, planCompaction } from './compact.ts';
+import { copyChunks, fragmented, placeKey, planCompaction } from './compact.ts';
 import { compileExcludes, type SyncConfig } from './config.ts';
-import { merge3, mergeJson } from './merge.ts';
+import { merge3, mergeCanvas, mergeJson, mergeNote } from './merge.ts';
 import { Packer, packRanges } from './packer.ts';
 import { conflictCopyName, ext, vaultKey } from './paths.ts';
 import { nothingToDo, planChanges, type Local, type Plan } from './plan.ts';
+import { findDamage, repairReport, storeAgain, type RepairOptions, type RepairReport } from './repair.ts';
 import { Repo } from './repo.ts';
 import { collectGarbage, listVersions, type CleanupResult } from './retention.ts';
 import { LocalState } from './state.ts';
 import { errorText } from './text.ts';
-import { hasChunks, sameContent, type Change, type ChunkRef, type Commit, type Entry, type FileStat, type LocalFS, type RemoteStore, type StateStore, type Version } from './types.ts';
-import { verifyRepo, type VerifyOptions, type VerifyReport } from './verify.ts';
+import { ReadOnlyError, hasChunks, readOnlyStore, sameContent, type Change, type ChunkRef, type Commit, type Entry, type FileStat, type LocalFS, type RemoteStore, type StateStore, type Version } from './types.ts';
+import { affectedBy, verifyRepo, type VerifyOptions, type VerifyReport } from './verify.ts';
 
 export type { VerifyOptions, VerifyProblem, VerifyReport } from './verify.ts';
+export type { RepairOptions, RepairReport } from './repair.ts';
 
 export interface EngineOptions {
   fs: LocalFS;
@@ -63,6 +65,11 @@ export interface SyncOptions {
    * marked; a path that still exists is not deleted.
    */
   allowDeletes?: Iterable<string>;
+  /**
+   * Vault paths of files left in storage (`SyncResult.deferred`) to download in this sync, which then sync like any
+   * other file. A path that is not such a file is ignored, and a file over the size limit stays out.
+   */
+  fetch?: Iterable<string>;
 }
 
 export interface SyncResult {
@@ -75,6 +82,10 @@ export interface SyncResult {
   skipped: number;
   /** Files not synced on this device because they are over the size limit. */
   tooLarge: string[];
+  /** Files left in storage until asked for (`SyncOptions.fetch`): over `deferAboveMB`, and not on this device under any path. */
+  deferred: string[];
+  /** Files changed on a device that only reads, and not sent. Empty for a device that writes. */
+  unsent: string[];
   errors: { path: string; message: string }[];
   commits: number;
   rounds: number;
@@ -182,6 +193,8 @@ interface Known {
 interface Run {
   force: boolean;
   allow: Set<string>;
+  /** The files to download although they are deferred, by key. */
+  fetch: Set<string>;
   /** The paths the caller says may have changed, by key, with their names on disk. Undefined: list the vault. */
   hint?: Map<string, string>;
   known: Known;
@@ -271,7 +284,12 @@ export class SyncEngine {
 
   private async load(): Promise<void> {
     if (!this.repo) {
-      this.repo = await Repo.open(this.o.store, this.o.passphrase, { kdfIterations: this.cfg.kdfIterations, chunk: this.cfg.chunk });
+      const { readOnly, kdfIterations, chunk } = this.cfg;
+      // A device that only reads never creates the vault: the key it would make is not worth deriving.
+      this.repo = await Repo.open(readOnly ? readOnlyStore(this.o.store) : this.o.store, this.o.passphrase, { kdfIterations: readOnly ? 1 : kdfIterations, chunk }).catch((e: unknown) => {
+        // Only creating vault.json writes while opening.
+        throw e instanceof ReadOnlyError ? new Error('Storage holds no synced vault yet, and this device only reads from it') : e;
+      });
     }
     if (!this.st) {
       const st = LocalState.parse(await this.o.stateStore.load());
@@ -403,6 +421,29 @@ export class SyncEngine {
     return this.cfg.maxFileSizeMB * (1 << 20) || Infinity;
   }
 
+  private deferLimit(): number {
+    return this.cfg.deferAboveMB * (1 << 20) || Infinity;
+  }
+
+  /**
+   * Whether a remote file is left in storage: over the deferral limit, not asked for, and not content this device
+   * already holds under another path, which a move or copy reuses. Undefined when nothing is deferred. The
+   * contents held are listed on first use, once for as long as the predicate lives.
+   */
+  private deferral(st: LocalState, run?: Run): ((key: string, r: Entry) => boolean) | undefined {
+    const limit = this.deferLimit();
+    if (limit === Infinity) return undefined;
+    let held: Set<string> | undefined;
+    return (key, r) => {
+      if (r.size <= limit || run?.fetch.has(key)) return false;
+      if (!held) {
+        held = new Set();
+        for (const s of st.synced.values()) if (s.entry.size > limit) held.add(contentKey(s.entry));
+      }
+      return !held.has(contentKey(r));
+    };
+  }
+
   private async scan(run: Run): Promise<LocalView> {
     const maxSize = this.maxSize();
     const local = new Map<string, Local>();
@@ -510,6 +551,18 @@ export class SyncEngine {
     return [...out].sort();
   }
 
+  /** Files in storage that this device leaves there until asked for: see `deferral`, within the size limit, and not here. */
+  private deferredKeys(st: LocalState, v: LocalView, defer?: (key: string, r: Entry) => boolean): string[] {
+    const maxSize = this.maxSize();
+    const out: string[] = [];
+    if (defer) {
+      for (const [key, r] of st.remote) {
+        if (r.size <= maxSize && !st.synced.has(key) && !v.local.has(key) && !v.tooLarge.has(key) && !this.excluded(key) && defer(key, r)) out.push(key);
+      }
+    }
+    return out.sort();
+  }
+
   /**
    * Brings this device and the remote in step. A sync called while another operation runs starts once
    * that one has finished. See `SyncOptions`.
@@ -521,16 +574,17 @@ export class SyncEngine {
   private async syncHeld(opts: SyncOptions): Promise<SyncResult> {
     const res: SyncResult = {
       pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0,
-      conflictCopies: [], skipped: 0, tooLarge: [], errors: [], commits: 0, rounds: 0,
+      conflictCopies: [], skipped: 0, tooLarge: [], deferred: [], unsent: [], errors: [], commits: 0, rounds: 0,
     };
     const { st } = await this.open();
     const allow = new Set([...(opts.allowDeletes ?? [])].map(vaultKey));
     const known = this.known;
-    const run: Run = { force: !!opts.force, allow, known: known ?? { tooLarge: new Set(), paths: new Map() }, unsettled: new Set() };
+    const fetch = new Set([...(opts.fetch ?? [])].map(vaultKey));
+    const run: Run = { force: !!opts.force, allow, fetch, known: known ?? { tooLarge: new Set(), paths: new Map() }, unsettled: new Set() };
     if (opts.changed && known) {
       run.hint = new Map();
       for (const p of opts.changed) run.hint.set(vaultKey(p), p);
-      for (const k of allow) if (!run.hint.has(k)) run.hint.set(k, known.paths.get(k) ?? k);
+      for (const k of [...allow, ...fetch]) if (!run.hint.has(k)) run.hint.set(k, known.paths.get(k) ?? k);
     }
     // Until this sync finishes, nothing it has seen is to be trusted by the next.
     this.known = undefined;
@@ -560,23 +614,26 @@ export class SyncEngine {
   private async round(res: SyncResult, run: Run, first: boolean): Promise<boolean> {
     const { repo, st } = await this.open();
     const maxSize = this.maxSize();
+    const defer = this.deferral(st, run);
     let v = await this.look(run, st);
-    let p = planChanges(v.local, st, this.excluded, maxSize, v.tooLarge, v.keys);
+    let p = planChanges(v.local, st, this.excluded, maxSize, v.tooLarge, v.keys, defer);
     // A small local edit is committed without first asking whether the remote moved: the commit
     // itself fails if it did, and the next pass sorts it out. Saves a round trip on the common case.
-    // Not when the head check is due: a commit on top of a log cut back under this device would succeed.
+    // The commit also checks that storage still holds the commit before it (`put`), so it need not wait for the hourly check.
     const optimistic =
-      first && st.lastSeq > 0 && !this.headDue(st) &&
+      first && st.lastSeq > 0 && st.head !== undefined &&
       p.pushes.length + p.pushDeletes.length > 0 && !p.pulls.length && !p.pullDeletes.length && !p.conflicts.length &&
-      p.pushes.reduce((n, f) => n + f.size, 0) <= OPTIMISTIC_BYTES;
+      p.pushes.reduce((n, f) => n + f.size, 0) <= OPTIMISTIC_BYTES && !this.cfg.readOnly;
     if (!optimistic && (await this.fetchRemote()).size) {
       if (v.keys) v = await this.look(run, st, v);
-      p = planChanges(v.local, st, this.excluded, maxSize, v.tooLarge, v.keys);
+      p = planChanges(v.local, st, this.excluded, maxSize, v.tooLarge, v.keys, defer);
     }
     res.tooLarge = this.tooLarge(st, v.tooLarge);
+    res.deferred = this.deferredKeys(st, v, defer);
 
     if (nothingToDo(p)) return false;
     this.checkDeletes(p, st, run);
+    const unsent = await this.keepLocal(p, run, res);
 
     const pass: Pass = { repo, st, local: v.local, keys: v.keys, run, res, pulls: p.pulls.length + p.conflicts.length, downloaded: 0 };
     const moved = await this.deleteLocal(pass, p);
@@ -590,6 +647,11 @@ export class SyncEngine {
       } catch (e) {
         recordError(res, key, e);
       }
+    }
+    unsent.push(...(await this.keepLocal(p, run, res)));
+    if (unsent.length) {
+      res.unsent = [...new Set([...res.unsent, ...unsent])].sort();
+      for (const key of unsent) run.unsettled.add(key);
     }
 
     const commitsBefore = res.commits;
@@ -605,8 +667,46 @@ export class SyncEngine {
     if (run.force) return;
     const limit = deleteLimit(st.synced.size, this.cfg);
     const here = p.pullDeletes.filter((k) => !st.confirmed.has(k)).length;
-    const there = p.pushDeletes.filter((k) => !run.allow.has(k)).length;
+    // A device that only reads never deletes in storage: what it deleted comes back (see `keepLocal`).
+    const there = this.cfg.readOnly ? 0 : p.pushDeletes.filter((k) => !run.allow.has(k)).length;
     if (here - p.pulls.length > limit || there - p.pushes.length > limit) throw new SafetyError(here, there);
+  }
+
+  /**
+   * What a device that only reads does with what the plan would send: nothing is sent, the files stay as they are,
+   * and a file deleted here comes back from storage, so that it is not left missing files every other device has.
+   * A file touched without changing its content, as by a tool that syncs files, is not a change. Empties the plan's
+   * pushes and returns the files left unsent; for any other device, does nothing.
+   */
+  private async keepLocal(p: Plan, run: Run, res: SyncResult): Promise<string[]> {
+    if (!this.cfg.readOnly) return [];
+    const { repo, st } = await this.open();
+    const fs = this.o.fs;
+    const unsent: string[] = [];
+    await pool(p.pushes, this.cfg.concurrency, async (f) => {
+      try {
+        const base = st.synced.get(f.key)?.entry;
+        if (base && st.remote.get(f.key)) {
+          const data = await fs.read(f.path);
+          if (!unchanged(await fs.stat(f.path), f)) {
+            this.skip(run, res, f.key);
+            return;
+          }
+          if (hasChunks(base, (await repo.split(data)).ids)) {
+            st.synced.set(f.key, { entry: base, lsize: f.size, lmtime: f.mtime });
+            this.unsaved = true;
+            return;
+          }
+        }
+      } catch (e) {
+        recordError(res, f.key, e);
+      }
+      unsent.push(f.key);
+    });
+    p.pulls.push(...p.pushDeletes);
+    p.pushes = [];
+    p.pushDeletes = [];
+    return unsent;
   }
 
   private skip(run: Run, res: SyncResult, key: string): void {
@@ -776,7 +876,7 @@ export class SyncEngine {
     const merged = settings
       ? await this.mergeSettings(key, base, mine, r)
       : this.cfg.conflictStrategy === 'merge' && base && this.cfg.mergeExtensions.includes(ext(key))
-        ? await this.tryMerge(base, mine, r)
+        ? await this.tryMerge(key, base, mine, r)
         : null;
     if (merged) {
       // Fetching the other versions took a moment; do not write over an edit made meanwhile.
@@ -792,6 +892,8 @@ export class SyncEngine {
       return { key, path: l.path, ...stat };
     }
     if (settings) {
+      // A device that only reads keeps its own file, listed as unsent: a copy here would never be seen.
+      if (this.cfg.readOnly) return l;
       // Not mergeable (plugin code, a theme, unreadable JSON): the version synced first stays, like any setting both changed.
       await this.writeRemote(pass, key, r, await this.readVersion(r));
       return;
@@ -812,7 +914,7 @@ export class SyncEngine {
 
   /** JSON settings merge key by key, even with no common version (two devices set up apart); other text line by line. */
   private async mergeSettings(key: string, base: Entry | undefined, mine: Uint8Array, remote: Entry): Promise<Uint8Array | null> {
-    if (ext(key) !== 'json') return base ? this.tryMerge(base, mine, remote) : null;
+    if (ext(key) !== 'json') return base ? this.tryMerge(key, base, mine, remote) : null;
     try {
       const text = (data: Uint8Array) => new TextDecoder('utf-8', { fatal: true }).decode(data);
       const theirs = text(await this.readVersion(remote));
@@ -825,11 +927,13 @@ export class SyncEngine {
     }
   }
 
-  private async tryMerge(base: Entry, mine: Uint8Array, remote: Entry): Promise<Uint8Array | null> {
+  private async tryMerge(key: string, base: Entry, mine: Uint8Array, remote: Entry): Promise<Uint8Array | null> {
     try {
       const text = (data: Uint8Array) => new TextDecoder('utf-8', { fatal: true }).decode(data);
       const [theirBase, theirs] = await Promise.all([this.readVersion(base), this.readVersion(remote)]);
-      const merged = merge3(text(theirBase), text(mine), text(theirs));
+      const kind = ext(key);
+      const merge = kind === 'canvas' ? mergeCanvas : kind === 'md' || kind === 'markdown' ? mergeNote : merge3;
+      const merged = merge(text(theirBase), text(mine), text(theirs));
       return merged === null ? null : new TextEncoder().encode(merged);
     } catch {
       // Not text, or the base version is no longer stored: fall back to keeping both.
@@ -961,6 +1065,29 @@ export class SyncEngine {
     return again;
   }
 
+  /**
+   * Writes a commit and, in the same round trip, reads the one before it: a log cut back or replaced under this
+   * device would take this commit all the same. Then it is taken back at once, since left beyond a gap or on a
+   * broken link it would stop every device that reads the log, and `acceptStorage` would find it again. Only a read
+   * that finds the commit missing or different counts. Resolves to the commit's digest, or null when another
+   * device took its number.
+   */
+  private async put(c: Commit): Promise<string | null> {
+    const { repo, st } = await this.open();
+    const [hash, before] = await Promise.all([
+      repo.writeCommit(c),
+      c.seq > 1 ? repo.readCommit(c.seq - 1).catch(() => undefined) : undefined,
+    ]);
+    if (!hash || before === undefined) return hash;
+    try {
+      this.checkHead(st, before, null);
+    } catch (e) {
+      await repo.retractCommit(c.seq, hash).catch((x) => this.log(`Could not take back commit ${c.seq}: ${errorText(x)}`));
+      throw e;
+    }
+    return hash;
+  }
+
   /** Returns true when another device committed first and some of these changes must be re-planned. */
   private async commit(prepared: Prepared[], deletes: string[], res: SyncResult, confirmed = false): Promise<boolean> {
     const { repo, st } = await this.open();
@@ -971,7 +1098,7 @@ export class SyncEngine {
         ...deletes.map((path) => ({ path, entry: null })),
       ];
       const c: Commit = { seq: st.lastSeq + 1, device: this.cfg.deviceName, time: this.now(), changes, prev: st.head, ...(confirmed && { confirmed }) };
-      const hash = await repo.writeCommit(c);
+      const hash = await this.put(c);
       if (hash) {
         st.apply({ ...c, time: 0, hash });
         for (const p of prepared) st.synced.set(p.file.key, { entry: p.entry, lsize: p.file.size, lmtime: p.file.mtime });
@@ -1030,7 +1157,7 @@ export class SyncEngine {
     return this.exclusive(async () => {
       const { st } = await this.open();
       await this.fetchRemote();
-      const run: Run = { force: false, allow: new Set(), known: { tooLarge: new Set(), paths: new Map() }, unsettled: new Set() };
+      const run: Run = { force: false, allow: new Set(), fetch: new Set(), known: { tooLarge: new Set(), paths: new Map() }, unsettled: new Set() };
       const { local, tooLarge } = await this.scan(run);
       let kept = 0;
       for (const key of [...st.synced.keys()]) {
@@ -1043,6 +1170,24 @@ export class SyncEngine {
       this.unsaved = true;
       await this.save();
       return kept;
+    });
+  }
+
+  /**
+   * Files left in storage until asked for, with their sizes: those over `deferAboveMB` that this device does not
+   * have, under that path or another. Pass their paths to `sync` as `fetch` to download them.
+   */
+  deferred(): Promise<{ path: string; size: number }[]> {
+    return this.exclusive(async () => {
+      const { st } = await this.refresh();
+      const defer = this.deferral(st);
+      const maxSize = this.maxSize();
+      const out: { path: string; size: number }[] = [];
+      const candidates = defer ? [...st.remote].filter(([key, r]) => r.size <= maxSize && !st.synced.has(key) && !this.excluded(key) && defer(key, r)) : [];
+      await pool(candidates, this.cfg.concurrency, async ([key, r]) => {
+        if (!(await this.o.fs.stat(this.known?.paths.get(key) ?? key))) out.push({ path: key, size: r.size });
+      });
+      return out.sort((a, b) => (a.path < b.path ? -1 : 1));
     });
   }
 
@@ -1062,9 +1207,14 @@ export class SyncEngine {
   changePassphrase(newPassphrase: string): Promise<void> {
     return this.exclusive(async () => {
       const { repo } = await this.open();
-      await repo.changePassphrase(this.o.passphrase, newPassphrase);
+      await repo.changePassphrase(this.o.passphrase, newPassphrase, this.cfg.kdfIterations);
       this.o.passphrase = newPassphrase;
     });
+  }
+
+  /** The PBKDF2 cost the vault's passphrase is wrapped with, which a setup link made here is sealed with at least. */
+  async kdfIterations(): Promise<number> {
+    return (await this.open()).repo.kdfIterations;
   }
 
   /** Opens the repo and brings the remote file table up to date, for features that only read. Waits for a sync in progress. */
@@ -1082,7 +1232,26 @@ export class SyncEngine {
   async verify(opts: VerifyOptions = {}): Promise<VerifyReport> {
     const { repo, st } = await this.open();
     return verifyRepo(repo, {
-      ...opts, concurrency: this.cfg.concurrency, rangeGapBytes: this.cfg.rangeGapBytes, seen: { seq: st.lastSeq, head: st.head },
+      ...opts, concurrency: this.cfg.concurrency, rangeGapBytes: this.cfg.rangeGapBytes, seen: { seq: st.lastSeq, head: st.head }, history: { cfg: this.cfg, now: this.now() },
+    });
+  }
+
+  /**
+   * Stores again, from the files on this device, the data the current files keep in packs that are missing or too
+   * short (and with `deep`, chunks that cannot be read), and points them at the new places in a commit marked as a
+   * move. A file this device does not have, or has under another content, is stored again as far as its chunks
+   * are here: the rest is reported. Earlier versions that share chunks with a current file become readable again;
+   * the others are reported. Writes nothing when this device has none of the data.
+   */
+  repair(opts: RepairOptions = {}): Promise<RepairReport> {
+    return this.exclusive(async () => {
+      const { repo, st, cfg, now } = await this.refresh();
+      const found = await findDamage(repo, st.remote, cfg, opts);
+      const affected = affectedBy(st.remote, found.damaged);
+      const files = affected.filter((k) => !this.excluded(k)).map((k): [string, string] => [k, this.known?.paths.get(k) ?? k]);
+      const { moved, chunks } = await storeAgain(repo, this.o.fs, st.remote, files, found.damaged, cfg);
+      if (moved.size) await this.relocate(moved);
+      return repairReport(repo, st, cfg, now, found, affected, chunks);
     });
   }
 
@@ -1132,6 +1301,12 @@ export class SyncEngine {
     return refs;
   }
 
+  /** True when the current files are spread over so many small packs that cleanup would save a new device many requests. */
+  async compactionDue(): Promise<boolean> {
+    const { st } = await this.open();
+    return fragmented(st.remote, this.cfg);
+  }
+
   /**
    * Deletes stored data that no kept version needs, then copies the current data of small or mostly
    * dead packs into fuller ones, at most `compactMaxBytes` a run. Every version keeps reading its data
@@ -1140,6 +1315,7 @@ export class SyncEngine {
    */
   gc(): Promise<GcResult> {
     return this.exclusive(async () => {
+      if (this.cfg.readOnly) return { packsDeleted: 0, bytesFreed: 0, snapshotsDeleted: 0, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0 };
       const { repo, st, cfg, now } = await this.refresh();
       const { result, packs } = await collectGarbage(repo, st, cfg, now);
       const out: GcResult = { ...result, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0 };
@@ -1171,7 +1347,7 @@ export class SyncEngine {
    * at a place it copied from. False when nothing was committed; the copies are then left to cleanup.
    */
   private async relocate(moved: Map<string, ChunkRef>): Promise<boolean> {
-    const { repo, st } = await this.open();
+    const { st } = await this.open();
     for (let round = 0; round < MAX_ROUNDS; round++) {
       const changes: Change[] = [];
       for (const [path, e] of st.remote) {
@@ -1186,7 +1362,7 @@ export class SyncEngine {
       }
       if (!changes.length) return false;
       const seq = st.lastSeq + 1;
-      const hash = await repo.writeCommit({ seq, device: this.cfg.deviceName, time: this.now(), changes, prev: st.head, moved: true });
+      const hash = await this.put({ seq, device: this.cfg.deviceName, time: this.now(), changes, prev: st.head, moved: true });
       if (hash) {
         st.apply({ seq, device: this.cfg.deviceName, time: 0, changes, hash, moved: true });
         for (const { path, entry } of changes) {

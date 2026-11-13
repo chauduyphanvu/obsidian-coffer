@@ -1,7 +1,7 @@
 // What a restore does, and how the past reads to a person. No Obsidian import, so it runs under plain Node tests.
 import { pool } from '../core/bytes.ts';
 import { compileExcludes, type SyncConfig } from '../core/config.ts';
-import { deleteLimit, type GcResult } from '../core/engine.ts';
+import { deleteLimit, type GcResult, type RepairReport, type SyncEngine } from '../core/engine.ts';
 import { diffCounts, lineDiff, type DiffRegion } from '../core/merge.ts';
 import { ext, vaultKey } from '../core/paths.ts';
 import { DAY } from '../core/retention.ts';
@@ -9,7 +9,7 @@ import { errorText, plural } from '../core/text.ts';
 import type { CommitSummary, RestorePlan } from '../core/timeline.ts';
 import type { Entry, FileStat } from '../core/types.ts';
 import type { VerifyReport } from '../core/verify.ts';
-import { MAX_COMPARE_BYTES, asText, sameBytes } from './status.ts';
+import { MAX_COMPARE_BYTES, asText, describeFailure, sameBytes } from './status.ts';
 
 /** `add` brings back a file that is not there now, `change` replaces one that is, `remove` takes one away. */
 export interface Step {
@@ -31,6 +31,34 @@ export function restoreSteps(plan: RestorePlan, current: Map<string, unknown>, k
     .map((w) => ({ kind: current.has(w.path) ? ('change' as const) : ('add' as const), path: w.path, entry: w.entry }))
     .sort(byPath);
   return { steps: [...remove, ...write], left: plan.remove.length + plan.write.length - remove.length - write.length };
+}
+
+/**
+ * `kept`, and the files `engine` leaves in storage until asked for, as they are now. Those are not on this device, so
+ * a restore would count them among the files to remove or change. Asked of the engine and not of the last sync, which
+ * may not have run yet since the app started.
+ */
+export async function keepDeferred(kept: (path: string) => boolean, engine: Pick<SyncEngine, 'deferred'>): Promise<(path: string) => boolean> {
+  const left = new Set((await engine.deferred()).map((f) => f.path));
+  return (path) => kept(path) || left.has(path);
+}
+
+/** What a restore says of the paths it left as they are: excluded here, or left in storage. */
+export const leftNote = (left: number) => `${plural(left, 'file')} left out of sync or in storage on this device ${left === 1 ? 'stays as it is' : 'stay as they are'}.`;
+
+/** What becomes of `n` files a restore wrote: the next sync sends them, unless the place only receives, which never sends. */
+export function sentNote(n: number, receivesOnly: boolean): string {
+  if (!receivesOnly) return `The next sync sends ${n === 1 ? 'it' : 'them'} to your other devices.`;
+  return `The restored ${n === 1 ? 'file stays' : 'files stay'} on this device and ${n === 1 ? 'is' : 'are'} not sent, because this device only receives changes.`;
+}
+
+/** A failed read of the history, for the screens that only read it. A pack that is gone costs the versions in it, and stops nothing else. */
+export function historyFailure(e: unknown): string {
+  if (/^Remote pack \S+ is missing/.test(errorText(e))) {
+    return `The data of this version is no longer in storage, so it cannot be restored. The files on this device are untouched. “Check synced data for damage” shows what else is affected. (${errorText(e)})`;
+  }
+  const p = describeFailure(e);
+  return p.id.startsWith('failed') ? p.detail : `${p.title}. ${p.detail}`;
 }
 
 export function countSteps(steps: Step[]): Record<Step['kind'], number> {
@@ -352,18 +380,31 @@ export function previewVersion(version: Uint8Array | undefined, current: Uint8Ar
 export interface VerifyFinding {
   title: string;
   detail: string;
-  /** Files whose current version is affected. */
+  /** Files whose current version is affected; for earlier versions lost, the files they belong to. */
   files: string[];
+  /** `warning` when the current files are fine and only earlier versions are lost. */
+  tone: 'critical' | 'warning';
   /** The checker's own words, for anyone who wants them. */
   messages: string[];
 }
+
+/** Chosen by a problem's `earlier`, so its pattern matches nothing. */
+const EARLIER: [RegExp, string, string] = [
+  /(?!)/,
+  'Earlier versions can no longer be restored',
+  'The current version of these files is fine, but an earlier version that history offers was stored in data that is gone, and no file has it now.',
+];
 
 const FINDINGS: [RegExp, string, string][] = [
   [/^pack\//, 'Stored file data is missing or damaged', 'Some of the encrypted data the files below are stored in could not be found or read. Other devices may be unable to download them.'],
   [/^log\//, 'Part of the sync history is missing or damaged', 'Devices may stop syncing until it is repaired, and some earlier times may not be restorable.'],
   [/^snap\//, 'A stored overview of the vault is damaged', 'New devices start from it, so setting one up may fail.'],
   [/(?:)/, 'Something in storage does not add up', 'The details below say what.'],
+  EARLIER,
 ];
+
+/** Whether storing data again from this device's files could help: it cannot bring back what only earlier versions need. */
+export const canRepair = (r: VerifyReport) => r.problems.some((p) => p.object?.startsWith('pack/') && !p.earlier);
 
 /** A check's report in plain words: what was checked, and each kind of problem once, with the files it affects. */
 export function describeVerify(r: VerifyReport): { ok: boolean; title: string; detail: string; findings: VerifyFinding[] } {
@@ -373,10 +414,10 @@ export function describeVerify(r: VerifyReport): { ok: boolean; title: string; d
   if (!r.problems.length) return { ok: true, title: 'No damage found', detail: checked, findings: [] };
   const found = new Map<number, VerifyFinding>();
   for (const p of r.problems) {
-    const i = FINDINGS.findIndex(([re]) => re.test(p.object ?? ''));
+    const i = p.earlier ? FINDINGS.length - 1 : FINDINGS.findIndex(([re]) => re.test(p.object ?? ''));
     let f = found.get(i);
-    if (!f) found.set(i, (f = { title: FINDINGS[i][1], detail: FINDINGS[i][2], files: [], messages: [] }));
-    f.files.push(...(p.paths ?? []));
+    if (!f) found.set(i, (f = { title: FINDINGS[i][1], detail: FINDINGS[i][2], files: [], tone: p.earlier ? 'warning' : 'critical', messages: [] }));
+    f.files.push(...(p.paths ?? p.earlier ?? []));
     f.messages.push(p.message);
   }
   const findings = [...found.entries()].sort(([a], [b]) => a - b).map(([, f]) => ({ ...f, files: [...new Set(f.files)].sort() }));
@@ -386,6 +427,57 @@ export function describeVerify(r: VerifyReport): { ok: boolean; title: string; d
     detail: `${checked} Nothing was changed. Keep the files on your devices: they may be the only good copies.`,
     findings,
   };
+}
+
+export interface RepairGroup {
+  title: string;
+  detail: string;
+  files: string[];
+  /** `ok` for what was fixed, `warning` for what history lost, `critical` for what is still missing. */
+  tone: 'ok' | 'warning' | 'critical';
+}
+
+/**
+ * A repair's report in plain words: what was stored again, what could not be, and what history lost. A repair that
+ * found nothing says how far it looked: without `deep` it saw that every object is there and long enough, not what is inside.
+ */
+export function describeRepair(r: RepairReport, deep = false): { ok: boolean; title: string; detail: string; groups: RepairGroup[] } {
+  const looked = deep
+    ? 'is there and has its full size, and what your files use was read and is intact'
+    : 'is there and has its full size. A quick look cannot read what is inside them: the thorough check does';
+  const groups: RepairGroup[] = [];
+  if (r.repaired.length) {
+    groups.push({
+      title: 'Stored again from this device',
+      detail: 'These files were missing or damaged in storage. Their data was stored again from the copies on this device, so other devices can download them.',
+      files: r.repaired,
+      tone: 'ok',
+    });
+  }
+  if (r.unrepaired.length) {
+    groups.push({
+      title: 'Still missing: run this on a device that has them',
+      detail: 'This device does not have all the data these files are stored in. Run the repair on a device that has them, and keep their files on your devices meanwhile: they may be the only good copies.',
+      files: r.unrepaired,
+      tone: 'critical',
+    });
+  }
+  if (r.historyOnly.length) {
+    groups.push({
+      title: 'Earlier versions that can no longer be restored',
+      detail: 'The current version of these files is fine, but an earlier version that history offers was stored in data that is gone, and no file has it now.',
+      files: r.historyOnly,
+      tone: 'warning',
+    });
+  }
+  if (!groups.length) return { ok: true, title: 'Nothing to repair', detail: `Every stored object that your files and their history need ${looked}.`, groups };
+  const stored = r.chunks ? `Stored ${plural(r.chunks, 'piece')} of data again.` : 'Storage still held the same data for other files, so nothing had to be uploaded.';
+  if (r.unrepaired.length) {
+    const done = r.repaired.length ? `Repaired ${plural(r.repaired.length, 'file')}. ${stored}` : 'Nothing could be stored again.';
+    return { ok: false, title: `${plural(r.unrepaired.length, 'file')} could not be repaired`, detail: done, groups };
+  }
+  if (r.repaired.length) return { ok: true, title: `Repaired ${plural(r.repaired.length, 'file')}`, detail: stored, groups };
+  return { ok: true, title: 'Nothing to repair', detail: `Every stored object that your files need ${looked}.`, groups };
 }
 
 /** What a clean-up of storage did, in plain words, including when there was nothing to do. */

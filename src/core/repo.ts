@@ -36,6 +36,21 @@ interface WireCommit {
   f?: 1;
 }
 
+/**
+ * A header made beside the commits and packs of a vault whose own is gone would lock every device out, so that is
+ * refused before anything is written. Only a missing header gets here: a normal open lists nothing.
+ */
+async function refuseOrphans(store: RemoteStore): Promise<void> {
+  for (const prefix of ['log/', 'snap/', 'pack/']) {
+    if ((await store.list(prefix)).length) {
+      throw new Error(
+        `The vault key file, vault.json, is missing from storage, though it still holds ${prefix} data. Put it back from a backup or from bucket versioning; ` +
+          'nothing was written, so no new vault was started beside the old data.',
+      );
+    }
+  }
+}
+
 function encCommit(c: Commit): WireCommit {
   const pt = new PackTable();
   const changes = c.changes.map((ch): [string, WireEntry | null] => [ch.path, ch.entry && encEntry(ch.entry, pt)]);
@@ -63,29 +78,43 @@ const seqOf = (key: string) => Number(key.slice(key.lastIndexOf('/') + 1));
  *   pruned       how far back cleanup has removed history (`prunedTo`), so no device offers what is gone
  *   dev/<id>     one device's heartbeat, an encrypted document
  *   any other    encrypted documents outside the log (readDoc, writeDoc)
- * Log objects are never deleted: a missing next key must always mean "nothing newer".
+ * Log objects are never deleted, except a commit its own writer takes back at once: a missing next key must always
+ * mean "nothing newer".
  */
 export class Repo {
   readonly id: string;
   private store: RemoteStore;
   private chunk: ChunkParams;
   private keys: Keys;
+  private iter: number;
 
   private constructor(store: RemoteStore, header: Header, keys: Keys) {
     this.store = store;
     this.id = header.id;
     this.chunk = header.chunk;
     this.keys = keys;
+    this.iter = header.kdf.iter;
   }
 
-  /** True when the storage already holds a vault, so setup asks for its passphrase rather than a new one. */
+  /** The PBKDF2 cost of the passphrase that wraps this vault's key. */
+  get kdfIterations(): number {
+    return this.iter;
+  }
+
+  /**
+   * True when the storage already holds a vault, so setup asks for its passphrase rather than a new one. Throws when it
+   * holds a vault's objects without the header (see `refuseOrphans`).
+   */
   static async exists(store: RemoteStore): Promise<boolean> {
-    return (await store.get(HEADER_KEY)) !== null;
+    if ((await store.get(HEADER_KEY)) !== null) return true;
+    await refuseOrphans(store);
+    return false;
   }
 
   static async open(store: RemoteStore, passphrase: string, create: { kdfIterations: number; chunk: ChunkParams }): Promise<Repo> {
     let raw = await store.get(HEADER_KEY);
     if (!raw) {
+      await refuseOrphans(store);
       const { header: kdf, keys } = await createKeys(passphrase, create.kdfIterations);
       const header: Header = { format: FORMAT, id: toB64(randomBytes(12)), kdf, chunk: create.chunk };
       if (await store.put(HEADER_KEY, utf8.encode(JSON.stringify(header)), { ifNoneMatch: true })) {
@@ -134,6 +163,19 @@ export class Repo {
     return (await this.store.put(key, sealed, { ifNoneMatch: true })) ? hash : null;
   }
 
+  /**
+   * Takes back the commit this device just wrote (`hash` is what `writeCommit` returned), which turned out to sit on a
+   * log that is not the one it saw. Only while storage still holds that commit, and in one attempt: a delete sent again
+   * after its reply was lost would remove whatever another device committed at this number since.
+   */
+  async retractCommit(seq: number, hash: string): Promise<void> {
+    const key = seqKey('log', seq);
+    const raw = await this.store.get(key);
+    if (!raw) return;
+    if ((await digest(raw)) !== hash) throw new Error(`commit ${seq} in storage is not the one this device wrote`);
+    await this.store.delete(key, { once: true });
+  }
+
   /** The `count` commits ending at `seq` in one object, so history does not fetch them one by one. */
   async writeDigest(seq: number, commits: Commit[]): Promise<void> {
     const key = seqKey('idx', seq);
@@ -170,12 +212,13 @@ export class Repo {
     await this.store.put(PRUNED_KEY, await this.sealJson(PRUNED_KEY, { floor }));
   }
 
-  async changePassphrase(oldPassphrase: string, newPassphrase: string): Promise<void> {
+  async changePassphrase(oldPassphrase: string, newPassphrase: string, iterations: number): Promise<void> {
     const raw = await this.store.get(HEADER_KEY);
     if (!raw) throw new Error('Remote vault header is missing');
     const header = JSON.parse(new TextDecoder().decode(raw)) as Header;
-    header.kdf = await rewrapKeys(header.kdf, oldPassphrase, newPassphrase);
+    header.kdf = await rewrapKeys(header.kdf, oldPassphrase, newPassphrase, iterations);
     await this.store.put(HEADER_KEY, utf8.encode(JSON.stringify(header)));
+    this.iter = header.kdf.iter;
   }
 
   async commitSeqsAfter(seq: number): Promise<number[]> {

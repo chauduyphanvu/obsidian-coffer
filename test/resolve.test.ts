@@ -199,7 +199,7 @@ test('a file counts as changed since it was shown by its bytes when known, else 
 });
 
 test('the conflict problem follows the copies still waiting, and goes when the last is resolved', () => {
-  const r = { errors: [{ path: 'x.md', message: 'EACCES' }], tooLarge: [] };
+  const r = { errors: [{ path: 'x.md', message: 'EACCES' }], tooLarge: [], unsent: [] };
   const copies = ['a (conflict phone 20261111-120000).md', 'b (conflict phone 20261111-120000).md'];
   const problems = resultProblems(r, copies, 200);
   assert.deepEqual(problems.map((p) => p.id.split(':')[0]), ['failed-files', 'conflicts']);

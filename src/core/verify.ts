@@ -1,7 +1,11 @@
 import { pool } from './bytes.ts';
+import { placeKey } from './compact.ts';
+import type { SyncConfig } from './config.ts';
 import { packRanges } from './packer.ts';
 import { seqKey, type Repo } from './repo.ts';
-import { errorText } from './text.ts';
+import { keptVersions } from './retention.ts';
+import type { LocalState } from './state.ts';
+import { errorText, plural } from './text.ts';
 import { sameContent, type ChunkRef, type Commit, type Entry } from './types.ts';
 
 export interface VerifyOptions {
@@ -16,6 +20,8 @@ export interface VerifyProblem {
   object?: string;
   /** Files whose current version it affects. */
   paths?: string[];
+  /** Files whose current version is fine, but an earlier one that history offers was stored in this pack and can no longer be restored. */
+  earlier?: string[];
 }
 
 export interface VerifyReport {
@@ -40,6 +46,8 @@ interface Context extends VerifyOptions {
   rangeGapBytes: number;
   /** The newest commit this device has seen, so a log cut back or forked under it is reported. */
   seen?: { seq: number; head?: string };
+  /** When given, also finds data that only earlier versions history offers (`keptVersions`, as of `now`) need: see `lostInHistory`. */
+  history?: { cfg: SyncConfig; now: number };
 }
 
 /** Ranges of a pack in flight at once in deep mode, each at most MAX_RANGE: memory stays at a few packs' worth. */
@@ -49,7 +57,10 @@ const LOG_WINDOW = 256;
 
 /**
  * Checks the remote end to end and never writes to it. Quick mode reads every commit and lists
- * snapshots and packs; deep mode also downloads every chunk of the current files.
+ * snapshots and packs; deep mode also downloads every chunk of the current files. With `history`, and a log that is
+ * whole, it also looks at what the earlier versions need, in the packs listed already: besides what the commits cost,
+ * a read of `pruned`, a list of the snapshots, a read of the snapshot the kept moments start from, and one read for
+ * each interval of `snapshotEvery` commits since then, or for each commit where its digest is missing.
  */
 export async function verifyRepo(repo: Repo, o: Context): Promise<VerifyReport> {
   const report: VerifyReport = { deep: !!o.deep, commits: 0, snapshot: 0, files: 0, packs: 0, chunks: 0, bytes: 0, problems: [] };
@@ -60,8 +71,102 @@ export async function verifyRepo(repo: Repo, o: Context): Promise<VerifyReport> 
   const { files, movedBy } = await replayLog(repo, o, seqs, snaps.at(-1)?.seq ?? 0, report, problem);
   report.files = files.size;
   const bad = checkPacks(files, movedBy, packs, report, problem);
-  if (o.deep) await checkChunks(repo, o, files, bad, report, problem);
+  const damaged = chunksIn(files, bad);
+  if (o.deep) await checkChunks(repo, o, files, bad, report, problem, (ref) => void damaged.set(placeKey(ref), ref));
+  // Which earlier versions history offers is read off the log, which says so only when it is whole.
+  if (o.history && !report.problems.some((p) => /^(log|snap)\//.test(p.object ?? ''))) {
+    await checkHistory(repo, o.history, { lastSeq: seqs.at(-1) ?? 0, remote: files }, packs, damaged, bad, report);
+  }
   return report;
+}
+
+/** The chunks the files keep in the packs `bad`, by place. */
+function chunksIn(files: Map<string, Entry>, bad: Set<string>): Map<string, ChunkRef> {
+  const out = new Map<string, ChunkRef>();
+  for (const e of files.values()) for (const ref of e.chunks) if (bad.has(ref.pack)) out.set(placeKey(ref), ref);
+  return out;
+}
+
+/** The current files with a chunk in a damaged place. */
+export function affectedBy(files: Map<string, Entry>, damaged: Map<string, ChunkRef>): string[] {
+  return [...files].filter(([, e]) => e.chunks.some((c) => damaged.has(placeKey(c)))).map(([path]) => path);
+}
+
+type Listing = { id: string; size: number }[];
+type Lost = Map<string, { end: number; paths: Set<string> }>;
+
+/**
+ * The packs, missing or too short, that earlier versions history offers (`keptVersions`, as of `now`) need, each with
+ * the files whose earlier versions are in it and how long it must be for them. A chunk counts only when no current
+ * file keeps it where it can be read, and files in `skip` are left out, being reported for their current version.
+ * Reads the log as `keptVersions` does, and writes nothing unless `mend`.
+ */
+export async function lostInHistory(
+  repo: Repo, st: Pick<LocalState, 'lastSeq' | 'remote'>, cfg: SyncConfig, now: number, listing: Listing, damaged: Map<string, ChunkRef>, skip: Set<string>, mend = true,
+): Promise<Lost> {
+  const size = new Map(listing.map((p) => [p.id, p.size]));
+  const lost = (c: ChunkRef) => (size.get(c.pack) ?? -1) < c.off + c.len;
+  const whole = new Set<string>();
+  for (const e of st.remote.values()) for (const c of e.chunks) if (!damaged.has(placeKey(c))) whole.add(c.id);
+  const out: Lost = new Map();
+  await keptVersions(repo, st, cfg, now, (path, e) => {
+    if (skip.has(path)) return;
+    for (const c of e.chunks) {
+      if (!lost(c) || whole.has(c.id)) continue;
+      let n = out.get(c.pack);
+      if (!n) out.set(c.pack, (n = { end: 0, paths: new Set() }));
+      n.end = Math.max(n.end, c.off + c.len);
+      n.paths.add(path);
+    }
+  }, mend);
+  return out;
+}
+
+/**
+ * Reports, apart from the problems of the current files, each pack that only earlier versions need and that is missing
+ * or too short. A pack in `bad` already has its report, for the current files, and repairing it may bring the earlier
+ * versions back too.
+ */
+async function checkHistory(
+  repo: Repo, h: NonNullable<Context['history']>, st: Pick<LocalState, 'lastSeq' | 'remote'>, listing: Listing, damaged: Map<string, ChunkRef>, bad: Set<string>, report: VerifyReport,
+): Promise<void> {
+  let lost: Lost;
+  try {
+    lost = await lostInHistory(repo, st, h.cfg, h.now, listing, damaged, new Set(affectedBy(st.remote, damaged)), false);
+  } catch (e) {
+    report.problems.push({ message: `Earlier versions could not be checked: ${errorText(e)}` });
+    return;
+  }
+  const size = new Map(listing.map((p) => [p.id, p.size]));
+  for (const [pack, n] of lost) {
+    if (bad.has(pack)) continue;
+    const have = size.get(pack);
+    const files = plural(n.paths.size, 'file');
+    report.problems.push({
+      message:
+        have === undefined
+          ? `Pack ${pack} is missing: earlier versions of ${files} cannot be restored, though the current files are fine`
+          : `Pack ${pack} is ${have} bytes, shorter than the ${n.end} that earlier versions of ${files} need: they cannot be restored, though the current files are fine`,
+      object: `pack/${pack}`,
+      earlier: [...n.paths].sort(),
+    });
+  }
+}
+
+/**
+ * The chunks the current files keep in places that cannot be read, by place (`placeKey`), from one listing of
+ * the packs. A pack that is missing or shorter than its chunks need is suspect throughout, so every chunk the
+ * files keep in it counts. With `deep`, a chunk that cannot be downloaded, opened or matched to its id counts too.
+ */
+export async function damagedChunks(
+  repo: Repo, files: Map<string, Entry>, listing: { id: string; size: number }[], o: VerifyOptions & { concurrency: number; rangeGapBytes: number },
+): Promise<Map<string, ChunkRef>> {
+  const report: VerifyReport = { deep: !!o.deep, commits: 0, snapshot: 0, files: 0, packs: 0, chunks: 0, bytes: 0, problems: [] };
+  const none = () => {};
+  const bad = checkPacks(files, new Map(), listing, report, none);
+  const damaged = chunksIn(files, bad);
+  if (o.deep) await checkChunks(repo, o, files, bad, report, none, (ref) => void damaged.set(placeKey(ref), ref));
+  return damaged;
 }
 
 type Problem = (message: string, object?: string, paths?: Iterable<string>) => void;
@@ -211,7 +316,9 @@ function checkPacks(
 }
 
 /** Downloads, decrypts and hashes each stored chunk the files use, once, a few ranges at a time. */
-async function checkChunks(repo: Repo, o: Context, files: Map<string, Entry>, skip: Set<string>, report: VerifyReport, problem: Problem): Promise<void> {
+async function checkChunks(
+  repo: Repo, o: Context, files: Map<string, Entry>, skip: Set<string>, report: VerifyReport, problem: Problem, onDamaged?: (ref: ChunkRef) => void,
+): Promise<void> {
   const byPack = new Map<string, Map<number, { ref: ChunkRef; paths: string[] }>>();
   for (const [path, e] of files) {
     for (const ref of e.chunks) {
@@ -232,6 +339,7 @@ async function checkChunks(repo: Repo, o: Context, files: Map<string, Entry>, sk
     const data = await repo.getPackRange(r.pack, r.start, r.end);
     if (!data || data.length < r.end - r.start) {
       problem(`Pack ${r.pack} is missing or shorter than its chunks need`, `pack/${r.pack}`, r.refs.flatMap((ref) => pathsOf.get(ref)!));
+      for (const ref of r.refs) onDamaged?.(ref);
       done += r.refs.length;
       o.onProgress?.({ phase: 'chunks', done, total });
       return;
@@ -241,12 +349,16 @@ async function checkChunks(repo: Repo, o: Context, files: Map<string, Entry>, sk
       const paths = pathsOf.get(ref)!;
       const at = ref.off - r.start;
       const where = `Chunk ${ref.id} in pack ${ref.pack}`;
+      const fail = (what: string) => {
+        problem(`${where} ${what}`, `pack/${ref.pack}`, paths);
+        onDamaged?.(ref);
+      };
       try {
         const plain = await repo.openChunk(ref.id, data.subarray(at, at + ref.len));
-        if (plain.length !== ref.size) problem(`${where} has the wrong size: corrupted`, `pack/${ref.pack}`, paths);
-        else if ((await repo.chunkId(plain)) !== ref.id) problem(`${where} does not match its id: corrupted`, `pack/${ref.pack}`, paths);
+        if (plain.length !== ref.size) fail('has the wrong size: corrupted');
+        else if ((await repo.chunkId(plain)) !== ref.id) fail('does not match its id: corrupted');
       } catch (e) {
-        problem(`${where} cannot be read: ${errorText(e)}`, `pack/${ref.pack}`, paths);
+        fail(`cannot be read: ${errorText(e)}`);
       }
       report.chunks++;
       o.onProgress?.({ phase: 'chunks', done: ++done, total });

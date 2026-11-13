@@ -64,8 +64,11 @@ export function inShare(p: Problem, share: { id: string; folder: string }): Prob
   return { ...p, id: `share:${share.id}:${p.id}`, title: `Shared folder “${share.folder}”: ${p.title}`, share: share.id };
 }
 
-/** What one synced place (the vault, or a shared folder) has to report, worst first. */
-export function targetProblems(t: { failure?: Problem; found: Problem[]; conflictCopies: string[]; lastSuccess: number }, now: number): Problem[] {
+/**
+ * What one synced place (the vault, or a shared folder) has to report, worst first. Files changed here are only a
+ * problem while the place only receives: once that is off, the next sync sends them.
+ */
+export function targetProblems(t: { failure?: Problem; found: Problem[]; conflictCopies: string[]; lastSuccess: number; readOnly: boolean }, now: number): Problem[] {
   const out: Problem[] = [];
   // A temporary failure (offline) only counts once it has gone on for a day.
   if (t.failure && t.failure.id !== 'offline') out.push(t.failure);
@@ -73,19 +76,39 @@ export function targetProblems(t: { failure?: Problem; found: Problem[]; conflic
     const stale = staleProblem(t.lastSuccess, now);
     if (stale) out.push(stale);
   }
-  out.push(...withConflicts(t.found, t.conflictCopies));
+  out.push(...withConflicts(t.found, t.conflictCopies).filter((p) => t.readOnly || p.id !== 'unsent'));
   return out.sort((a, b) => (a.severity === b.severity ? 0 : a.severity === 'critical' ? -1 : 1));
 }
 
 export type Tone = 'ok' | 'busy' | 'warning' | 'critical' | 'off';
 
-/** One line for a synced place: its worst problem, or when it last synced and how much there is to review. */
+/** One line for a synced place: its worst problem, or when it last synced, whether it is offline and how much there is to review. */
 export function statusText(problems: Problem[], lastSuccess: number, offline: boolean): { text: string; tone: Tone } {
   const critical = problems.filter((p) => p.severity === 'critical');
   if (critical.length) return { text: critical.length === 1 ? critical[0].title : `${plural(critical.length, 'problem')} need attention`, tone: 'critical' };
   const when = lastSuccess ? `Synced ${new Date(lastSuccess).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : 'Not synced yet';
-  if (problems.length) return { text: `${when} · ${plural(problems.length, 'thing', 'things')} to review`, tone: 'warning' };
-  return { text: offline ? `${when} · offline` : when, tone: 'ok' };
+  const review = problems.length ? `${plural(problems.length, 'thing', 'things')} to review` : '';
+  return { text: [when, offline && 'offline', review].filter(Boolean).join(' · '), tone: problems.length ? 'warning' : 'ok' };
+}
+
+/** What the problems screen says when it lists nothing: all in sync, or what keeps that from being so. */
+export function quietText(offline: boolean, waiting: boolean): string {
+  if (offline) return "Can't reach the storage, so changes made here are not sent and changes from other devices do not arrive. Sync tries again on its own.";
+  return waiting ? 'Changes made here are waiting to be sent.' : 'Everything is in sync.';
+}
+
+/** The settings row for files left in storage: how many, once every synced place has said, otherwise only what the row is. */
+export function leftInStorage(counts: (number | undefined)[]): string {
+  const known = counts.filter((n): n is number => n !== undefined);
+  return known.length === counts.length ? `${plural(known.reduce((a, n) => a + n, 0), 'file')} left in storage` : 'Files left in storage';
+}
+
+/** What "Keep all files" does with the `kept` files: those `left` over the download limit stay in storage instead of being copied back. */
+export function keptNote(kept: number, left: number): string {
+  const back = `${plural(kept - left, 'file')} will be copied back.`;
+  if (!left) return back;
+  const stay = `${plural(left, 'file')} over the download limit ${left === 1 ? 'stays' : 'stay'} in storage until you choose ${left === 1 ? 'it' : 'them'}.`;
+  return kept > left ? `${back} ${stay}` : stay;
 }
 
 /** Probably temporary: no network, or the storage is busy. Not worth an alarm until it lasts. */
@@ -133,7 +156,7 @@ export function describeFailure(e: unknown): Problem {
       id: 'access',
       severity: 'critical',
       title: 'The storage refused the access keys',
-      detail: `Sync is stopped. Check the keys, and that they may read and write this bucket or folder. (${message})`,
+      detail: `Sync is stopped. Check the keys, and that they may read and write this bucket or folder. If these keys may only read, turn on Only receive changes. (${message})`,
       action: 'settings',
     };
   }
@@ -158,7 +181,7 @@ export function describeFailure(e: unknown): Problem {
 }
 
 /** Files a finished sync could not handle, and conflict copies still waiting for the user. */
-export function resultProblems(r: Pick<SyncResult, 'errors' | 'tooLarge'>, conflictCopies: string[], maxFileSizeMB: number): Problem[] {
+export function resultProblems(r: Pick<SyncResult, 'errors' | 'tooLarge' | 'unsent'>, conflictCopies: string[], maxFileSizeMB: number): Problem[] {
   const out: Problem[] = [];
   if (r.errors.length) {
     out.push({
@@ -183,6 +206,19 @@ export function resultProblems(r: Pick<SyncResult, 'errors' | 'tooLarge'>, confl
           : `Over the ${maxFileSizeMB} MB limit set on this device, so they are not synced to or from it. Raise the limit in settings to include them.`,
       files: r.tooLarge,
       action: 'settings',
+    });
+  }
+  if (r.unsent.length) {
+    out.push({
+      // One id however many files, so a device that is meant to keep local changes is told once.
+      id: 'unsent',
+      severity: 'warning',
+      title: `${plural(r.unsent.length, 'file')} changed here, not sent`,
+      detail:
+        'This device only receives changes, so what is changed here stays here. A file changed in storage as well is merged with the change made here; where that cannot be done, ' +
+        'storage\'s version takes the name and this device\'s is kept beside it. Turn off Only receive changes in settings to send them.',
+      files: r.unsent,
+      action: 'files',
     });
   }
   return out;

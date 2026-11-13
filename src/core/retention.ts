@@ -97,14 +97,17 @@ export class Reads {
   private commits = new Map<number, Promise<Commit | null>>();
   private digests = new Map<number, Promise<Commit[] | null>>();
   private snaps = new Map<number, Promise<Map<string, Entry> | null>>();
+  private mends: boolean;
   /** Commits read from the log itself. */
   private read = new Map<number, Commit>();
   /** Intervals, by their last commit, whose digest is missing or lost the commits' flags. See `mend`. */
   private stale = new Set<number>();
 
-  constructor(repo: Repo, cfg: SyncConfig) {
+  /** `mend` false never writes a digest, for a caller that promises not to change storage. */
+  constructor(repo: Repo, cfg: SyncConfig, mend = true) {
     this.repo = repo;
     this.cfg = cfg;
+    this.mends = mend;
   }
 
   commit(seq: number): Promise<Commit | null> {
@@ -170,7 +173,7 @@ export class Reads {
     await pool(out, this.cfg.concurrency, async (_, i) => {
       out[i] = await this.get(lo + i);
     });
-    if (this.stale.size) await this.mend();
+    if (this.mends && this.stale.size) await this.mend();
     return out;
   }
 }
@@ -339,26 +342,19 @@ export interface CleanupResult {
 }
 
 /**
- * Deletes packs that no kept version uses, and snapshots no longer needed to rebuild the earliest
- * moment. A version is kept when it was current at a kept moment (`Thinning`), or is current now. Packs
- * younger than a day are kept: a device may still be about to commit them. Returns what is left.
- *
- * The floor it uses is recorded (`Repo.prunedTo`) before anything is deleted, and every device offers
- * history from no earlier than the record, whatever retention it keeps itself. A device that read the record
- * before a cleanup moved it may still offer, for as long as it holds on to what it read, what that cleanup
- * then removes, when the cleanup's device keeps fewer days than it does (one that keeps as many or more
- * removes nothing such a device offers for a day after: see GC_SKEW). Storage cannot write only if unchanged,
- * so two cleanups at once could put the record back: each reads it again just before writing it and once more
- * after deleting, and writes it again if it is behind its own floor.
+ * Hands `keep` each version kept as of `at`, with its path: one that was current at the end of a kept moment
+ * (`Thinning`), or is current now. Returns the floor the moments are counted from, how far cleanup has pruned,
+ * the snapshots, and the snapshot the replay started from. With `mend` false it writes nothing (see `Reads`).
  */
-export async function collectGarbage(
+export async function keptVersions(
   repo: Repo,
-  st: LocalState,
+  st: Pick<LocalState, 'lastSeq' | 'remote'>,
   cfg: SyncConfig,
-  now: number,
-): Promise<{ result: CleanupResult; packs: { id: string; size: number; modified: number }[] }> {
-  const at = now - GC_SKEW;
-  const reads = new Reads(repo, cfg);
+  at: number,
+  keep: (path: string, entry: Entry) => void,
+  mend = true,
+): Promise<{ floor: number; pruned: number; snaps: Snapshot[]; base: number }> {
+  const reads = new Reads(repo, cfg, mend);
   const [snaps, pruned] = await Promise.all([repo.snapshots(), repo.prunedTo()]);
   const floor = Math.min(st.lastSeq, Math.max(floorSnapshot(snaps, cfg, at)?.seq ?? 0, pruned));
   const after = await readAll(reads, floor + 1, st.lastSeq);
@@ -384,10 +380,8 @@ export async function collectGarbage(
   const files = base ? await reads.snapshot(base) : new Map<string, Entry>();
   if (!files) throw new Error(`Snapshot ${base} cannot be read`);
 
-  // Replay, marking each entry that was current at the end of a kept moment: just before the next user
+  // Replay, keeping each entry that was current at the end of a kept moment: just before the next user
   // commit, so moves made in between are part of it. An entry is current from `since` until replaced.
-  const live = new Set<string>();
-  const mark = (e: Entry) => e.chunks.forEach((c) => live.add(c.pack));
   const table = new Map<string, { entry: Entry; since: number }>();
   for (const [path, entry] of files) table.set(path, { entry, since: base });
   const from = earliest?.seq ?? 0;
@@ -400,13 +394,37 @@ export async function collectGarbage(
     }
     for (const { path, entry } of c.changes) {
       const old = table.get(path);
-      if (old && old.since <= keptEnd) mark(old.entry);
+      if (old && old.since <= keptEnd) keep(path, old.entry);
       if (entry) table.set(path, { entry, since: c.seq });
       else table.delete(path);
     }
   }
-  for (const { entry } of table.values()) mark(entry);
-  for (const e of st.remote.values()) mark(e);
+  for (const [path, { entry }] of table) keep(path, entry);
+  for (const [path, e] of st.remote) keep(path, e);
+  return { floor, pruned, snaps, base };
+}
+
+/**
+ * Deletes packs that no kept version uses, and snapshots no longer needed to rebuild the earliest
+ * moment. A version is kept when it was current at a kept moment (`Thinning`), or is current now. Packs
+ * younger than a day are kept: a device may still be about to commit them. Returns what is left.
+ *
+ * The floor it uses is recorded (`Repo.prunedTo`) before anything is deleted, and every device offers
+ * history from no earlier than the record, whatever retention it keeps itself. A device that read the record
+ * before a cleanup moved it may still offer, for as long as it holds on to what it read, what that cleanup
+ * then removes, when the cleanup's device keeps fewer days than it does (one that keeps as many or more
+ * removes nothing such a device offers for a day after: see GC_SKEW). Storage cannot write only if unchanged,
+ * so two cleanups at once could put the record back: each reads it again just before writing it and once more
+ * after deleting, and writes it again if it is behind its own floor.
+ */
+export async function collectGarbage(
+  repo: Repo,
+  st: LocalState,
+  cfg: SyncConfig,
+  now: number,
+): Promise<{ result: CleanupResult; packs: { id: string; size: number; modified: number }[] }> {
+  const live = new Set<string>();
+  const { floor, pruned, snaps, base } = await keptVersions(repo, st, cfg, now - GC_SKEW, (_, e) => e.chunks.forEach((c) => live.add(c.pack)));
 
   const result: CleanupResult = { packsDeleted: 0, bytesFreed: 0, snapshotsDeleted: 0 };
   const advance = async () => {

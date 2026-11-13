@@ -4,10 +4,10 @@ import { WrongPassphraseError } from '../src/core/crypto.ts';
 import { HistoryError, SafetyError, type SyncResult } from '../src/core/engine.ts';
 import { MissingFolderError } from '../src/core/scopedfs.ts';
 import { plural } from '../src/core/text.ts';
-import { connectError, describeFailure, inShare, isConflictProblem, keysMissingProblem, missingProblem, resultProblems, staleProblem, statusText, summarize, targetProblems, type Problem } from '../src/plugin/status.ts';
+import { connectError, describeFailure, inShare, isConflictProblem, keptNote, keysMissingProblem, leftInStorage, missingProblem, quietText, resultProblems, staleProblem, statusText, summarize, targetProblems, type Problem } from '../src/plugin/status.ts';
 
 const result = (over: Partial<SyncResult> = {}): SyncResult => ({
-  pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0, conflictCopies: [], skipped: 0, tooLarge: [], errors: [], commits: 0, rounds: 1, ...over,
+  pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0, conflictCopies: [], skipped: 0, tooLarge: [], deferred: [], unsent: [], errors: [], commits: 0, rounds: 1, ...over,
 });
 
 test('summaries count in words that read right for one', () => {
@@ -135,11 +135,11 @@ test('one place\'s problems: offline only once it lasts a day, and conflict copi
   const now = 1_800_000_000_000;
   const offline = describeFailure(new Error('fetch failed'));
   const found = resultProblems(result(), ['a (conflict x 20261111-1200).md'], 200);
-  assert.deepEqual(targetProblems({ failure: offline, found: [], conflictCopies: [], lastSuccess: now - 3_600_000 }, now), []);
-  assert.deepEqual(targetProblems({ failure: offline, found: [], conflictCopies: [], lastSuccess: now - 2 * 86_400_000 }, now).map((x) => x.id), ['stale']);
-  assert.deepEqual(targetProblems({ found, conflictCopies: [], lastSuccess: now }, now), [], 'resolved since the sync');
+  assert.deepEqual(targetProblems({ failure: offline, found: [], conflictCopies: [], lastSuccess: now - 3_600_000, readOnly: false }, now), []);
+  assert.deepEqual(targetProblems({ failure: offline, found: [], conflictCopies: [], lastSuccess: now - 2 * 86_400_000, readOnly: false }, now).map((x) => x.id), ['stale']);
+  assert.deepEqual(targetProblems({ found, conflictCopies: [], lastSuccess: now, readOnly: false }, now), [], 'resolved since the sync');
   const failure: Problem = describeFailure(new Error('odd'));
-  assert.deepEqual(targetProblems({ failure, found, conflictCopies: ['a (conflict x 20261111-1200).md'], lastSuccess: now }, now).map((x) => x.severity), ['critical', 'warning']);
+  assert.deepEqual(targetProblems({ failure, found, conflictCopies: ['a (conflict x 20261111-1200).md'], lastSuccess: now, readOnly: false }, now).map((x) => x.severity), ['critical', 'warning']);
 });
 
 test('a status line names the worst problem, or when it synced and how much is left to review', () => {
@@ -150,4 +150,41 @@ test('a status line names the worst problem, or when it synced and how much is l
   assert.deepEqual(statusText(warning, 0, false), { text: 'Not synced yet · 1 thing to review', tone: 'warning' });
   assert.deepEqual(statusText([], 0, true), { text: 'Not synced yet · offline', tone: 'ok' });
   assert.match(statusText([], 1_800_000_000_000, false).text, /^Synced /);
+});
+
+test('offline is told beside whatever else is listed, not instead of it', () => {
+  const warning = resultProblems(result({ tooLarge: ['v.mov'] }), [], 200);
+  assert.deepEqual(statusText(warning, 0, true), { text: 'Not synced yet · offline · 1 thing to review', tone: 'warning' });
+  const two = resultProblems(result({ tooLarge: ['v.mov'], unsent: ['a.md'] }), [], 200);
+  assert.match(statusText(two, 1_800_000_000_000, true).text, /^Synced .* · offline · 2 things to review$/);
+});
+
+test('files changed here are a problem of the place only while it only receives', () => {
+  const now = 1_800_000_000_000;
+  const found = resultProblems(result({ unsent: ['a.md'], tooLarge: ['v.mov'] }), [], 200);
+  const ids = (readOnly: boolean) => targetProblems({ found, conflictCopies: [], lastSuccess: now, readOnly }, now).map((p) => p.id.split(':')[0]);
+  assert.deepEqual(ids(true), ['too-large', 'unsent']);
+  assert.deepEqual(ids(false), ['too-large'], 'turned off since that sync: the next one sends them');
+});
+
+test('the problems screen does not call it in sync while offline or while changes wait', () => {
+  assert.equal(quietText(false, false), 'Everything is in sync.');
+  assert.equal(quietText(false, true), 'Changes made here are waiting to be sent.');
+  for (const waiting of [false, true]) assert.match(quietText(true, waiting), /^Can't reach the storage, so changes made here are not sent/);
+});
+
+test('files left in storage are counted once every place has said, and not before', () => {
+  assert.equal(leftInStorage([2, 0, 1]), '3 files left in storage');
+  assert.equal(leftInStorage([1]), '1 file left in storage');
+  assert.equal(leftInStorage([0]), '0 files left in storage');
+  assert.equal(leftInStorage([2, undefined]), 'Files left in storage', 'a place that has not synced since the app started may hold more');
+  assert.equal(leftInStorage([undefined]), 'Files left in storage');
+});
+
+test('keeping all files says how many come back and how many stay in storage over the download limit', () => {
+  assert.equal(keptNote(42, 0), '42 files will be copied back.');
+  assert.equal(keptNote(1, 0), '1 file will be copied back.');
+  assert.equal(keptNote(42, 3), '39 files will be copied back. 3 files over the download limit stay in storage until you choose them.');
+  assert.equal(keptNote(2, 1), '1 file will be copied back. 1 file over the download limit stays in storage until you choose it.');
+  assert.equal(keptNote(3, 3), '3 files over the download limit stay in storage until you choose them.');
 });

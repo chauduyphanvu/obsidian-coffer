@@ -2,7 +2,7 @@
 // copying an invite link, stopping, and choosing the vault or a shared folder for commands that work on one.
 import { Modal, Notice, SuggestModal, TFile, TFolder, Vault, type App } from 'obsidian';
 import { DEFAULT_CONFIG } from '../core/config.ts';
-import { WrongPassphraseError } from '../core/crypto.ts';
+import { MIN_PASSPHRASE, WrongPassphraseError } from '../core/crypto.ts';
 import { Repo } from '../core/repo.ts';
 import { errorText } from '../core/text.ts';
 import { openRemote } from '../stores/open.ts';
@@ -16,7 +16,9 @@ import {
   describeStorage,
   folderFor,
   folderProblem,
+  linkProblem,
   normalFolder,
+  passphraseProblem,
   remoteSpec,
   sameKeys,
   setupCodeFrom,
@@ -28,10 +30,10 @@ import {
   type Storage,
   type StorageForm,
 } from './settings.ts';
-import { newShareId, rejoinNote } from './shares.ts';
-import { IDS, MIN_PASSPHRASE, formStorage, storageFields, tryStorage, type Keys } from './setup.ts';
+import { mountHint, newShareId, rejoinNote } from './shares.ts';
+import { IDS, formStorage, readOnlyBox, storageFields, tryStorage, type Keys } from './setup.ts';
 import { summarize, type Problem } from './status.ts';
-import { FolderSuggest, button, buttonRow, choice, field, message } from './ui.ts';
+import { FolderSuggest, button, buttonRow, choice, field, message, passphraseFields } from './ui.ts';
 
 /** Files in the vault folder `path`, at any depth; undefined when there is no such folder. */
 function filesIn(app: App, path: string): number | undefined {
@@ -51,7 +53,7 @@ export function renderShares(box: HTMLElement, plugin: CofferPlugin): () => void
   const draw = () => {
     const shares = plugin.settings.shares;
     // Redrawn only when something shown changes, not on every progress step, so a button is not replaced while tapped.
-    const now = JSON.stringify(shares.map((s) => [s.id, s.folder, s.missing, plugin.shareStatus(s), describeStorage(s)]));
+    const now = JSON.stringify(shares.map((s) => [s.id, s.folder, s.missing, s.readOnly, plugin.shareStatus(s), describeStorage(s)]));
     if (now === shown) return;
     shown = now;
     box.empty();
@@ -77,7 +79,15 @@ function shareRow(box: HTMLElement, plugin: CofferPlugin, share: Share): void {
   const status = body.createDiv({ cls: 'coffer-share-status' });
   status.createSpan({ cls: 'coffer-share-dot' });
   status.createSpan({ text });
-  body.createDiv({ cls: 'coffer-share-meta', text: describeStorage(share) });
+  body.createDiv({ cls: 'coffer-share-meta', text: share.readOnly ? `${describeStorage(share)} · Only receives` : describeStorage(share) });
+  const only = body.createEl('label', { cls: 'coffer-check' });
+  const check = only.createEl('input', { attr: { type: 'checkbox' } });
+  check.checked = share.readOnly;
+  check.addEventListener('change', () => {
+    share.readOnly = check.checked;
+    void plugin.saveSettings();
+  });
+  only.appendText(' Only receive changes');
   const actions = el.createDiv({ cls: 'coffer-share-actions' });
   if (share.missing) button(actions, 'Download again', () => downloadAgain(plugin, share), 'cta');
   else button(actions, 'Copy invite link', () => new InviteModal(plugin.app, plugin, share).open());
@@ -95,10 +105,10 @@ export async function downloadAgain(plugin: CofferPlugin, share: Share): Promise
   }
 }
 
-/** Opens `then` for the vault, or first asks which, when the vault has shared folders that sync here. */
-export function pickTarget(plugin: CofferPlugin, title: string, then: (share?: Share) => void): void {
-  const targets = plugin.targets();
-  if (targets.length === 1) then(undefined);
+/** Opens `then` for the vault, or first asks which, when the vault has shared folders that sync here. Only places `fits` count. */
+export function pickTarget(plugin: CofferPlugin, title: string, then: (share?: Share) => void, fits: (share?: Share) => boolean = () => true): void {
+  const targets = plugin.targets().filter(fits);
+  if (targets.length === 1) then(targets[0]);
   else new TargetSuggest(plugin.app, title, targets.map((share) => ({ share })), then).open();
 }
 
@@ -134,6 +144,10 @@ class InviteModal extends Modal {
   private share: Share;
   private link = '';
   private error = '';
+  /** The form for an invite that only reads is showing, with the read-only keys typed into it so far and the link made from them. */
+  private reading = false;
+  private keys = { access: '', secret: '', password: '', user: '' };
+  private readLink = '';
 
   constructor(app: App, plugin: CofferPlugin, share: Share) {
     super(app);
@@ -159,6 +173,7 @@ class InviteModal extends Modal {
   private render(): void {
     const c = this.contentEl;
     c.empty();
+    if (this.reading) return this.readingForm(c);
     c.createEl('p', {
       cls: 'coffer-intro',
       text:
@@ -179,6 +194,78 @@ class InviteModal extends Modal {
         this.render();
       }
     }, 'cta').setDisabled(!this.link);
+    choice(c, 'For someone who may only read', 'They receive this folder and can not change it. You make a key that can only read, and the link carries that one.', () => {
+      this.error = '';
+      this.reading = true;
+      this.render();
+    });
+  }
+
+  /** Read-only keys for the invite. The link is made on one tap and copied on the next, as phones only copy inside a tap. */
+  private readingForm(c: HTMLElement): void {
+    const share = this.share;
+    const dav = share.storageType === 'webdav';
+    const k = this.keys;
+    c.createEl('p', {
+      cls: 'coffer-intro',
+      text:
+        'Make a key in your storage provider that can only read this folder, and enter it here. The link carries that key and turns on Only receive changes for whoever opens it. ' +
+        'They need the passphrase too: tell it to them another way.',
+    });
+    c.createEl('p', {
+      cls: 'coffer-hint',
+      text: dav
+        ? 'WebDAV passwords usually can not be limited to reading. Their Coffer will not write, but nothing stops another program that has the password.'
+        : 'Cloudflare R2, Backblaze B2 and Amazon S3 can limit a key to reading. Without that limit the key could still change what is stored.',
+    });
+    let make!: ReturnType<typeof button>;
+    const edited = (set: (v: string) => void) => (v: string) => {
+      set(v);
+      this.readLink = '';
+      make.setButtonText('Make the link');
+    };
+    if (dav) {
+      field(c, 'User name', { value: k.user }, edited((v) => (k.user = v)));
+      field(c, 'Password', { value: k.password, password: true }, edited((v) => (k.password = v)));
+    } else {
+      field(c, 'Read-only access key ID', { value: k.access }, edited((v) => (k.access = v)));
+      field(c, 'Read-only secret access key', { value: k.secret, password: true }, edited((v) => (k.secret = v)));
+    }
+    message(c, this.error);
+    const row = buttonRow(c);
+    button(row, 'Back', () => {
+      this.reading = false;
+      this.error = '';
+      this.render();
+    });
+    make = button(row, this.readLink ? 'Copy read-only invite link' : 'Make the link', async () => {
+      if (this.readLink) {
+        try {
+          await activeWindow.navigator.clipboard.writeText(this.readLink);
+          new Notice('Invite link copied. Send the passphrase separately.');
+          this.close();
+        } catch (e) {
+          this.error = `Could not copy the link: ${errorText(e)}`;
+          this.render();
+        }
+        return;
+      }
+      const own = (n: string) => this.plugin.secret(n);
+      const sameAsOwn = dav ? k.user.trim() === share.webdavUser.trim() && k.password === own(share.webdavPasswordSecret) : k.access.trim() === own(share.accessKeySecret);
+      this.error = (dav ? !k.user.trim() || !k.password : !k.access.trim() || !k.secret.trim())
+        ? 'Enter the read-only keys.'
+        : sameAsOwn
+          ? 'That is the key this device writes with. Make another one that can only read.'
+          : '';
+      if (!this.error) {
+        try {
+          this.readLink = await this.plugin.readOnlyInviteLink(share, { ...k, access: k.access.trim(), secret: k.secret.trim(), user: k.user.trim() });
+        } catch (e) {
+          this.error = `Could not make the link: ${errorText(e)}`;
+        }
+      }
+      this.render();
+    }, 'cta');
   }
 }
 
@@ -251,6 +338,7 @@ export class ShareModal extends Modal {
   private joining: boolean;
   private folder = '';
   private sameStorage = false;
+  private readOnly = false;
   private provider: Provider = 'r2';
   private form: StorageForm = { location: '', bucket: '', prefix: '', user: '', region: '', pathStyle: true };
   private keys: Keys = { access: '', secret: '', password: '' };
@@ -258,6 +346,10 @@ export class ShareModal extends Modal {
   private exists = false;
   private passphrase = '';
   private repeat = '';
+  /** The generated passphrase on show. */
+  private suggested?: string;
+  /** Redraws what the folder field says about the folder, when something it depends on changes. */
+  private showFolder?: () => void;
   private code: string;
   private invite?: { storage: Partial<Storage>; secrets: [string, string][] };
   private id = newShareId();
@@ -363,7 +455,7 @@ export class ShareModal extends Modal {
           : !n
             ? `“${folder}” is empty.`
             : this.joining
-              ? `“${folder}” already has ${n === 1 ? 'a file' : `${n.toLocaleString()} files`}. They are added to the shared folder, so everyone who shares it sees them; a file with the same name is compared, and both are kept when they differ. Nothing is deleted.`
+              ? mountHint(folder, n, this.readOnly)
               : `Its ${n === 1 ? 'file is' : `${n.toLocaleString()} files are`} sent to the shared storage, where everyone who joins can see ${n === 1 ? 'it' : 'them'}. ` +
                 'Your other devices keep their copy in this vault until you add the shared folder there too.';
       message(info, text, 'coffer-note');
@@ -384,6 +476,7 @@ export class ShareModal extends Modal {
       }).open(),
     );
     c.appendChild(info);
+    this.showFolder = show;
     show();
   }
 
@@ -488,29 +581,22 @@ export class ShareModal extends Modal {
       this.setTitle('Enter the passphrase');
       this.intro('This location already holds a shared folder. Enter the passphrase it was shared with.');
       field(c, 'Passphrase', { value: this.passphrase, password: true }, (v) => (this.passphrase = v));
+      message(c, this.error);
     } else {
       this.setTitle('Choose a passphrase');
       this.intro(
         'It encrypts the shared files before they leave this device. Everyone who joins needs it, so use a different one from this vault\'s. ' +
           'If it is lost, the shared copy cannot be read, so keep it in a password manager.',
       );
-      field(c, 'Passphrase', { value: this.passphrase, password: true, hint: `At least ${MIN_PASSPHRASE} characters.` }, (v) => (this.passphrase = v));
-      field(c, 'Repeat it', { value: this.repeat, password: true }, (v) => (this.repeat = v));
+      passphraseFields(c, { passphrase: this.passphrase, repeat: this.repeat, suggested: this.suggested }, { hint: `At least ${MIN_PASSPHRASE} characters.`, error: this.error, changed: (v) => void Object.assign(this, v) });
     }
-    message(c, this.error);
     const row = buttonRow(c);
     button(row, 'Back', () => this.go(this.sameStorage ? 'where' : 'storage')).setDisabled(this.busy);
     button(row, this.busy ? 'Checking…' : 'Share this folder', () => this.create(), 'cta').setDisabled(this.busy);
   }
 
   private async create(): Promise<void> {
-    const problem = !this.passphrase
-      ? 'Enter the passphrase.'
-      : !this.exists && this.passphrase.length < MIN_PASSPHRASE
-        ? `Use at least ${MIN_PASSPHRASE} characters.`
-        : !this.exists && this.passphrase !== this.repeat
-          ? 'The two entries do not match.'
-          : '';
+    const problem = passphraseProblem(this.passphrase, this.repeat, this.exists);
     if (problem) return this.fail(problem);
     const k = this.keys;
     const dav = this.storage!.storageType === 'webdav';
@@ -576,11 +662,12 @@ export class ShareModal extends Modal {
     try {
       invite = await decodeInvite(code, this.passphrase, this.app.vault.getName(), this.id);
     } catch (e) {
-      return this.fail(e instanceof WrongPassphraseError ? 'That passphrase does not open this invite link.' : 'That is not an invite link. Copy it again.');
+      return this.fail(linkProblem(e, 'invite'));
     }
     const taken = storageProblem(this.plugin.settings, shareWith({ ...invite.storage, id: this.id, folder: invite.folder }), this.id);
     if (taken) return this.fail(taken);
     this.invite = invite;
+    this.readOnly = this.readOnly || !!invite.storage.readOnly;
     this.folder ||= invite.folder;
     this.go('mount');
   }
@@ -589,6 +676,15 @@ export class ShareModal extends Modal {
     this.setTitle('Where should it go in this vault?');
     this.intro('The shared files go in this folder. It does not need to have the same name as on the other devices.');
     this.folderField();
+    readOnlyBox(
+      this.contentEl,
+      this.readOnly,
+      (v) => {
+        this.readOnly = v;
+        this.showFolder?.();
+      },
+      !!this.invite?.storage.readOnly,
+    );
     const row = buttonRow(this.contentEl);
     button(row, 'Back', () => this.go('join')).setDisabled(this.busy);
     button(row, this.busy ? 'Joining…' : 'Join', () => this.join(), 'cta').setDisabled(this.busy);
@@ -599,7 +695,7 @@ export class ShareModal extends Modal {
     const problem = folder ? this.problem(folder) : 'Choose a folder, or type the name of a new one.';
     if (problem) return this.fail(problem);
     this.folder = folder;
-    await this.add(shareWith({ ...this.invite!.storage, id: this.id, folder }), this.invite!.secrets);
+    await this.add(shareWith({ ...this.invite!.storage, id: this.id, folder, readOnly: this.readOnly }), this.invite!.secrets);
   }
 
   private async add(share: Share, secrets: [string, string][]): Promise<void> {

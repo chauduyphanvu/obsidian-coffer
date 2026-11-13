@@ -2,12 +2,14 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { utf8 } from '../src/core/bytes.ts';
 import { deflate, inflate } from '../src/core/compress.ts';
-import type { SyncConfig } from '../src/core/config.ts';
+import { fragmented, planCompaction } from '../src/core/compact.ts';
+import { resolveConfig, type SyncConfig } from '../src/core/config.ts';
 import { open, seal, unlockKeys, type KeyHeader } from '../src/core/crypto.ts';
 import { Repo, seqKey } from '../src/core/repo.ts';
 import { Forward, Reads } from '../src/core/retention.ts';
 import { listCommits, listDeleted, tableAt, TooOldError } from '../src/core/timeline.ts';
-import { sameContent, type Commit, type Entry, type RemoteStore } from '../src/core/types.ts';
+import { sameContent, type ChunkRef, type Commit, type Entry, type RemoteStore } from '../src/core/types.ts';
+import { cleanupDue } from '../src/plugin/settings.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
 import { rng, SimStore } from '../src/testing/netsim.ts';
 import { Device } from './helpers.ts';
@@ -919,5 +921,155 @@ test('after storage is restored from an older backup, accepting it treats every 
   await a.sync();
   assert.deepEqual(a.snapshot(), b.snapshot());
   assert.equal(a.fs.text('from-a.md'), 'from A\n');
+  assert.deepEqual((await a.engine.verify({ deep: true })).problems, []);
+});
+
+const chunk = (pack: string, off: number, len: number): ChunkRef => ({ id: `${pack}:${off}`, pack, off, len, size: len });
+/** One file per pack, each holding the chunks `chunks(i)` says. */
+const packsOf = (n: number, chunks: (i: number) => ChunkRef[]) =>
+  new Map<string, Entry>(Array.from({ length: n }, (_, i): [string, Entry] => [`n${i}.md`, { size: 1, mtime: 0, chunks: chunks(i) }]));
+
+test('storage is fragmented at 32 small packs of one size class, counted from the file table alone', () => {
+  const cfg = resolveConfig({});
+  const quarter = cfg.packTargetBytes / 4;
+  const small = (n: number) => packsOf(n, (i) => [chunk(`p${i}`, 100, 300)]);
+  assert.equal(fragmented(small(31), cfg), false);
+  assert.equal(fragmented(small(32), cfg), true);
+  assert.equal(fragmented(new Map(), cfg), false);
+
+  // Only the furthest end of a pack counts, and a pack counts once however many files keep data in it.
+  const shared = new Map([...small(31), ['more.md', { size: 1, mtime: 0, chunks: [chunk('p0', 400, 300), chunk('p1', 100, 300)] }] as [string, Entry]]);
+  assert.equal(fragmented(shared, cfg), false, '31 packs');
+  assert.equal(fragmented(new Map([...small(31), ['another.md', { size: 1, mtime: 0, chunks: [chunk('p31', 0, 10)] }] as [string, Entry]]), cfg), true);
+
+  // Packs a quarter of the target or more are not small, and neither is one with a chunk stored alone.
+  assert.equal(fragmented(packsOf(40, (i) => [chunk(`p${i}`, quarter - 1000, 1000)]), cfg), false, 'ends at a quarter of the target');
+  assert.equal(fragmented(packsOf(32, (i) => [chunk(`p${i}`, quarter - 1001, 1000)]), cfg), true, 'ends just short of it');
+  assert.equal(fragmented(packsOf(40, (i) => [chunk(`p${i}`, 0, cfg.packMaxBlobBytes)]), cfg), false, 'a chunk stored alone');
+  assert.equal(fragmented(packsOf(40, (i) => [chunk(`p${i}`, 0, 200), chunk(`p${i}`, 200, cfg.packMaxBlobBytes)]), cfg), false, 'with small ones beside it');
+  const mixed = new Map([...small(31), ...packsOf(40, (i) => [chunk(`q${i}`, quarter, 100)])].map(([k, v], i): [string, Entry] => [`${k}${i}`, v]));
+  assert.equal(fragmented(mixed, cfg), false, 'big packs are no help');
+
+  // The classes are counted apart: packs one cleanup combined are crowded only by packs of their own size.
+  const combined = (n: number, tag: string) => packsOf(n, (i) => [chunk(`${tag}${i}`, 20_000, 300)]);
+  const both = (a: Map<string, Entry>, b: Map<string, Entry>) => new Map([...a, ...b].map(([k, v], i): [string, Entry] => [`${k}.${i}`, v]));
+  assert.equal(fragmented(both(small(31), combined(31, 'c')), cfg), false, '62 packs in two classes');
+  assert.equal(fragmented(combined(31, 'c'), cfg), false);
+  assert.equal(fragmented(combined(32, 'c'), cfg), true, 'they pile up in turn');
+});
+
+test('a cleanup that fragmentation asks for combines the crowded size classes only, so a pack it wrote before is not copied again', () => {
+  const cfg = resolveConfig({});
+  const now = T0 + 10 * DAY;
+  const plan = (table: Map<string, Entry>, sizes: Record<string, number> = {}) => {
+    const size = new Map<string, number>();
+    for (const e of table.values()) for (const c of e.chunks) size.set(c.pack, Math.max(size.get(c.pack) ?? 0, c.off + c.len));
+    return planCompaction([...size].map(([id, n]) => ({ id, size: sizes[id] ?? n, modified: T0 })), table, cfg, now);
+  };
+  const fresh = (n: number) => packsOf(n, (i) => [chunk(`f${i}`, 0, 500)]);
+  const written = (n: number) => new Map(Array.from({ length: n }, (_, i): [string, Entry] => [`w${i}.md`, { size: 1, mtime: 0, chunks: [chunk(`w${i}`, 0, 20_000)] }]));
+  const packIds = (table: Map<string, Entry>) => [...table.values()].map((e) => e.chunks[0].pack).sort();
+
+  // 32 fresh packs crowd their class: the 20 KB pack an earlier cleanup wrote stays where it is.
+  const crowded = plan(new Map([...fresh(32), ...written(1)]))!;
+  assert.deepEqual(crowded.packs.map((p) => p.id).sort(), packIds(fresh(32)));
+
+  // Not crowded, nothing is left out that cleanup combined before.
+  const calm = plan(new Map([...fresh(31), ...written(1)]))!;
+  assert.equal(calm.packs.length, 32);
+  assert.ok(calm.packs.some((p) => p.id === 'w0'));
+
+  // A big pack mostly holding data no file uses is emptied all the same, as the calendar's cleanup would.
+  const wasteful = new Map([['old.md', { size: 1, mtime: 0, chunks: [chunk('old', 3_900_000, 50_000)] }] as [string, Entry]]);
+  const empties = plan(new Map([...fresh(32), ...wasteful]), { old: 4_000_000 })!;
+  assert.deepEqual(empties.packs.map((p) => p.id).sort(), ['old', ...packIds(fresh(32))].sort());
+
+  // Written packs crowd their own class in turn, and the fresh ones wait for their own.
+  const turn = plan(new Map([...fresh(5), ...written(32)]))!;
+  assert.deepEqual(turn.packs.map((p) => p.id).sort(), packIds(written(32)));
+});
+
+test('an early cleanup copies what it wrote last time no more, and a cleanup of storage that is not fragmented still combines it', async () => {
+  const { devices: [a], clock } = setup(['A']);
+  const add = async (from: number, to: number) => {
+    for (let i = from; i < to; i++) {
+      a.fs.put(`n${i}.bin`, random(700, i + 1)); // 28 KB in all, over what an early cleanup would combine again
+      await a.sync();
+      clock.now += HOUR;
+    }
+    clock.now += 2 * DAY;
+  };
+  const packOf = async (path: string) => (await a.engine.view()).st.remote.get(path)!.chunks[0].pack;
+
+  await add(0, 40);
+  assert.equal(await a.engine.compactionDue(), true);
+  assert.equal((await a.engine.gc()).packsCombined, 40);
+  const written = await packOf('n0.bin');
+
+  await add(40, 80);
+  assert.equal(await a.engine.compactionDue(), true);
+  const second = await a.engine.gc();
+  assert.equal(second.packsCombined, 40, 'only the new ones');
+  assert.ok(second.bytesMoved < 40 * 800, `${second.bytesMoved} bytes`);
+  assert.equal(await packOf('n0.bin'), written);
+  assert.notEqual(await packOf('n79.bin'), written);
+
+  await add(80, 83);
+  assert.equal(await a.engine.compactionDue(), false);
+  assert.equal((await a.engine.gc()).packsCombined, 5, 'the two written ones and the three new');
+  assert.deepEqual((await a.engine.verify({ deep: true })).problems, []);
+});
+
+test('cleanup asked for by fragmentation runs within days, at most once a day and only after a commit, and a new device then needs far fewer requests', async () => {
+  const grow = async (early: boolean) => {
+    const { devices: [a], clock, net, mem } = setup(['A']);
+    const start = clock.now;
+    let last = start;
+    const cleanups: number[] = [];
+    // Whether the plugin runs cleanup after a sync that made `commits` commits.
+    const due = async (commits: number) => cleanupDue({ autoCleanDays: 7, lastCleanup: last }, clock.now, early && commits > 0 && (await a.engine.compactionDue()));
+    const sync = async () => {
+      const r = await a.sync();
+      if (await due(r.commits)) {
+        await a.engine.gc();
+        last = clock.now;
+        cleanups.push(clock.now - start);
+      }
+      return r;
+    };
+    for (let i = 0; i < 300; i++) {
+      a.fs.put(`n${i}.md`, `# Note ${i}\n\n${'Some text that is the same in every note. '.repeat(3)}\n${i}\n`);
+      await sync();
+      clock.now += HOUR;
+    }
+    const joiner = new Device('N', net, clock, a.config);
+    net.reset();
+    await joiner.sync();
+    assert.deepEqual(joiner.snapshot(), a.snapshot());
+    const stored = [...mem.objects.values()].reduce((n, o) => n + o.data.length, 0);
+    return { a, clock, due, cleanups, requests: net.stats.get + net.stats.list, stored, last: () => last };
+  };
+
+  const weekly = await grow(false);
+  assert.ok(weekly.cleanups[0] > 7 * DAY, 'only the calendar');
+  const early = await grow(true);
+  assert.ok(early.cleanups.length >= 4 && early.cleanups[0] < 7 * DAY, JSON.stringify(early.cleanups));
+  early.cleanups.slice(1).forEach((t, i) => assert.ok(t - early.cleanups[i] > DAY, `twice within a day: ${early.cleanups}`));
+  assert.ok(early.requests * 2 < weekly.requests, `${early.requests} requests for a new device, against ${weekly.requests} with the weekly cleanup alone`);
+  assert.ok(early.stored < 2 * weekly.stored, `${early.stored} bytes stored, against ${weekly.stored} with the weekly cleanup alone`);
+
+  // Fragmented again and a day since the last cleanup: a sync that sends nothing does not ask, one that sends something does.
+  const { a, clock, due } = early;
+  for (let i = 0; i < 40; i++) {
+    a.fs.put(`later${i}.md`, `later ${i}\n`);
+    await a.sync();
+  }
+  clock.now += 2 * DAY;
+  assert.equal(await a.engine.compactionDue(), true);
+  const idle = await a.sync();
+  assert.equal(idle.commits, 0);
+  assert.equal(await due(idle.commits), false);
+  a.fs.put('one more.md', 'one more\n');
+  assert.equal(await due((await a.sync()).commits), true);
   assert.deepEqual((await a.engine.verify({ deep: true })).problems, []);
 });

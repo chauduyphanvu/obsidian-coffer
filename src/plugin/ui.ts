@@ -1,5 +1,7 @@
 // Small building blocks for the plugin's screens, laid out to work at phone width.
-import { ButtonComponent, FuzzySuggestModal, TFile, type App, type TFolder } from 'obsidian';
+import { ButtonComponent, FuzzySuggestModal, Notice, TFile, type App, type TFolder } from 'obsidian';
+import { generatePassphrase } from '../core/crypto.ts';
+import { errorText } from '../core/text.ts';
 import { lookup } from './obsidianfs.ts';
 
 /** Picks one of the vault's folders, leaving out those `skip` refuses (given as "path/"). */
@@ -47,6 +49,65 @@ export function field(parent: HTMLElement, label: string, opts: FieldOptions, on
   input.addEventListener('input', () => onInput(input.value));
   if (opts.hint) wrap.createDiv({ cls: 'coffer-hint', text: opts.hint });
   return input;
+}
+
+export interface PassphraseChoice {
+  passphrase: string;
+  repeat: string;
+  /** The generated passphrase on show, until either field is edited away from it. */
+  suggested?: string;
+}
+
+/**
+ * The fields for choosing a new passphrase, and a button that fills both with a generated one. That one is shown in
+ * plain text to copy, because nobody could remember it. `value` is kept current and `opts.changed`, when given, told after
+ * each change, so a screen that redraws can start from it again. `opts.error` is shown under the fields until they change.
+ */
+export function passphraseFields(
+  parent: HTMLElement,
+  value: PassphraseChoice,
+  opts: { label?: string; hint?: string; error?: string; changed?: (value: PassphraseChoice) => void } = {},
+): void {
+  const first = field(parent, opts.label ?? 'Passphrase', { value: value.passphrase, password: true, hint: opts.hint }, (v) => {
+    value.passphrase = v;
+    edited();
+  });
+  const second = field(parent, 'Repeat it', { value: value.repeat, password: true }, (v) => {
+    value.repeat = v;
+    edited();
+  });
+  button(buttonRow(parent), 'Suggest a passphrase', () => {
+    value.suggested = generatePassphrase();
+    first.value = value.passphrase = value.suggested;
+    second.value = value.repeat = value.suggested;
+    edited();
+  });
+  const shown = parent.createDiv({ cls: 'coffer-suggestion' });
+  const problem = parent.createDiv();
+  message(problem, opts.error ?? '');
+  function edited(): void {
+    problem.empty();
+    refresh();
+  }
+  function refresh(): void {
+    if (value.suggested !== undefined && (value.passphrase !== value.suggested || value.repeat !== value.suggested)) value.suggested = undefined;
+    shown.empty();
+    if (value.suggested !== undefined) {
+      const text = value.suggested;
+      shown.createEl('code', { text });
+      button(buttonRow(shown), 'Copy', async () => {
+        try {
+          await activeWindow.navigator.clipboard.writeText(text);
+          new Notice('Passphrase copied.');
+        } catch (e) {
+          new Notice(`Could not copy it: ${errorText(e)}. Select it and copy it by hand.`, 8000);
+        }
+      });
+      shown.createDiv({ cls: 'coffer-hint', text: 'Save it in your password manager now. Each of your other devices asks for it once, and a lost passphrase cannot be recovered.' });
+    }
+    opts.changed?.(value);
+  }
+  refresh();
 }
 
 /** A large tappable option with a title and one line of explanation. */

@@ -1,6 +1,6 @@
 // Guided setup: connect storage and choose a passphrase on the first device, or join with a setup link.
 import { Modal, Notice, type App } from 'obsidian';
-import { WrongPassphraseError } from '../core/crypto.ts';
+import { MIN_PASSPHRASE } from '../core/crypto.ts';
 import type { SyncResult } from '../core/engine.ts';
 import { Repo } from '../core/repo.ts';
 import { errorText } from '../core/text.ts';
@@ -8,16 +8,14 @@ import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
 import type CofferPlugin from './main.ts';
 import { obsidianHttp } from './obsidianfs.ts';
-import { PROVIDERS, codeKind, folderFor, remoteSpec, secretName, setupCodeFrom, storageSettings, type Provider, type Settings, type Storage, type StorageForm } from './settings.ts';
+import { PROVIDERS, codeKind, folderFor, linkProblem, passphraseProblem, remoteSpec, secretName, setupCodeFrom, storageSettings, type Provider, type Settings, type Storage, type StorageForm } from './settings.ts';
 import { connectError, summarize } from './status.ts';
-import { button, buttonRow, choice, field, message } from './ui.ts';
+import { button, buttonRow, choice, field, message, passphraseFields } from './ui.ts';
 
 type Step = 'start' | 'provider' | 'storage' | 'passphrase' | 'join' | 'syncing' | 'done';
 
 /** What setup stores, the same secrets a setup code fills in; `secretName` makes each name this vault's own. */
 export const IDS = { access: 'coffer-access-key', secret: 'coffer-secret-key', password: 'coffer-webdav-password', passphrase: 'coffer-passphrase' };
-
-export const MIN_PASSPHRASE = 8;
 
 /** The keys typed into the storage form. Kept apart from settings until they are stored as secrets. */
 export interface Keys {
@@ -75,19 +73,36 @@ export function formStorage(provider: Provider, f: StorageForm, k: Keys): Partia
   return storage;
 }
 
-/** Checks that `storage` works with keys `k`; true when it already holds synced data. Fails in words the user can act on. */
-export async function tryStorage(base: Storage, storage: Partial<Storage>, k: Keys): Promise<boolean> {
+/** The checkbox that makes a device only receive changes. `locked` keeps it on, as when an invite says so. */
+export function readOnlyBox(c: HTMLElement, value: boolean, onChange: (v: boolean) => void, locked = false): void {
+  const row = c.createEl('label', { cls: 'coffer-check' });
+  const box = row.createEl('input', { attr: { type: 'checkbox' } });
+  box.checked = value || locked;
+  box.disabled = locked;
+  box.addEventListener('change', () => onChange(box.checked));
+  row.appendText(' Only receive changes');
+  c.createDiv({ cls: 'coffer-hint', text: 'This device never writes to storage, so keys that may only read are enough. What you change here stays here.' });
+}
+
+/**
+ * Checks that `storage` works with keys `k`; true when it already holds synced data. Fails in words the user can act on.
+ * With `readOnly` it only reads, and storage that holds nothing yet is refused.
+ */
+export async function tryStorage(base: Storage, storage: Partial<Storage>, k: Keys, readOnly = false): Promise<boolean> {
   const values: Record<string, string> = { a: k.access.trim(), s: k.secret.trim(), p: k.password };
   const trial: Storage = { ...base, ...storage, accessKeySecret: 'a', secretKeySecret: 's', webdavPasswordSecret: 'p' };
   const store = openRemote(remoteSpec(trial, (n) => values[n] ?? ''), obsidianHttp);
+  let exists: boolean;
   try {
-    const report = await checkStore(store);
+    const report = await checkStore(store, readOnly);
     const bad = report.checks.find((x) => !x.ok);
     if (bad) throw new Error(bad.detail ?? bad.name);
-    return await Repo.exists(store);
+    exists = await Repo.exists(store);
   } catch (e) {
     throw new Error(connectError(errorText(e), trial.storageType));
   }
+  if (readOnly && !exists) throw new Error('This storage holds no synced vault yet. A device that only receives changes needs a vault set up from another device first.');
+  return exists;
 }
 
 export class SetupModal extends Modal {
@@ -98,6 +113,7 @@ export class SetupModal extends Modal {
   private keys = { access: '', secret: '', password: '' };
   private storage: Partial<Settings> = {};
   private exists = false;
+  private readOnly = false;
   private passphrase = '';
   private repeat = '';
   private code: string;
@@ -105,6 +121,10 @@ export class SetupModal extends Modal {
   private error = '';
   private busy = false;
   private result?: SyncResult;
+  /** The generated passphrase on show. */
+  private suggested?: string;
+  /** The setup link, made as soon as the last step shows, so that copying it happens in the tap: '' while it is being made. */
+  private link?: string;
   private unsubscribe?: () => void;
 
   constructor(app: App, plugin: CofferPlugin, start: 'start' | 'new' | 'join', code = '') {
@@ -175,6 +195,7 @@ export class SetupModal extends Modal {
     const c = this.contentEl;
     this.setTitle(PROVIDERS.find((p) => p.id === this.provider)!.name);
     storageFields(c, this.provider, this.form, this.keys);
+    readOnlyBox(c, this.readOnly, (v) => (this.readOnly = v));
     message(c, this.error);
     const row = buttonRow(c);
     button(row, 'Back', () => this.go('provider'));
@@ -193,7 +214,7 @@ export class SetupModal extends Modal {
     this.error = '';
     this.render();
     try {
-      this.exists = await tryStorage(this.plugin.settings, this.storage, this.keys);
+      this.exists = await tryStorage(this.plugin.settings, this.storage, this.keys, this.readOnly);
       this.go('passphrase');
     } catch (e) {
       this.busy = false;
@@ -208,29 +229,22 @@ export class SetupModal extends Modal {
       this.setTitle('Enter the passphrase');
       this.intro('This storage already holds a synced vault. Enter the passphrase chosen on your first device.');
       field(c, 'Passphrase', { value: this.passphrase, password: true }, (v) => (this.passphrase = v));
+      message(c, this.error);
     } else {
       this.setTitle('Choose a passphrase');
       this.intro(
         'It encrypts your files before they leave this device, and you type it once on each of your devices. ' +
           'If it is lost, the synced copy cannot be read, so keep it in a password manager.',
       );
-      field(c, 'Passphrase', { value: this.passphrase, password: true, hint: `At least ${MIN_PASSPHRASE} characters.` }, (v) => (this.passphrase = v));
-      field(c, 'Repeat it', { value: this.repeat, password: true }, (v) => (this.repeat = v));
+      passphraseFields(c, { passphrase: this.passphrase, repeat: this.repeat, suggested: this.suggested }, { hint: `At least ${MIN_PASSPHRASE} characters.`, error: this.error, changed: (v) => void Object.assign(this, v) });
     }
-    message(c, this.error);
     const row = buttonRow(c);
     button(row, 'Back', () => this.go('storage'));
     button(row, 'Start syncing', () => this.begin(), 'cta');
   }
 
   private async begin(): Promise<void> {
-    const problem = !this.passphrase
-      ? 'Enter the passphrase.'
-      : !this.exists && this.passphrase.length < MIN_PASSPHRASE
-        ? `Use at least ${MIN_PASSPHRASE} characters.`
-        : !this.exists && this.passphrase !== this.repeat
-          ? 'The two entries do not match.'
-          : '';
+    const problem = passphraseProblem(this.passphrase, this.repeat, this.exists);
     if (problem) {
       this.error = problem;
       this.render();
@@ -250,6 +264,7 @@ export class SetupModal extends Modal {
       secretKeySecret: this.provider === 'webdav' ? this.plugin.settings.secretKeySecret : name(IDS.secret),
       webdavPasswordSecret: this.provider === 'webdav' ? name(IDS.password) : this.plugin.settings.webdavPasswordSecret,
       passphraseSecret: name(IDS.passphrase),
+      readOnly: this.readOnly,
     });
     await this.plugin.saveSettings();
     await this.firstSync('passphrase');
@@ -271,6 +286,7 @@ export class SetupModal extends Modal {
       }
     });
     field(c, 'Passphrase', { value: this.passphrase, password: true }, (v) => (this.passphrase = v));
+    readOnlyBox(c, this.readOnly, (v) => (this.readOnly = v));
     message(c, this.error);
     const row = buttonRow(c);
     button(row, 'Back', () => this.go('start'));
@@ -291,10 +307,10 @@ export class SetupModal extends Modal {
     this.busy = true;
     this.render();
     try {
-      await this.plugin.importSetupCode(setupCodeFrom(this.code), this.passphrase);
+      await this.plugin.importSetupCode(setupCodeFrom(this.code), this.passphrase, this.readOnly);
     } catch (e) {
       this.busy = false;
-      this.error = e instanceof WrongPassphraseError ? 'That passphrase does not open this setup link.' : 'That is not a setup link. Copy it again on the other device.';
+      this.error = linkProblem(e, 'setup');
       this.render();
       return;
     }
@@ -329,10 +345,24 @@ export class SetupModal extends Modal {
     this.intro(this.result ? `This vault is in sync: ${summarize(this.result)}.` : 'This vault is in sync.');
     if (!this.joined) {
       this.intro('Next, add your other devices: install Coffer there, choose "I already sync another device", and paste this link. It is encrypted with your passphrase.');
-      button(buttonRow(c), 'Copy setup link', async () => {
-        await navigator.clipboard.writeText(await this.plugin.setupLink());
-        new Notice('Setup link copied.');
-      });
+      if (this.link === undefined) {
+        this.link = '';
+        this.plugin.setupLink().then(
+          (link) => (this.link = link),
+          (e) => (this.error = `Could not make the link: ${errorText(e)}`),
+        ).finally(() => {
+          if (this.step === 'done') this.render();
+        });
+      }
+      message(c, this.error);
+      button(buttonRow(c), this.link || this.error ? 'Copy setup link' : 'Preparing…', async () => {
+        try {
+          await navigator.clipboard.writeText(this.link!);
+          new Notice('Setup link copied.');
+        } catch (e) {
+          new Notice(`Could not copy the setup link: ${errorText(e)}`, 8000);
+        }
+      }).setDisabled(!this.link);
     }
     button(buttonRow(c), 'Done', () => this.close(), 'cta');
   }

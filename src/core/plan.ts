@@ -1,5 +1,5 @@
 import type { LocalState } from './state.ts';
-import { sameContent, type LocalFile } from './types.ts';
+import { sameContent, type Entry, type LocalFile } from './types.ts';
 
 /** A file found by the local scan, under its vault key. */
 export interface Local extends LocalFile {
@@ -21,6 +21,8 @@ export interface Plan {
  * `tooLargeHere` holds paths whose local file is over the size limit: they are missing from
  * `local`, but must not be mistaken for local deletions. A path over the limit on either side is left alone.
  * With `keys`, compares only those paths, and `local` need only hold those of them that exist.
+ * `defer` names remote files left in storage until asked for: one that this device never had (no local file and no
+ * agreed version) is not pulled, and being absent here is not a deletion.
  */
 export function planChanges(
   local: Map<string, Local>,
@@ -29,6 +31,7 @@ export function planChanges(
   maxSize: number,
   tooLargeHere: Set<string> = new Set(),
   keys?: Set<string>,
+  defer?: (key: string, r: Entry) => boolean,
 ): Plan {
   const pushes: Local[] = [];
   const pushDeletes: string[] = [];
@@ -42,6 +45,7 @@ export function planChanges(
     const s = st.synced.get(key);
     const r = st.remote.get(key);
     if (tooLargeHere.has(key) || (r && r.size > maxSize)) return;
+    if (!l && !s && r && defer?.(key, r)) return;
     const base = s?.entry;
     const localTouched = l ? !s || s.lsize !== l.size || s.lmtime !== l.mtime : !!s;
     const remoteChanged = base ? !r || !sameContent(r, base) : !!r;

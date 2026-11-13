@@ -14,6 +14,9 @@ export interface KeyHeader {
   wrapped: string;
 }
 
+/** The fewest characters a passphrase may have for a new vault or a new passphrase; an existing one opens whatever its length. */
+export const MIN_PASSPHRASE = 8;
+
 export class WrongPassphraseError extends Error {
   constructor() {
     super('Wrong passphrase');
@@ -70,30 +73,53 @@ export async function unlockKeys(header: KeyHeader, passphrase: string): Promise
   return expand(await unwrap(header, passphrase));
 }
 
-/** The same master key under a new passphrase: stored data stays valid, only the header changes. */
-export async function rewrapKeys(header: KeyHeader, oldPassphrase: string, newPassphrase: string): Promise<KeyHeader> {
-  return wrap(await unwrap(header, oldPassphrase), newPassphrase, header.iter);
+/** The same master key under a new passphrase: stored data stays valid, only the header changes. It never lowers the cost. */
+export async function rewrapKeys(header: KeyHeader, oldPassphrase: string, newPassphrase: string, iterations = header.iter): Promise<KeyHeader> {
+  return wrap(await unwrap(header, oldPassphrase), newPassphrase, Math.max(header.iter, iterations));
 }
 
-/** Encrypts a small text under a passphrase alone, for moving settings between devices. */
-export async function sealWithPassphrase(text: string, passphrase: string, iterations = 200_000): Promise<string> {
+const PASSPHRASE_SYMBOLS = 'abcdefghijkmnpqrstuvwxyz23456789';
+
+/** 100 bits from 32 symbols without look-alikes (`byte & 31` keeps them unbiased), as xxxx-xxxx-xxxx-xxxx-xxxx. */
+export function generatePassphrase(): string {
+  const bytes = randomBytes(20);
+  let out = '';
+  for (let i = 0; i < bytes.length; i++) out += (i && i % 4 === 0 ? '-' : '') + PASSPHRASE_SYMBOLS[bytes[i] & 31];
+  return out;
+}
+
+/** What a setup code from 0.1 and 0.2 used, since its layout does not say. */
+export const LEGACY_CODE_ITERATIONS = 200_000;
+/** The most a setup code may ask for, so a crafted link cannot keep a device busy for minutes. */
+export const MAX_CODE_ITERATIONS = 10_000_000;
+const CODE_HEADER = 4;
+
+/** Encrypts a small text under a passphrase alone, for moving settings between devices. Layout: iterations (u32 BE) | salt (16) | nonce (12) | ciphertext+tag. */
+export async function sealWithPassphrase(text: string, passphrase: string, iterations: number): Promise<string> {
   const salt = randomBytes(16);
   const nonce = randomBytes(12);
   const ct = new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv: bs(nonce) }, await kek(passphrase, salt, iterations), bs(utf8.encode(text))));
-  return toB64(concat([salt, nonce, ct]));
+  const head = new Uint8Array(CODE_HEADER);
+  new DataView(head.buffer).setUint32(0, iterations);
+  return toB64(concat([head, salt, nonce, ct]));
 }
 
-export async function openWithPassphrase(sealed: string, passphrase: string, iterations = 200_000): Promise<string> {
+/** With `legacy`, the layout of 0.1 and 0.2, which has no iterations field: salt (16) | nonce (12) | ciphertext+tag. */
+export async function openWithPassphrase(sealed: string, passphrase: string, legacy = false): Promise<string> {
   let raw: Uint8Array;
   try {
     raw = fromB64(sealed);
   } catch {
     throw new Error('That is not a valid setup code');
   }
-  if (raw.length < 45) throw new Error('That is not a valid setup code');
+  const head = legacy ? 0 : CODE_HEADER;
+  if (raw.length < head + 45) throw new Error('That is not a valid setup code');
+  const iterations = legacy ? LEGACY_CODE_ITERATIONS : new DataView(raw.buffer, raw.byteOffset).getUint32(0);
+  if (iterations < 1 || iterations > MAX_CODE_ITERATIONS) throw new Error('That is not a valid setup code');
+  const body = raw.subarray(head);
   try {
-    const key = await kek(passphrase, raw.subarray(0, 16), iterations);
-    return new TextDecoder().decode(await subtle.decrypt({ name: 'AES-GCM', iv: bs(raw.subarray(16, 28)) }, key, bs(raw.subarray(28))));
+    const key = await kek(passphrase, body.subarray(0, 16), iterations);
+    return new TextDecoder().decode(await subtle.decrypt({ name: 'AES-GCM', iv: bs(body.subarray(16, 28)) }, key, bs(body.subarray(28))));
   } catch {
     throw new WrongPassphraseError();
   }

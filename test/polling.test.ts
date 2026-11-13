@@ -33,7 +33,7 @@ test('the fast spell polls six times as often as the setting, never faster than 
 });
 
 const result = (over: Partial<SyncResult> = {}): SyncResult => ({
-  pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0, conflictCopies: [], skipped: 0, tooLarge: [], errors: [], commits: 0, rounds: 1, ...over,
+  pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0, conflictCopies: [], skipped: 0, tooLarge: [], deferred: [], unsent: [], errors: [], commits: 0, rounds: 1, ...over,
 });
 
 test('a sync counts as activity only when it received changes from another device, not when it only sent this one\'s', () => {

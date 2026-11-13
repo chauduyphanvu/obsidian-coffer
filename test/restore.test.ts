@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { SafetyError } from '../src/core/engine.ts';
+import { SafetyError, type RepairReport } from '../src/core/engine.ts';
 import { lineDiff } from '../src/core/merge.ts';
 import { planRestore, tableAt, type CommitSummary } from '../src/core/timeline.ts';
 import type { Entry } from '../src/core/types.ts';
@@ -8,14 +8,17 @@ import type { VerifyReport } from '../src/core/verify.ts';
 import {
   applyRestore,
   byDay,
+  canRepair,
   changesLabel,
   countSteps,
   countable,
   dayLabel,
   deleteLimitCrossed,
   describeCleanup,
+  describeRepair,
   describeVerify,
   deviceLabel,
+  historyFailure,
   diffLines,
   MomentPages,
   keepOut,
@@ -28,6 +31,7 @@ import {
   restoreSteps,
   sameSteps,
   scopeName,
+  sentNote,
   sizeLabel,
   stepSummary,
   timeLabel,
@@ -401,4 +405,79 @@ test('a storage check reads as what was checked, and each kind of problem once w
     ['Part of the sync history is missing or damaged', [], 1],
     ['Something in storage does not add up', [], 1],
   ]);
+
+  // Data only earlier versions need is its own kind of problem, listing the files whose earlier versions are lost, and the current files are said to be fine.
+  const earlier = describeVerify(
+    report({
+      problems: [
+        { message: 'Pack p9 is missing: earlier versions of 2 files cannot be restored, though the current files are fine', object: 'pack/p9', earlier: ['z.md', 'old.md'] },
+        { message: 'Pack p3 is missing: earlier versions of 1 file cannot be restored, though the current files are fine', object: 'pack/p3', earlier: ['old.md'] },
+        { message: 'Pack p1 is missing', object: 'pack/p1', paths: ['a.md'] },
+      ],
+    }),
+  );
+  assert.equal(earlier.title, '3 problems found');
+  assert.deepEqual(earlier.findings.map((f) => [f.title, f.tone, f.files, f.messages.length]), [
+    ['Stored file data is missing or damaged', 'critical', ['a.md'], 1],
+    ['Earlier versions can no longer be restored', 'warning', ['old.md', 'z.md'], 2],
+  ]);
+  assert.match(earlier.findings[1].detail, /current version of these files is fine/);
+  assert.equal(canRepair(report({ problems: [{ message: 'x', object: 'pack/p3', earlier: ['old.md'] }] })), false, 'no device has what only an earlier version needs');
+  assert.equal(canRepair(report({ problems: [{ message: 'x', object: 'pack/p3', earlier: ['old.md'] }, { message: 'y', object: 'pack/p1', paths: ['a.md'] }] })), true);
+  assert.equal(canRepair(report({ problems: [{ message: 'x', object: 'log/000000000007' }] })), false);
+});
+
+test('a repair reads as what was stored again, what is still missing and what history lost, each with its files', () => {
+  const report = (over: Partial<RepairReport> = {}): RepairReport => ({ repaired: [], unrepaired: [], historyOnly: [], chunks: 0, ...over });
+  // A listing says what is there and how long it is, not what is inside: only the thorough repair reads it.
+  assert.deepEqual(describeRepair(report()), {
+    ok: true,
+    title: 'Nothing to repair',
+    detail: 'Every stored object that your files and their history need is there and has its full size. A quick look cannot read what is inside them: the thorough check does.',
+    groups: [],
+  });
+  assert.equal(
+    describeRepair(report(), true).detail,
+    'Every stored object that your files and their history need is there and has its full size, and what your files use was read and is intact.',
+  );
+
+  const fixed = describeRepair(report({ repaired: ['a.md', 'b.md'], chunks: 3 }));
+  assert.deepEqual([fixed.ok, fixed.title, fixed.detail], [true, 'Repaired 2 files', 'Stored 3 pieces of data again.']);
+  assert.deepEqual(fixed.groups.map((g) => [g.title, g.tone, g.files]), [['Stored again from this device', 'ok', ['a.md', 'b.md']]]);
+  assert.match(describeRepair(report({ repaired: ['a.md'] })).detail, /nothing had to be uploaded/);
+
+  const none = describeRepair(report({ unrepaired: ['c.md'] }));
+  assert.deepEqual([none.ok, none.title, none.detail], [false, '1 file could not be repaired', 'Nothing could be stored again.']);
+  assert.deepEqual(none.groups.map((g) => [g.title, g.tone]), [['Still missing: run this on a device that has them', 'critical']]);
+
+  const all = describeRepair(report({ repaired: ['a.md'], unrepaired: ['c.md', 'd.md'], historyOnly: ['e.md'], chunks: 1 }));
+  assert.deepEqual([all.ok, all.title, all.detail], [false, '2 files could not be repaired', 'Repaired 1 file. Stored 1 piece of data again.']);
+  assert.deepEqual(all.groups.map((g) => [g.title, g.tone, g.files]), [
+    ['Stored again from this device', 'ok', ['a.md']],
+    ['Still missing: run this on a device that has them', 'critical', ['c.md', 'd.md']],
+    ['Earlier versions that can no longer be restored', 'warning', ['e.md']],
+  ]);
+
+  // Earlier versions lost, current ones fine: nothing to repair, though history says what is gone.
+  const past = describeRepair(report({ historyOnly: ['e.md'] }));
+  assert.deepEqual([past.ok, past.title, past.groups.map((g) => g.title)], [true, 'Nothing to repair', ['Earlier versions that can no longer be restored']]);
+  assert.match(past.detail, /^Every stored object that your files need is there and has its full size\. A quick look cannot read what is inside them/);
+  assert.match(describeRepair(report({ historyOnly: ['e.md'] }), true).detail, /read and is intact\.$/);
+});
+
+test('restored files are sent by the next sync, or kept here on a place that only receives', () => {
+  assert.equal(sentNote(1, false), 'The next sync sends it to your other devices.');
+  assert.equal(sentNote(3, false), 'The next sync sends them to your other devices.');
+  assert.equal(sentNote(1, true), 'The restored file stays on this device and is not sent, because this device only receives changes.');
+  assert.equal(sentNote(2, true), 'The restored files stay on this device and are not sent, because this device only receives changes.');
+});
+
+test('a version whose data is gone says so, not that sync is stopped', () => {
+  const gone = historyFailure(new Error('Remote pack 8e778eb8f19466f74ca265a2ac482f02 is missing'));
+  assert.match(gone, /^The data of this version is no longer in storage, so it cannot be restored\. The files on this device are untouched\./);
+  assert.match(gone, /\(Remote pack 8e778eb8f19466f74ca265a2ac482f02 is missing\)$/);
+  assert.ok(!/sync is stopped/i.test(gone));
+  assert.equal(historyFailure(new Error('fetch failed')), "Can't reach the storage. Sync tries again on its own. (fetch failed)");
+  assert.match(historyFailure(new Error('Remote commit 7 is missing, though a snapshot was taken at it')), /^Synced data in storage is damaged\. Sync is stopped/, 'the log itself, which a sync reads too');
+  assert.equal(historyFailure(new Error('odd')), 'odd');
 });

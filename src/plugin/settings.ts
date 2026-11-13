@@ -1,6 +1,6 @@
 // The plugin's settings and what they translate into. No Obsidian import, so it runs under plain Node tests.
 import { DEFAULT_CONFIG, compileExcludes, resolveConfig, type SyncConfig } from '../core/config.ts';
-import { openWithPassphrase, sealWithPassphrase } from '../core/crypto.ts';
+import { MIN_PASSPHRASE, WrongPassphraseError, openWithPassphrase, sealWithPassphrase } from '../core/crypto.ts';
 import { vaultKey } from '../core/paths.ts';
 import { DAY } from '../core/retention.ts';
 import { isInside } from '../core/scopedfs.ts';
@@ -21,6 +21,8 @@ export interface Storage {
   accessKeySecret: string;
   secretKeySecret: string;
   passphraseSecret: string;
+  /** This device never writes to this storage: what it changes stays here, and files it deletes come back. */
+  readOnly: boolean;
 }
 
 /**
@@ -60,6 +62,8 @@ export interface Settings extends Storage {
   conflictStrategy: 'merge' | 'copy';
   retentionDays: number;
   maxFileSizeMB: number;
+  /** Files larger than this stay in storage until asked for, here and in every shared folder. 0 downloads everything. */
+  deferAboveMB: number;
   concurrency: number;
   compression: boolean;
   /** When a sync last finished without failing; 0 before the first one. */
@@ -83,6 +87,7 @@ export function defaultSettings(isMobile: boolean): Settings {
     accessKeySecret: '',
     secretKeySecret: '',
     passphraseSecret: '',
+    readOnly: false,
     deviceName: '',
     syncOnStart: true,
     intervalMinutes: 5,
@@ -95,6 +100,7 @@ export function defaultSettings(isMobile: boolean): Settings {
     conflictStrategy: DEFAULT_CONFIG.conflictStrategy,
     retentionDays: DEFAULT_CONFIG.retentionDays,
     maxFileSizeMB: isMobile ? 200 : DEFAULT_CONFIG.maxFileSizeMB,
+    deferAboveMB: DEFAULT_CONFIG.deferAboveMB,
     concurrency: DEFAULT_CONFIG.concurrency,
     compression: DEFAULT_CONFIG.compression,
     lastSuccess: 0,
@@ -116,6 +122,7 @@ const STORAGE_DEFAULTS: Storage = {
   accessKeySecret: '',
   secretKeySecret: '',
   passphraseSecret: '',
+  readOnly: false,
 };
 
 /** A share with every field present, as saved by any version. */
@@ -170,6 +177,7 @@ const tuning = (s: Settings) => ({
   conflictStrategy: s.conflictStrategy,
   retentionDays: s.retentionDays,
   maxFileSizeMB: s.maxFileSizeMB,
+  deferAboveMB: s.deferAboveMB,
   concurrency: s.concurrency,
   compression: s.compression,
 });
@@ -203,6 +211,7 @@ export function syncConfig(s: Settings, configDir: string, pluginDir: string): S
       ...s.shares.flatMap((x) => [`${vaultKey(x.folder)}/`, ...x.vaultCopies.filter((key) => !isInside(x.folder, key)), statePath(pluginDir, x.id)]),
     ],
     ...tuning(s),
+    readOnly: s.readOnly,
   });
 }
 
@@ -223,7 +232,7 @@ export function shareConfig(s: Settings, share: Share, configDir: string): SyncC
   for (const other of s.shares) if (isInside(share.folder, other.folder)) exclude.push(`${vaultKey(other.folder).slice(at.length)}/`);
   // Obsidian's file list has no name starting with a dot, at any depth of a shared folder: see `unlisted`.
   exclude.push('.*', '**/.*/');
-  return resolveConfig({ deviceName: s.deviceName, configDir, exclude, ...tuning(s) });
+  return resolveConfig({ deviceName: s.deviceName, configDir, exclude, ...tuning(s), readOnly: share.readOnly });
 }
 
 /** A folder path as settings keep it: forward slashes, none doubled or at either end. */
@@ -286,6 +295,7 @@ export function sameKeys(a: Storage, b: Storage, secret: SecretLookup): boolean 
 export function besideVault(s: Storage, name: string, tag: string): Storage {
   const storage: Storage = { ...STORAGE_DEFAULTS };
   for (const k of Object.keys(STORAGE_DEFAULTS) as (keyof Storage)[]) (storage as unknown as Record<string, unknown>)[k] = s[k];
+  storage.readOnly = false;
   const place = `shared-${folderFor(name)}-${tag}`;
   if (s.storageType === 'webdav') storage.webdavUrl = `${s.webdavUrl.trim().replace(/\/+$/, '')}/${place}`;
   else storage.prefix = [s.prefix.replace(/^\/+|\/+$/g, ''), place].filter(Boolean).join('/');
@@ -298,8 +308,14 @@ export function parseNumberSetting(text: string, min: number): number | null {
   return text.trim() === '' || !Number.isFinite(n) || n < min ? null : n;
 }
 
-export function cleanupDue(s: Pick<Settings, 'autoCleanDays' | 'lastCleanup'>, now: number): boolean {
-  return s.autoCleanDays > 0 && now - s.lastCleanup > s.autoCleanDays * DAY;
+/**
+ * Cleanup is due every `autoCleanDays`, and, with `fragmented` (storage holds many small packs, see `compactionDue`),
+ * after a day. It never runs when automatic cleanup is off.
+ */
+export function cleanupDue(s: Pick<Settings, 'autoCleanDays' | 'lastCleanup'>, now: number, fragmented = false): boolean {
+  if (s.autoCleanDays <= 0) return false;
+  const since = now - s.lastCleanup;
+  return since > s.autoCleanDays * DAY || (fragmented && since > DAY);
 }
 
 // A setup code carries these settings, then these credentials, in this order.
@@ -311,25 +327,36 @@ const SETUP_SECRETS = [
   ['webdavPassword', 'webdavPasswordSecret', 'coffer-webdav-password'],
 ] as const;
 
-const VAULT_CODE = 'coffer1.';
-const SHARE_CODE = 'coffershare1.';
+const VAULT_CODE = 'coffer2.';
+const SHARE_CODE = 'coffershare2.';
+/** Version 1 (0.1 and 0.2) sealed at a fixed 200,000 iterations and left the count out. */
+const CODE = /^coffer(share)?([12])\./;
 
 /** What a code is: a vault's setup code, an invite to a shared folder, or neither. */
 export function codeKind(code: string): 'vault' | 'share' | undefined {
-  const c = code.trim();
-  return c.startsWith(VAULT_CODE) ? 'vault' : c.startsWith(SHARE_CODE) ? 'share' : undefined;
+  const m = CODE.exec(code.trim());
+  return m ? (m[1] ? 'share' : 'vault') : undefined;
+}
+
+/** The PBKDF2 cost a link is sealed at: the vault's own, and never less than a new vault gets. */
+export function codeIterations(vault?: number): number {
+  return Math.max(DEFAULT_CONFIG.kdfIterations, vault ?? 0);
 }
 
 /**
  * Storage settings and keys, encrypted under the passphrase, for pasting into another device. With `folder`, an
- * invite to a shared folder, which suggests that folder name to whoever joins.
+ * invite to a shared folder, which suggests that folder name to whoever joins and, from a place that only receives,
+ * turns that on for them. A vault's link leaves it to the device that joins.
  */
-export async function encodeSetupCode(s: Storage, secret: SecretLookup, folder?: string): Promise<string> {
+export async function encodeSetupCode(s: Storage, secret: SecretLookup, folder?: string, iterations = codeIterations()): Promise<string> {
   const payload: Record<string, unknown> = {};
   for (const f of SETUP_FIELDS) payload[f] = s[f];
   for (const [field, setting] of SETUP_SECRETS) payload[field] = secret(s[setting]);
-  if (folder !== undefined) payload.folder = folder;
-  return `${folder === undefined ? VAULT_CODE : SHARE_CODE}${await sealWithPassphrase(JSON.stringify(payload), secret(s.passphraseSecret))}`;
+  if (folder !== undefined) {
+    if (s.readOnly) payload.readOnly = true;
+    payload.folder = folder;
+  }
+  return `${folder === undefined ? VAULT_CODE : SHARE_CODE}${await sealWithPassphrase(JSON.stringify(payload), secret(s.passphraseSecret), iterations)}`;
 }
 
 /**
@@ -354,9 +381,19 @@ export function secretName(base: string, vault: string): string {
 /** The name share `id` of `vault` keeps one of its secrets under, apart from the vault's and every other share's. */
 export const shareSecretName = (base: string, vault: string, id: string) => secretName(base, `${vault} ${id}`);
 
+/**
+ * A prefixed code opens as its own version. Without a prefix it is tried as the new layout, which fails before any key
+ * is made unless its first four bytes read as a plausible count, and then as the old.
+ */
+async function openSealed(code: string, passphrase: string): Promise<string> {
+  const sealed = code.replace(CODE, '');
+  const version = CODE.exec(code)?.[2];
+  if (version) return openWithPassphrase(sealed, passphrase, version !== '2');
+  return openWithPassphrase(sealed, passphrase).catch(() => openWithPassphrase(sealed, passphrase, true));
+}
+
 async function openCode(code: string, passphrase: string, name: (base: string) => string) {
-  const body = code.trim().replace(/^coffer(?:share)?1\./, '');
-  const p = JSON.parse(await openWithPassphrase(body, passphrase)) as Record<string, string | boolean>;
+  const p = JSON.parse(await openSealed(code.trim(), passphrase)) as Record<string, string | boolean>;
   const settings: Record<string, unknown> = { storageType: p.storageType === 'webdav' ? 'webdav' : 's3' };
   for (const f of SETUP_FIELDS) if (f !== 'storageType') settings[f] = p[f];
   const secrets: [string, string][] = [];
@@ -366,8 +403,10 @@ async function openCode(code: string, passphrase: string, name: (base: string) =
     return value ? id : '';
   };
   for (const [field, setting, id] of SETUP_SECRETS) settings[setting] = keep(id, p[field]);
+  const invite = typeof p.folder === 'string';
+  if (invite && p.readOnly === true) settings.readOnly = true;
   settings.passphraseSecret = keep('coffer-passphrase', passphrase);
-  return { settings, secrets, folder: typeof p.folder === 'string' ? p.folder : '' };
+  return { settings, secrets, folder: invite ? (p.folder as string) : '' };
 }
 
 /** The settings a setup code fills in, and the secrets to store first, in order, named for `vault`. */
@@ -481,5 +520,25 @@ export const setupLink = (code: string) => `obsidian://coffer?${codeKind(code) =
 export function setupCodeFrom(text: string): string {
   const t = text.trim();
   const m = /[?&](?:setup|share)=([^&\s]+)/.exec(t);
-  return m ? decodeURIComponent(m[1]) : t;
+  if (!m) return t;
+  try {
+    return decodeURIComponent(m[1]);
+  } catch {
+    // Cut inside an escape: what is left reads as the damaged code it is.
+    return m[1];
+  }
+}
+
+/** Why a link did not open, in a few words. A link cut short fails as a wrong passphrase does: encryption cannot tell them apart. */
+export function linkProblem(e: unknown, what: 'setup' | 'invite'): string {
+  if (e instanceof WrongPassphraseError) return `That passphrase does not open this ${what} link. If it is right, copy the link again: one cut short fails the same way.`;
+  return `That is not a valid or complete ${what} link. Copy it again${what === 'setup' ? ' on the other device' : ''}.`;
+}
+
+/** Why `passphrase` cannot be chosen for a vault or shared folder, or '' when it can. One only being entered opens whatever its length. */
+export function passphraseProblem(passphrase: string, repeat: string, entering = false): string {
+  if (!passphrase) return 'Enter the passphrase.';
+  if (entering) return '';
+  if (passphrase.length < MIN_PASSPHRASE) return `Use at least ${MIN_PASSPHRASE} characters.`;
+  return passphrase === repeat ? '' : 'The two entries do not match.';
 }

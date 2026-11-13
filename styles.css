@@ -94,6 +94,16 @@
   word-break: break-all;
 }
 .coffer-hint { color: var(--text-muted); font-size: var(--font-ui-small); margin-top: var(--size-2-2); }
+.coffer-suggestion:empty { display: none; }
+.coffer-suggestion > code {
+  display: block;
+  padding: var(--size-4-2) var(--size-4-3);
+  background: var(--background-secondary);
+  border-radius: var(--radius-s);
+  font-size: var(--font-ui-medium);
+  overflow-wrap: anywhere;
+  user-select: all;
+}
 .coffer-check { display: block; margin-bottom: var(--size-4-3); color: var(--text-muted); }
 
 .coffer-error {

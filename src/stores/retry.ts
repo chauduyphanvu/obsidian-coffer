@@ -22,7 +22,7 @@ export function withRetry(store: RemoteStore, attempts = 5, baseMs = 300): Remot
   return {
     get: (key, range) => run(() => store.get(key, range)),
     put: (key, data, opts) => run(() => store.put(key, data, opts)),
-    delete: (key) => run(() => store.delete(key)),
+    delete: (key, opts) => (opts?.once ? store.delete(key) : run(() => store.delete(key))),
     list: (prefix, startAfter) => run(() => store.list(prefix, startAfter)),
   };
 }

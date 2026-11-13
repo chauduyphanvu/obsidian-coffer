@@ -42,7 +42,7 @@ test('create, edit and delete travel between devices', async () => {
   assert.deepEqual(b.snapshot(), a.snapshot());
 });
 
-test('a sync with nothing to do costs two empty reads, and a small edit two writes', async () => {
+test('a sync with nothing to do costs two empty reads, and a small edit two writes and one read of the commit before it', async () => {
   const { devices: [a, b], net } = setup();
   a.fs.put('a.md', 'x\n');
   await a.sync();
@@ -53,8 +53,7 @@ test('a sync with nothing to do costs two empty reads, and a small edit two writ
   a.fs.put('a.md', 'x\ny\n');
   net.reset();
   await a.sync();
-  assert.equal(net.stats.get + net.stats.list, 0);
-  assert.equal(net.stats.put, 2);
+  assert.deepEqual([net.stats.get, net.stats.put, net.stats.list], [1, 2, 0]);
   net.reset();
   await b.sync();
   assert.equal(b.fs.text('a.md'), 'x\ny\n');
@@ -85,6 +84,82 @@ test('edits to different parts of a note merge', async () => {
   await a.sync();
   assert.equal(a.fs.text('n.md'), '# Title\n\nONE\n\ntwo\n\nthree\n\nfour\n');
   assert.deepEqual(b.snapshot(), a.snapshot());
+});
+
+test('edits to different sentences of one paragraph merge', async () => {
+  const { devices: [a, b] } = setup();
+  const text = (...s: string[]) => `${s.join(' ')}\n`;
+  a.fs.put('n.md', text('The weather was warm and the market was busy.', 'We bought bread and cheese for the trip.'));
+  await a.sync();
+  await b.sync();
+  a.fs.put('n.md', text('The weather was very warm and the market was busy.', 'We bought bread and cheese for the trip.'));
+  b.fs.put('n.md', text('The weather was warm and the market was busy.', 'We bought bread and butter for the trip.'));
+  await a.sync();
+  const r = await b.sync();
+  assert.equal(r.merged, 1);
+  assert.deepEqual(r.conflictCopies, []);
+  await a.sync();
+  const merged = text('The weather was very warm and the market was busy.', 'We bought bread and butter for the trip.');
+  assert.equal(a.fs.text('n.md'), merged);
+  assert.deepEqual(b.snapshot(), a.snapshot());
+});
+
+test('properties edited on two devices merge key by key', async () => {
+  const { devices: [a, b] } = setup();
+  const note = (props: string) => `---\n${props}---\nBody\n`;
+  a.fs.put('n.md', note('title: Draft\nstatus: todo\ntags: [a]\n'));
+  await a.sync();
+  await b.sync();
+  a.fs.put('n.md', note('title: Draft\nstatus: done\ntags: [a, b]\n'));
+  b.fs.put('n.md', note('title: Final\nstatus: todo\ntags: [a, c]\n'));
+  await a.sync();
+  const r = await b.sync();
+  assert.equal(r.merged, 1);
+  assert.deepEqual(r.conflictCopies, []);
+  await a.sync();
+  assert.equal(a.fs.text('n.md'), note('title: Final\nstatus: done\ntags: [a, b, c]\n'));
+  assert.deepEqual(b.snapshot(), a.snapshot());
+});
+
+test('a canvas edited on two devices merges node by node', async () => {
+  const { devices: [a, b] } = setup();
+  const node = (id: string, extra: object = {}) => ({ id, type: 'text', text: `note ${id}`, x: 0, y: 0, width: 250, height: 60, ...extra });
+  const canvas = (...nodes: object[]) => `{\n\t"nodes":[\n${nodes.map((n) => `\t\t${JSON.stringify(n)}`).join(',\n')}\n\t],\n\t"edges":[]\n}`;
+  a.fs.put('board.canvas', canvas(node('a'), node('b')));
+  await a.sync();
+  await b.sync();
+  a.fs.put('board.canvas', canvas(node('a', { x: 300 }), node('b'), node('c')));
+  b.fs.put('board.canvas', canvas(node('a', { text: 'reworded' }), node('b', { y: -80 })));
+  await a.sync();
+  const r = await b.sync();
+  assert.equal(r.merged, 1);
+  assert.deepEqual(r.conflictCopies, []);
+  await a.sync();
+  assert.equal(a.fs.text('board.canvas'), canvas(node('a', { x: 300, text: 'reworded' }), node('b', { y: -80 }), node('c')));
+  assert.deepEqual(b.snapshot(), a.snapshot());
+});
+
+test('three devices editing different sentences of one paragraph at once converge on all three edits', async () => {
+  const { devices } = setup(['A', 'B', 'C']);
+  const [a, b, c] = devices;
+  const text = (planned: string, car: string, lake: string) =>
+    `Monday we ${planned} the trip together. Tuesday we packed the ${car} early. Wednesday we drove north all day. Thursday we reached the ${lake} at dusk.\n`;
+  a.fs.put('log.md', text('planned', 'car', 'lake'));
+  await a.sync();
+  await Promise.all([b.sync(), c.sync()]);
+  a.fs.put('log.md', text('carefully planned', 'car', 'lake'));
+  b.fs.put('log.md', text('planned', 'old car', 'lake'));
+  c.fs.put('log.md', text('planned', 'car', 'quiet lake'));
+  const copies: string[] = [];
+  const results = await Promise.all(devices.map((d) => d.sync()));
+  for (let pass = 0; pass < 4; pass++) results.push(...(await Promise.all(devices.map((d) => d.sync()))));
+  for (const r of results) copies.push(...r.conflictCopies);
+  assert.deepEqual(copies, []);
+  assert.ok(results.some((r) => r.merged > 0));
+  for (const d of devices) assert.equal(d.fs.text('log.md'), text('carefully planned', 'old car', 'quiet lake'));
+  assert.deepEqual([...a.fs.files.keys()], ['log.md']);
+  assert.deepEqual(b.snapshot(), a.snapshot());
+  assert.deepEqual(c.snapshot(), a.snapshot());
 });
 
 test('overlapping edits keep both versions', async () => {
@@ -631,6 +706,22 @@ test('after a paused mass delete, keeping all files brings them back on both sid
   assert.equal(b.fs.files.size, 30);
   await a.sync();
   assert.equal(a.fs.files.size, 30);
+});
+
+test('keeping all files counts the files over the download limit, which stay in storage: they are listed as left only afterwards', async () => {
+  const { devices: [a] } = setup(['A'], { deferAboveMB: 1 });
+  for (let i = 0; i < 30; i++) a.fs.put(`n${i}.md`, `${i}\n`);
+  a.fs.put('big1.bin', random(1_200_000, 1));
+  a.fs.put('big2.bin', random(1_300_000, 2));
+  await a.sync();
+  assert.deepEqual(await a.engine.deferred(), []);
+
+  a.fs.files.clear();
+  await assert.rejects(a.sync(), SafetyError);
+  assert.equal(await a.engine.keepAllFiles(), 32);
+  assert.deepEqual((await a.engine.deferred()).map((f) => f.path), ['big1.bin', 'big2.bin']);
+  await a.sync();
+  assert.equal(a.fs.files.size, 30, 'the two over the limit are not copied back');
 });
 
 test('a commit lists its files in the order they were planned, whichever is prepared first', async () => {
