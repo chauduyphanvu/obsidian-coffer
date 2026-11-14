@@ -1,14 +1,15 @@
 # Coffer
 
-Sync your Obsidian vault between your devices through storage you own: an S3-compatible bucket (Cloudflare R2, Backblaze B2, Amazon S3, MinIO, Wasabi and others) or a WebDAV server (Nextcloud, a NAS). Everything is encrypted on your device before it leaves, so the storage provider only ever holds data it cannot read.
+Sync your Obsidian vault between your devices through storage you own: an S3-compatible bucket (Cloudflare R2, Backblaze B2, Amazon S3, MinIO, Wasabi and others) or a WebDAV server (Nextcloud, a NAS). Everything that syncs is encrypted on your device before it leaves, so the storage provider only ever holds data it cannot read.
 
 Coffer runs on desktop and mobile, keeps a version history of every file, merges edits made on two devices, and can bring back deleted files or a whole folder as it was at an earlier time.
 
-> Coffer is young (0.4). It is covered by 644 tests and has been run on macOS and iOS, but keep a backup of a vault you care about while you try it.
+> Coffer is young (0.4). It is covered by 771 tests and has been run on macOS and iOS, but keep a backup of a vault you care about while you try it.
 
 ## What you need to know first
 
-- **Network use.** Coffer connects only to the storage you configure, to read and write your encrypted vault. It talks to no other server: no analytics, no telemetry, no update checks. Requests go through Obsidian's own `requestUrl`.
+- **Network use.** Coffer connects only to the storage you configure, to read and write your encrypted vault, and, if you publish a website, to the location you chose for it. It talks to no other server: no analytics, no telemetry, no update checks. Requests go through Obsidian's own `requestUrl`.
+- **Publishing is not encrypted.** Only if you use it: the notes you mark `publish: true` are uploaded as readable web pages to the location you choose, and anyone with its address can read them. Nothing is published until you run the command and confirm. See [Publishing a website](#publishing-a-website).
 - **No account, no payment.** Coffer is free. The storage itself is billed by your provider, if at all; R2 and B2 both have free tiers of 10 GB.
 - **Your passphrase is the only key.** If it is lost, the synced copy cannot be decrypted by anyone, including you. Keep it in a password manager.
 - **Files.** Coffer reads and writes only inside your vault, including its settings folder.
@@ -21,6 +22,7 @@ Coffer runs on desktop and mobile, keeps a version history of every file, merges
 - **History and restore.** Every version is kept for a day, then hourly states for a week, then daily states for the retention window (30 days by default). You can restore a version of a file, bring back deleted files, or return a folder or the whole vault to an earlier time, with a preview of what will change.
 - **Safety checks.** A sync that would delete more than 10 files and half the vault stops and asks first. Each change is chained to the one before it, so a device notices if storage was rolled back or tampered with. A "Check synced data for damage" command checks the stored data end to end, and "Repair synced data" stores again, from the files on a device that has them, whatever it finds missing.
 - **Sharing.** Share one folder with other people as members who can edit, only read, or read and suggest changes, each joining through their own invite link; or share notes scattered across the vault by marking them with a property. A shared folder gets its own storage. See [Sharing](#sharing).
+- **Publishing a website** (optional). Mark notes with `publish: true` and Coffer turns them into web pages, with the pictures they show, at a bucket or WebDAV folder of its own. These pages are not encrypted. See [Publishing a website](#publishing-a-website).
 - **Made for phones too.** Setup works from a phone, a new device joins by opening a setup link, and edits are sent before the app is suspended.
 - **Clear status.** The status bar says when the vault last synced; a problems screen says plainly what is wrong and what to do.
 - **Command-line tool** (optional) to keep a folder in sync from an always-on computer. See [Command line](#command-line).
@@ -106,6 +108,46 @@ Everything shared is encrypted like the vault, in storage you choose, and separa
 
 What members cannot be stopped from doing: anyone whose storage key can write can delete objects or add garbage that holds a shared folder up until the owner removes it. They cannot get a change accepted.
 
+## Publishing a website
+
+Sharing sends notes, encrypted, to people who hold a key. Publishing is different: it turns notes into web pages that anyone with their address can read in a browser, with no key and no sign-in. The pages are **not encrypted**, and they go to a location of their own, not to the storage your vault syncs to. Sync and sharing stay encrypted and are not touched by it. Nothing is published until you ask.
+
+### Marking notes
+
+A note is on the website when its properties say `publish: true` (in Obsidian, a checkbox property named `publish`). The commands **Put the current note on the website** and **Take the current note off the website** set and remove it. Notes that Obsidian Publish publishes carry the same property, so they are picked up too.
+
+### What goes up
+
+Those notes become pages, and the pictures, sound, video and PDF files they show or link to go up with them. Nothing else goes up.
+
+- A note's properties are not shown, except `title`, which is the page's title.
+- `%%comments%%` and HTML comments are removed.
+- A link to a note that is not published shows as plain text. A note embedded in another shows as a link to it.
+- A file whose name exists more than once in the vault is left out, unless the note links it with its folder.
+- Files left out of sync, files in hidden folders and conflict copies are never published. In Obsidian, neither are notes inside a shared folder.
+
+### Where it goes
+
+Under **Settings → Coffer → Website**, choose an S3-compatible bucket or a WebDAV folder, with keys of its own. It must not be the bucket or folder your vault or a shared folder syncs to, nor a folder inside it or one that holds it: Coffer refuses those. Use a key that can reach only that location.
+
+Coffer uploads the files; making them readable to the public is up to you, with your provider's own setting for it (public access to the bucket, or a domain connected to it). The site's entry page is `index.html`.
+
+### Publishing
+
+Run **Publish notes to the website…**. Coffer builds the site and compares it with what is at the location, then shows what would change: new, changed and removed pages and files, and what was left out. It uploads only after you confirm, and only the files that changed; pages you took off are deleted from the location. Nothing is published automatically, so a note you mark does not go up until you run the command.
+
+### How the site looks
+
+One page per note, at its place in the vault (`Folder/Note.html`), and an `index.html` front page: a note you choose with a list of the other pages under it, or the list alone. When you choose none, a published note named `index.md` at the top of the vault is the front page. Every page uses one stylesheet, light or dark as the reader's device is set. There are no scripts, and Coffer adds no trackers.
+
+### Good to know
+
+- The file and folder names of the notes you publish are visible in their page addresses.
+- Pictures go up exactly as they are, including any location data a phone stored in them. An image a note takes from another website is loaded from there by the reader's browser.
+- Taking a page off deletes it from your location, but not from caches or from copies others made, and a bucket with versioning keeps the old versions.
+- Coffer keeps a list of what it uploaded in `coffer-site.json` at the location, and only ever deletes files on that list. Files you put there yourself are left alone.
+- Coffer renders the notes itself, so what plugins draw (Dataview queries, Mermaid diagrams, math typesetting) appears as source text, and an embedded note is a link, not its text shown in place.
+
 ## Commands
 
 | Command | What it does |
@@ -120,6 +162,9 @@ What members cannot be stopped from doing: anyone whose storage key can write ca
 | Show recent changes in a shared folder | Lists who changed what in a shared folder with members |
 | Add the current note to the notes shared by property | Marks the note to be shared at the next sync |
 | Remove the current note from the notes shared by property… | Deletes the note for the people it is shared with, and keeps yours |
+| Publish notes to the website… | Shows what would change on the website, and uploads it once you confirm |
+| Put the current note on the website | Marks the note `publish: true`, so the next publish includes it |
+| Take the current note off the website | Removes `publish: true` from the note, so the next publish deletes its page |
 | Restore deleted files | Lists deleted files that can still be brought back |
 | Restore the vault or a folder to an earlier time | Previews and applies a point-in-time restore |
 | Resolve a file changed on two devices | Walks through a conflict copy line by line |
@@ -155,7 +200,19 @@ To check that the file was built by this repository's release workflow, run `gh 
 }
 ```
 
-Secrets come from the environment: `COFFER_PASSPHRASE` (at least 8 characters to make a new vault, and the same for `COFFER_NEW_PASSPHRASE`), and `COFFER_ACCESS_KEY` with `COFFER_SECRET_KEY` for S3, or `COFFER_WEBDAV_PASSWORD` for WebDAV. Other commands: `join`, `sync`, `fetch`, `check`, `history`, `restore`, `deleted`, `log`, `restore-at`, `verify`, `repair`, `clean`, `change-passphrase` and `accept-storage`. Run `node coffer.js --help` (from a clone, `npm run cli`) for details, and `--version` for the version.
+Secrets come from the environment: `COFFER_PASSPHRASE` (at least 8 characters to make a new vault, and the same for `COFFER_NEW_PASSPHRASE`), and `COFFER_ACCESS_KEY` with `COFFER_SECRET_KEY` for S3, or `COFFER_WEBDAV_PASSWORD` for WebDAV. Other commands: `join`, `sync`, `fetch`, `check`, `history`, `restore`, `deleted`, `log`, `restore-at`, `verify`, `repair`, `clean`, `change-passphrase`, `accept-storage` and `publish`. Run `node coffer.js --help` (from a clone, `npm run cli`) for details, and `--version` for the version.
+
+To publish a website (see [Publishing a website](#publishing-a-website)), add a `site` to `coffer.json`: where it goes, as a `remote` of type `s3`, `webdav` or `folder` with the same fields as the vault's `remote`, and optionally a `title` and a `home`, the note that is the front page.
+
+```json
+"site": {
+  "remote": { "type": "s3", "endpoint": "https://s3.us-east-1.amazonaws.com", "region": "us-east-1", "bucket": "my-site", "prefix": "", "pathStyle": false },
+  "title": "My notes",
+  "home": "Home.md"
+}
+```
+
+`node coffer.js publish --config=coffer.json` uploads the website and prints what changed. Unlike the command in Obsidian it does not ask first, so run it with `--dry-run` to see what it would do: that prints the same and writes nothing. The website's keys are separate from the vault's: `COFFER_SITE_ACCESS_KEY` and `COFFER_SITE_SECRET_KEY` for S3, or `COFFER_SITE_WEBDAV_PASSWORD` for WebDAV. `publish` reads only the vault folder, so it needs no passphrase and no sync keys, works on a device that only receives, and leaves the sync state alone. A `folder` site writes plain files you can host anywhere; the folder must be outside the vault, neither inside it nor holding it.
 
 To keep large files off this machine, set `deferAboveMB` under `sync` to a size in MB: files above it stay in storage, `sync` lists them as not downloaded, and `fetch <path>...` downloads the ones you name, after which they sync like any other file.
 

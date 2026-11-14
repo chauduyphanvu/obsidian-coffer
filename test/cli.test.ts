@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { resolveConfig } from '../src/core/config.ts';
@@ -1936,5 +1936,368 @@ test('cli: a shared folder whose keys file is gone or damaged says so instead of
     assert.equal((await mai.run(['sync'])).stderr, `config file ${mai.config} needs "share" to be the name of the shared folder, as join writes it\n`);
   } finally {
     h.done();
+  }
+});
+
+/** The environment a `publish` is run in: no COFFER_ variable, so no passphrase and none of the vault's keys. */
+const WITHOUT_SECRETS = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('COFFER_')));
+
+/** `setup`, and a website that goes to a folder beside the vault. `publishWith` adds environment variables to a `publish`. */
+function siteSetup(sync: object = {}, site: object = {}) {
+  const t = setup(sync);
+  const folder = join(t.dir, 'site');
+  const withSite = (site: object) => writeFileSync(t.config, JSON.stringify({ ...JSON.parse(readFileSync(t.config, 'utf8')), site }));
+  withSite({ remote: { type: 'folder', path: folder }, title: 'My notes', ...site });
+  const publishWith = (env: Record<string, string>, ...args: string[]) =>
+    spawnSync('node', [CLI, 'publish', ...args, `--config=${t.config}`], { encoding: 'utf8', env: { ...WITHOUT_SECRETS, ...env } });
+  return { ...t, folder, withSite, publishWith, publish: (...args: string[]) => publishWith({}, ...args) };
+}
+
+/** Five notes and two pictures: two notes say publish: true, one shows a picture, the other links to a note that is not published. */
+function siteNotes(vault: string): void {
+  put(vault, 'Home.md', '---\npublish: true\n---\n# Home\n\nTrips: [[Trip]]. Plans: [[Secret plan]].\n');
+  put(vault, 'Trip.md', '---\npublish: true\n---\n# Trip\n\n![[beach.png]]\n');
+  put(vault, 'Secret plan.md', '# Secret plan\n\nthe launch is on friday\n\n![[unused.png]]\n');
+  put(vault, 'Journal/Day.md', '---\npublish: false\n---\ndear diary, a private day\n');
+  put(vault, 'Plain.md', 'plain words only\n');
+  writeFileSync(join(vault, 'beach.png'), randomBytes(64));
+  writeFileSync(join(vault, 'unused.png'), randomBytes(64));
+}
+
+/** The modification time of every file under `dir`. */
+const mtimes = (dir: string) =>
+  Object.fromEntries((readdirSync(dir, { recursive: true }) as string[]).filter((p) => statSync(join(dir, p)).isFile()).map((p) => [p, statSync(join(dir, p)).mtimeMs]));
+
+test('cli publish: puts the notes that say publish: true on the website with the files they show, and nothing else, and says what it did', () => {
+  const t = siteSetup();
+  try {
+    siteNotes(t.vault);
+    const before = files(t.vault);
+    const r = t.publish();
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stderr, '');
+    assert.deepEqual(Object.keys(files(t.folder)).sort(), ['Home.html', 'Trip.html', 'beach.png', 'coffer-site.json', 'index.html', 'site.css']);
+    for (const [name, text] of Object.entries(files(t.folder))) {
+      for (const private_ of ['launch is on friday', 'a private day', 'plain words only', 'unused.png', 'publish: true']) assert.ok(!text.includes(private_), `${name} has "${private_}"`);
+    }
+    assert.match(readFileSync(join(t.folder, 'Home.html'), 'utf8'), /href="Trip\.html"/);
+    assert.match(readFileSync(join(t.folder, 'Trip.html'), 'utf8'), /<img src="beach\.png"/);
+    assert.deepEqual(readFileSync(join(t.folder, 'beach.png')), readFileSync(join(t.vault, 'beach.png')));
+    assert.deepEqual(Object.keys(JSON.parse(readFileSync(join(t.folder, 'coffer-site.json'), 'utf8')).files), ['Home.html', 'Trip.html', 'beach.png', 'index.html', 'site.css']);
+    assert.match(r.stdout, /^The website has 3 pages and 2 other files, published here for the first time\.$/m);
+    assert.match(r.stdout, /^New page: Trip$/m);
+    assert.match(r.stdout, /^New file: beach\.png$/m);
+    assert.match(r.stdout, /^Not linked: “Secret plan” in Home\.md leads to a note that is not published/m);
+    assert.match(r.stdout, new RegExp(`^published to folder ${escaped(t.folder)}\\n$`, 'm'));
+    assert.deepEqual(files(t.vault), before);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli publish: needs no passphrase and no keys of the sync, works on a device that only receives, and never makes or touches the sync state', () => {
+  const t = siteSetup({ readOnly: true });
+  try {
+    siteNotes(t.vault);
+    // The vault's own storage is a followed folder that cannot be reached: publishing never looks at it.
+    writeFileSync(t.config, JSON.stringify({ ...JSON.parse(readFileSync(t.config, 'utf8')), remote: { type: 'follow', url: 'http://127.0.0.1:1/' } }));
+    const r = t.publish();
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stderr, '');
+    assert.equal(existsSync(join(t.vault, '.coffer')), false);
+    assert.equal(existsSync(join(t.dir, 'remote')), false);
+
+    const sync = setup({});
+    try {
+      put(sync.vault, 'a.md', 'a\n');
+      sync.cli('sync');
+      const state = readFileSync(join(sync.vault, '.coffer', 'state.json'), 'utf8');
+      const stateMtime = statSync(join(sync.vault, '.coffer', 'state.json')).mtimeMs;
+      writeFileSync(sync.config, JSON.stringify({ ...JSON.parse(readFileSync(sync.config, 'utf8')), site: { remote: { type: 'folder', path: join(sync.dir, 'site') } } }));
+      const again = spawnSync('node', [CLI, 'publish', `--config=${sync.config}`], { encoding: 'utf8', env: WITHOUT_SECRETS });
+      assert.equal(again.status, 0, again.stderr);
+      assert.equal(readFileSync(join(sync.vault, '.coffer', 'state.json'), 'utf8'), state);
+      assert.equal(statSync(join(sync.vault, '.coffer', 'state.json')).mtimeMs, stateMtime);
+      assert.match(sync.cli('sync'), /^sent 0, received 0,/);
+    } finally {
+      sync.done();
+    }
+  } finally {
+    t.done();
+  }
+});
+
+test('cli publish --dry-run prints what publish would, writes nothing, not even the folder, and a later publish does just that', () => {
+  const t = siteSetup();
+  try {
+    siteNotes(t.vault);
+    const dry = t.publish('--dry-run');
+    assert.equal(dry.status, 0, dry.stderr);
+    assert.match(dry.stdout, /\ndry run: nothing was uploaded or deleted\n$/);
+    assert.equal(existsSync(t.folder), false);
+    mkdirSync(t.folder);
+    assert.equal(t.publish('--dry-run').status, 0);
+    assert.deepEqual(readdirSync(t.folder), []);
+
+    const real = t.publish();
+    assert.equal(real.status, 0, real.stderr);
+    const summary = dry.stdout.replace(/dry run: .*\n$/, '');
+    assert.ok(summary.length > 0);
+    assert.ok(real.stdout.startsWith(summary), 'the summary a dry run prints is the one the publish then shows');
+    assert.match(real.stdout.slice(summary.length), /^published to folder /);
+
+    // On a site that is there, a dry run says what would change and leaves every file as it was.
+    put(t.vault, 'Plain.md', '---\npublish: true\n---\nplain words only\n');
+    const before = { text: files(t.folder), times: mtimes(t.folder) };
+    const next = t.publish('--dry-run');
+    assert.equal(next.status, 0, next.stderr);
+    assert.match(next.stdout, /^New page: Plain$/m);
+    assert.match(next.stdout, /^Changed page: Front page$/m);
+    assert.deepEqual({ text: files(t.folder), times: mtimes(t.folder) }, before);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli publish: a second run with nothing changed says the website is up to date and rewrites nothing', async () => {
+  const t = siteSetup();
+  try {
+    siteNotes(t.vault);
+    assert.equal(t.publish().status, 0);
+    const times = mtimes(t.folder);
+    await sleep(30);
+    const again = t.publish();
+    assert.equal(again.status, 0, again.stderr);
+    assert.match(again.stdout, /^Nothing to upload or delete: the website at this location is up to date\.$/m);
+    assert.doesNotMatch(again.stdout, /published to/);
+    assert.deepEqual(mtimes(t.folder), times);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli publish: a note that stops saying publish: true is taken off, with the picture only it showed, and files that are not the website\'s stay', () => {
+  const t = siteSetup();
+  try {
+    siteNotes(t.vault);
+    assert.equal(t.publish().status, 0);
+    put(t.folder, 'mine.txt', 'not published by Coffer\n');
+    put(t.vault, 'Trip.md', '# Trip\n\n![[beach.png]]\n');
+    const r = t.publish();
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /^Removed page: Trip$/m);
+    assert.match(r.stdout, /^Removed file: beach\.png$/m);
+    assert.deepEqual(Object.keys(files(t.folder)).sort(), ['Home.html', 'coffer-site.json', 'index.html', 'mine.txt', 'site.css']);
+    assert.deepEqual(Object.keys(JSON.parse(readFileSync(join(t.folder, 'coffer-site.json'), 'utf8')).files), ['Home.html', 'index.html', 'site.css']);
+    assert.doesNotMatch(readFileSync(join(t.folder, 'index.html'), 'utf8'), /Trip/);
+    assert.match(readFileSync(join(t.folder, 'Home.html'), 'utf8'), /Trip/);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli publish: refuses, and writes nothing, without a site in the config, a folder that is or holds or is inside the vault, a vault, a website that is not its own, or an option it does not know', () => {
+  const t = siteSetup();
+  try {
+    siteNotes(t.vault);
+    const none = setup({});
+    try {
+      const r = bare(none.dir, ['publish', `--config=${none.config}`]);
+      assert.equal(r.status, 1);
+      assert.equal(r.stdout, '');
+      assert.equal(r.stderr, `config file ${none.config} has no "site", which says where the website goes\n`);
+    } finally {
+      none.done();
+    }
+
+    const link = join(t.dir, 'link');
+    const places = [
+      [join(t.vault, 'web'), 'inside the vault'],
+      [t.vault, 'the vault'],
+      [t.dir, 'the vault'],
+    ];
+    if (process.platform !== 'win32') {
+      symlinkSync(t.vault, link);
+      places.push([join(link, 'web'), 'inside the vault through a link'], [link, 'the vault through a link']);
+    }
+    // The config file, which is also in this folder, is rewritten for each place.
+    const everything = () => ({ ...files(t.dir), [basename(t.config)]: '' });
+    const before = everything();
+    for (const [path, what] of places) {
+      t.withSite({ remote: { type: 'folder', path } });
+      for (const args of [[], ['--dry-run']]) {
+        const r = t.publish(...args);
+        assert.equal(r.status, 1, `${path} is ${what}`);
+        assert.equal(r.stdout, '');
+        assert.match(r.stderr, /^the website's folder must be outside the vault, so nothing was published: /, path);
+      }
+    }
+    assert.deepEqual(everything(), before);
+    assert.equal(existsSync(join(t.vault, 'web')), false);
+
+    t.withSite({ remote: { type: 'folder', path: t.folder } });
+    mkdirSync(t.folder);
+    writeFileSync(join(t.folder, 'vault.json'), '{}');
+    const vaultHere = t.publish();
+    assert.equal(vaultHere.status, 1);
+    assert.match(vaultHere.stderr, /^This location holds a synced vault, so nothing was published\./);
+    assert.deepEqual(readdirSync(t.folder), ['vault.json']);
+
+    rmSync(join(t.folder, 'vault.json'));
+    writeFileSync(join(t.folder, 'index.html'), 'somebody else\'s page');
+    const foreign = t.publish();
+    assert.equal(foreign.status, 1);
+    assert.match(foreign.stderr, /^This location already has a website that Coffer did not put there, so nothing was published\./);
+    assert.deepEqual(readdirSync(t.folder), ['index.html']);
+    assert.equal(readFileSync(join(t.folder, 'index.html'), 'utf8'), 'somebody else\'s page');
+
+    writeFileSync(join(t.folder, 'coffer-site.json'), '{ not json');
+    const damaged = t.publish();
+    assert.equal(damaged.status, 1);
+    assert.match(damaged.stderr, /^The list of published files at this location \(coffer-site\.json\) is damaged, so nothing was published\./);
+    assert.equal(readFileSync(join(t.folder, 'coffer-site.json'), 'utf8'), '{ not json');
+
+    const force = t.publish('--force');
+    assert.equal(force.status, 2);
+    assert.match(force.stderr, /^unknown option for publish: --force$/m);
+    assert.equal(force.stdout, '');
+  } finally {
+    t.done();
+  }
+});
+
+test('cli publish: the website\'s keys are its own, from COFFER_SITE_ variables, and the vault\'s are never used for it', () => {
+  const t = siteSetup();
+  try {
+    siteNotes(t.vault);
+    const sync = { COFFER_PASSPHRASE: PASSPHRASE, COFFER_ACCESS_KEY: 'sync-key', COFFER_SECRET_KEY: 'sync-secret', COFFER_WEBDAV_PASSWORD: 'sync-password' };
+    const asked = (env: Record<string, string>, ...args: string[]) => {
+      const r = t.publishWith(env, ...args);
+      assert.equal(r.status, 1);
+      assert.equal(r.stdout, '');
+      return r.stderr;
+    };
+    t.withSite({ remote: { type: 's3', endpoint: 'http://127.0.0.1:1', region: 'auto', bucket: 'site' } });
+    assert.equal(asked(sync), 'COFFER_SITE_ACCESS_KEY is not set\n');
+    assert.equal(asked({ ...sync, COFFER_SITE_ACCESS_KEY: 'site-key' }), 'COFFER_SITE_SECRET_KEY is not set\n');
+    assert.equal(asked(sync, '--dry-run'), 'COFFER_SITE_ACCESS_KEY is not set\n');
+    t.withSite({ remote: { type: 'webdav', url: 'http://127.0.0.1:1/site', username: 'me' } });
+    assert.equal(asked(sync), 'COFFER_SITE_WEBDAV_PASSWORD is not set\n');
+  } finally {
+    t.done();
+  }
+});
+
+test('cli: a config\'s site is checked, and a config without one, or with a good one, is fine for the other commands', () => {
+  const t = siteSetup();
+  try {
+    const file = join(t.dir, 'odd.json');
+    const folder = { type: 'folder', path: join(t.dir, 'site') };
+    const site = (s: unknown) => JSON.stringify({ vault: t.vault, remote: { type: 'folder', path: join(t.dir, 'remote') }, site: s });
+    for (const [text, why] of [
+      [site('nope'), /needs "site" to be a JSON object/],
+      [site(null), /needs "site" to be a JSON object/],
+      [site([]), /needs "site" to be a JSON object/],
+      [site({}), /needs "site\.remote", saying where the website goes/],
+      [site({ remote: 'x' }), /needs "site\.remote", saying where the website goes/],
+      [site({ remote: { type: 'ftp' } }), /needs "site\.remote\.type" to be s3, webdav or folder/],
+      [site({ remote: { type: 'follow', url: 'http://localhost' } }), /needs "site\.remote\.type" to be s3, webdav or folder/],
+      [site({ remote: { path: '/x' } }), /needs "site\.remote\.type" to be s3, webdav or folder/],
+      [site({ remote: { type: 'folder' } }), /needs "site\.remote\.path"/],
+      [site({ remote: { type: 'webdav', url: 'http://localhost' } }), /needs "site\.remote\.username"/],
+      [site({ remote: { type: 'webdav', username: 'me' } }), /needs "site\.remote\.url"/],
+      [site({ remote: { type: 's3', endpoint: 'http://localhost' } }), /needs "site\.remote\.bucket"/],
+      [site({ remote: { type: 's3', bucket: 'b' } }), /needs "site\.remote\.endpoint"/],
+      [site({ remote: folder, title: 5 }), /needs "site\.title" to be a text/],
+      [site({ remote: folder, home: true }), /needs "site\.home" to be a text/],
+    ] as const) {
+      writeFileSync(file, text);
+      for (const command of ['sync', 'publish']) {
+        const r = bare(t.dir, [command, `--config=${file}`]);
+        assert.equal(r.status, 1, `${command} ${text}`);
+        assert.equal(r.stdout, '');
+        assert.match(r.stderr, new RegExp(`^config file ${escaped(file)} .*\\n$`), text);
+        assert.match(r.stderr, why, text);
+      }
+    }
+    put(t.vault, 'a.md', 'a\n');
+    for (const good of [{ remote: folder }, { remote: folder, title: 'My notes', home: 'Home.md' }]) {
+      t.withSite(good);
+      const r = t.run('sync');
+      assert.equal(r.status, 0, r.stderr);
+    }
+    writeFileSync(file, JSON.stringify({ vault: t.vault, remote: { type: 'folder', path: join(t.dir, 'remote') } }));
+    assert.equal(bare(t.dir, ['sync', `--config=${file}`]).status, 0);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli publish: a link in the vault to a file or folder outside it never puts what it leads to on the website', { skip: process.platform === 'win32' }, () => {
+  const t = siteSetup();
+  try {
+    const outside = join(t.dir, 'outside');
+    put(outside, 'secret.png', 'SECRET-PICTURE');
+    put(outside, 'Other.md', '---\npublish: true\n---\n# Other\n\nSECRET-NOTE\n');
+    put(outside, 'folder/Deep.md', '---\npublish: true\n---\n# Deep\n\nSECRET-DEEP\n');
+    put(t.vault, 'Mine.md', '---\npublish: true\n---\n# Mine\n\n![[pic.png]]\n\n[[Other]] [[Deep]]\n');
+    symlinkSync(join(outside, 'secret.png'), join(t.vault, 'pic.png'));
+    symlinkSync(join(outside, 'Other.md'), join(t.vault, 'Other.md'));
+    symlinkSync(join(outside, 'folder'), join(t.vault, 'folder'));
+    const r = t.publish();
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(Object.keys(files(t.folder)).sort(), ['Mine.html', 'coffer-site.json', 'index.html', 'site.css']);
+    for (const [name, text] of Object.entries(files(t.folder))) assert.doesNotMatch(text, /SECRET/, name);
+    assert.match(r.stdout, /^Not found: “pic\.png” in Mine\.md leads to no file in the vault\.$/m);
+    assert.match(r.stdout, /^Not found: “Other” in Mine\.md leads to no file in the vault\.$/m);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli publish: leaves out what sync leaves out and the settings and state folders, and says so', () => {
+  const t = siteSetup({ exclude: ['drafts/**'], configDir: 'config' });
+  try {
+    const page = (name: string) => `---\npublish: true\n---\n# ${name}\n`;
+    put(t.vault, 'Open.md', page('Open'));
+    put(t.vault, 'drafts/Later.md', page('Later'));
+    put(t.vault, 'config/Plugin.md', page('Plugin'));
+    put(t.vault, '.coffer/State.md', page('State'));
+    const r = t.publish();
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(Object.keys(files(t.folder)).sort(), ['Open.html', 'coffer-site.json', 'index.html', 'site.css']);
+    assert.match(r.stdout, /^Left out: drafts\/Later\.md, because /m);
+    assert.match(r.stdout, /^Left out: config\/Plugin\.md, because /m);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli: --help describes publish, that its pages are not encrypted, and the keys of the website', () => {
+  const t = setup({});
+  try {
+    const r = bare(t.dir, ['--help']);
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /^  publish \[--dry-run\] /m);
+    assert.match(r.stdout, /NOT\s+encrypted/);
+    assert.match(r.stdout, /COFFER_SITE_ACCESS_KEY and COFFER_SITE_SECRET_KEY for S3, COFFER_SITE_WEBDAV_PASSWORD/);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli publish: refuses the place the vault is stored, also before the first sync has put anything there', () => {
+  const t = siteSetup();
+  try {
+    siteNotes(t.vault);
+    // The vault's remote in `setup` is the folder `remote` beside the vault, which no sync has made yet.
+    t.withSite({ remote: { type: 'folder', path: join(t.dir, 'remote') } });
+    const r = t.publish();
+    assert.equal(r.status, 1);
+    assert.equal(r.stdout, '');
+    assert.match(r.stderr, /the website must go somewhere other than where the vault is stored, so nothing was published/);
+    assert.ok(!existsSync(join(t.dir, 'remote')));
+  } finally {
+    t.done();
   }
 });

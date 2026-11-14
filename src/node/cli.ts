@@ -1,8 +1,8 @@
 import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { readFile, realpath } from 'node:fs/promises';
 import { hostname } from 'node:os';
-import { join, resolve } from 'node:path';
-import { DEFAULT_CONFIG, resolveConfig, type SyncConfig } from '../core/config.ts';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { DEFAULT_CONFIG, compileExcludes, resolveConfig, type SyncConfig } from '../core/config.ts';
 import { MIN_PASSPHRASE } from '../core/crypto.ts';
 import { heartbeatDue, writeHeartbeat } from '../core/devices.ts';
 import { HistoryError, PassphraseUnknownError, RemovedError, SafetyError, SyncEngine, UnverifiedError, type SyncOptions, type SyncResult } from '../core/engine.ts';
@@ -11,8 +11,10 @@ import { Repo } from '../core/repo.ts';
 import { errorText, plural } from '../core/text.ts';
 import { TooOldError, listCommits, listDeleted, planRestore, tableAt } from '../core/timeline.ts';
 import type { RemoteStore } from '../core/types.ts';
+import { changesOf, preparePublish, publishPrepared, summaryLines } from '../publish/publish.ts';
 import { applyRestore, countSteps, deleteLimitCrossed, keepDeferred, keepOut, leftNote, restoreSteps, sizeLabel, unsent } from '../plugin/restore.ts';
 import { checkStore } from '../stores/doctor.ts';
+import { MemoryStore } from '../stores/memory.ts';
 import { openRemote } from '../stores/open.ts';
 import type { S3Config } from '../stores/s3.ts';
 import { KEYS_FILE, POSITION_FILE, STATE_FILE, credentialsFrom, joinWithLink, loadKeyFile, saveKeyFile, storageProblem, type Credentials, type KeyFile, type MemberRemote } from './member.ts';
@@ -22,16 +24,17 @@ import { SyncLoop, watchVault } from './watch.ts';
 /** Set at build time in dist/coffer.js; undefined when this file runs from source. */
 declare const COFFER_VERSION: string | undefined;
 
+/** Where a vault is stored or a website goes, with the secrets left out: they come from the environment. */
+type SiteRemote = ({ type: 's3' } & Omit<S3Config, 'accessKey' | 'secretKey'>) | { type: 'webdav'; url: string; username: string } | { type: 'folder'; path: string };
+
 interface CliConfig {
   vault: string;
-  remote:
-    | ({ type: 's3' } & Omit<S3Config, 'accessKey' | 'secretKey'>)
-    | { type: 'webdav'; url: string; username: string }
-    | { type: 'folder'; path: string }
-    | { type: 'follow'; url: string };
+  remote: SiteRemote | { type: 'follow'; url: string };
   /** Set by `join`: the name of a shared folder with members, whose keys are in the state folder's keys file. */
   share?: string;
   sync?: Partial<SyncConfig>;
+  /** Where `publish` puts the website: the notes marked to be published, as pages anyone with the address can read. `home` is the note that is the front page. */
+  site?: { remote: SiteRemote; title?: string; home?: string };
 }
 
 const USAGE = `Usage: node coffer.js <command> [--config=coffer.json]
@@ -80,10 +83,20 @@ const USAGE = `Usage: node coffer.js <command> [--config=coffer.json]
                          then sync: nothing is deleted, and where files differ both versions are kept.
                          Right after storage was restored from a backup; wrong if nobody did that on
                          purpose, as then someone else may have changed what is stored
+  publish [--dry-run]    publish the notes whose properties say publish: true as a website, with the pictures, sound,
+                         video and PDF files they show, to the location "site" gives in coffer.json: a "remote" of
+                         type s3, webdav or folder (plain files, to host anywhere), set as the vault's remote is, with
+                         "title" and "home" (the note that is the front page) if you want them. The pages are NOT
+                         encrypted: anyone with the address can read them. Only the vault folder is read, so no
+                         passphrase is needed, a device that only receives may publish, and sync's own files are left
+                         alone. Prints what is new, changed, removed and left out, then uploads what changed and
+                         deletes the pages taken off; --dry-run stops after printing, and writes nothing
 
 Secrets come from the environment: COFFER_PASSPHRASE, and for S3
 COFFER_ACCESS_KEY and COFFER_SECRET_KEY, for WebDAV COFFER_WEBDAV_PASSWORD. A shared folder joined with a link keeps
-its keys in .coffer/keys.json instead, and the environment is not read for it.`;
+its keys in .coffer/keys.json instead, and the environment is not read for it. The website's location has keys of
+its own, never the vault's: COFFER_SITE_ACCESS_KEY and COFFER_SITE_SECRET_KEY for S3, COFFER_SITE_WEBDAV_PASSWORD for
+WebDAV; a folder needs none.`;
 
 /** The options that take a value, as `--name=value` or `--name value`; every other option takes none. */
 const VALUED = ['config', 'poll', 'interval', 'limit', 'vault'];
@@ -105,6 +118,7 @@ const OPTIONS: Record<string, string[]> = {
   clean: [],
   'change-passphrase': [],
   'accept-storage': [],
+  publish: ['dry-run'],
 };
 
 /** What a device with sync.readOnly cannot do, as each command's reason: they write to storage, or to files it would never send. */
@@ -177,6 +191,13 @@ function makeStore(remote: CliConfig['remote'] | MemberRemote, firstRun: boolean
   return openRemote({ ...remote, pathStyle: remote.pathStyle ?? true, prefix: remote.prefix ?? '', accessKey: key('accessKey', 'COFFER_ACCESS_KEY'), secretKey: key('secretKey', 'COFFER_SECRET_KEY') });
 }
 
+/** The website's location, with keys of its own from the environment: `create` makes a folder that is not there yet. */
+function makeSiteStore(remote: SiteRemote, create: boolean): RemoteStore {
+  if (remote.type === 'folder') return new FolderStore(resolve(remote.path), { create });
+  if (remote.type === 'webdav') return openRemote({ type: 'webdav', url: remote.url, username: remote.username, password: env('COFFER_SITE_WEBDAV_PASSWORD') });
+  return openRemote({ ...remote, pathStyle: remote.pathStyle ?? true, prefix: remote.prefix ?? '', accessKey: env('COFFER_SITE_ACCESS_KEY'), secretKey: env('COFFER_SITE_SECRET_KEY') });
+}
+
 const fail = (message: string): never => {
   throw new Error(message);
 };
@@ -189,7 +210,7 @@ const REMOTE_FIELDS: Record<string, string[]> = { s3: ['endpoint', 'bucket'], we
 /** Why `c`, parsed from the config file, cannot be a config, in words that follow "config file <path>". */
 function configProblem(c: unknown): string | undefined {
   if (typeof c !== 'object' || c === null || Array.isArray(c)) return 'must hold a JSON object';
-  const { vault, remote, sync, share } = c as Record<string, unknown>;
+  const { vault, remote, sync, share, site } = c as Record<string, unknown>;
   if (typeof vault !== 'string' || !vault) return 'needs "vault", the path of the folder to sync';
   if (share !== undefined && typeof share !== 'string') return 'needs "share" to be the name of the shared folder, as join writes it';
   if (sync !== undefined) {
@@ -206,12 +227,25 @@ function configProblem(c: unknown): string | undefined {
       if (!fits) return `needs "sync.${key}" to be ${Array.isArray(like) ? 'a list of texts' : typeof like === 'number' ? 'a number, 0 or more' : typeof like === 'boolean' ? 'true or false' : typeof like === 'string' ? 'a text' : 'a JSON object'}`;
     }
   }
-  if (typeof remote !== 'object' || remote === null) return 'needs "remote", saying where the vault is stored';
+  const problem = remoteProblem(remote, 'remote', 'saying where the vault is stored', true);
+  if (problem || site === undefined) return problem;
+  if (typeof site !== 'object' || site === null || Array.isArray(site)) return 'needs "site" to be a JSON object';
+  const { remote: where, title, home } = site as Record<string, unknown>;
+  return (
+    remoteProblem(where, 'site.remote', 'saying where the website goes', false) ??
+    (title !== undefined && typeof title !== 'string' ? 'needs "site.title" to be a text' : undefined) ??
+    (home !== undefined && typeof home !== 'string' ? 'needs "site.home" to be a text' : undefined)
+  );
+}
+
+/** Why `remote`, found at `at` in the config file, cannot say where things go, in words that follow "config file <path>". A vault's remote may also be a followed folder; a website's may not. */
+function remoteProblem(remote: unknown, at: string, says: string, follow: boolean): string | undefined {
+  if (typeof remote !== 'object' || remote === null) return `needs "${at}", ${says}`;
   const { type } = remote as Record<string, unknown>;
-  const fields = typeof type === 'string' && Object.hasOwn(REMOTE_FIELDS, type) ? REMOTE_FIELDS[type] : undefined;
-  if (!fields) return 'needs "remote.type" to be s3, webdav or folder';
+  const fields = typeof type === 'string' && Object.hasOwn(REMOTE_FIELDS, type) && (follow || type !== 'follow') ? REMOTE_FIELDS[type] : undefined;
+  if (!fields) return `needs "${at}.type" to be s3, webdav or folder`;
   const missing = fields.find((f) => typeof (remote as Record<string, unknown>)[f] !== 'string');
-  return missing && `needs "remote.${missing}"`;
+  return missing && `needs "${at}.${missing}"`;
 }
 
 /** The storage, for a line that says what is being watched. */
@@ -339,6 +373,63 @@ async function restoreAt(engine: SyncEngine, fs: NodeFS, when: string, folder: s
   return failed || r.errors.length ? 1 : 0;
 }
 
+/** Where `path` really is, so two folders can be compared: the part that exists is resolved through links, and what is not made yet is added after it. */
+async function realPath(path: string): Promise<string> {
+  const abs = resolve(path);
+  try {
+    return await realpath(abs);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT' && code !== 'ENOTDIR') throw e;
+    const up = dirname(abs);
+    return up === abs ? abs : join(await realPath(up), basename(abs));
+  }
+}
+
+const within = (inner: string, outer: string) => {
+  const way = relative(outer, inner);
+  return way === '' || (way !== '..' && !way.startsWith(`..${sep}`) && !isAbsolute(way));
+};
+
+/**
+ * Publishes the notes that say publish: true to the location `cli.site` gives, as the plugin does: shows what would change
+ * and, unless `dry`, uploads and deletes as shown. Reads only the vault folder and writes only the location, so no sync key
+ * or state is needed or touched, and a folder for a website is never made by a dry run.
+ */
+async function publish(cli: CliConfig, vault: string, configFile: string, dry: boolean): Promise<number> {
+  const { site } = cli;
+  if (!site) throw new Error(`config file ${resolve(configFile)} has no "site", which says where the website goes`);
+  if (site.remote.type === 'folder') {
+    const [there, here] = await Promise.all([realPath(site.remote.path), realPath(vault)]);
+    const how = within(here, there) ? (there === here ? 'is the vault' : `holds the vault (${here})`) : within(there, here) ? `is inside the vault (${here})` : '';
+    if (how) throw new Error(`the website's folder must be outside the vault, so nothing was published: ${there} ${how}`);
+  }
+  // Before the vault's first sync its storage holds no vault.json yet, which is what the upload would refuse it by.
+  const sync = cli.remote;
+  const sameBucket = site.remote.type === 's3' && sync.type === 's3' && site.remote.endpoint === sync.endpoint && site.remote.bucket === sync.bucket && (site.remote.prefix ?? '') === (sync.prefix ?? '');
+  const sameDav = site.remote.type === 'webdav' && sync.type === 'webdav' && site.remote.url === sync.url;
+  const sameFolder = site.remote.type === 'folder' && sync.type === 'folder' && (await realPath(site.remote.path)) === (await realPath(sync.path));
+  if (sameBucket || sameDav || sameFolder) throw new Error('the website must go somewhere other than where the vault is stored, so nothing was published');
+  // A folder reads as a location with nothing in it when it is not there yet, and only a real run makes it.
+  const store = dry && site.remote.type === 'folder' && !existsSync(resolve(site.remote.path)) ? new MemoryStore() : makeSiteStore(site.remote, !dry);
+  const fs = new NodeFS(vault);
+  const configDir = cli.sync?.configDir ?? DEFAULT_CONFIG.configDir;
+  const prepared = await preparePublish({ list: async () => (await fs.list()).map((f) => f.path), read: (path) => fs.read(path) }, store, {
+    title: site.title ?? '',
+    home: site.home ?? '',
+    excluded: compileExcludes([...(cli.sync?.exclude ?? DEFAULT_CONFIG.exclude), `${STATE_DIR}/**`, `${configDir}/**`]),
+  });
+  for (const line of summaryLines(prepared)) console.log(line);
+  if (dry) {
+    console.log('dry run: nothing was uploaded or deleted');
+    return 0;
+  }
+  if (changesOf(prepared).nothing) return 0;
+  await publishPrepared(store, prepared);
+  console.log(`published to ${describeRemote(site.remote)}`);
+  return 0;
+}
+
 async function readStdin(): Promise<string> {
   const parts: Buffer[] = [];
   for await (const part of process.stdin) parts.push(part as Buffer);
@@ -417,6 +508,8 @@ async function main(): Promise<number> {
     },
   );
   const vault = resolve(cli.vault);
+  // Before anything that needs the vault's keys, state or passphrase: publishing has no use for them, and none of it may be made or changed here.
+  if (command === 'publish') return publish(cli, vault, configFile, flags.has('dry-run'));
   const stateFile = join(vault, STATE_DIR, STATE_FILE);
   const keysFile = join(vault, STATE_DIR, KEYS_FILE);
   // A shared folder with members: its keys are in a file of their own. A device without a signing key (a reader, a follower) only receives.
