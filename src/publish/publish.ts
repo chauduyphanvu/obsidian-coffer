@@ -67,7 +67,7 @@ export function changesOf(p: Prepared): Changes {
 }
 
 const WHY: Record<LeftOutWhy, string> = {
-  excluded: 'it is left out of sync on this device, or is in a hidden folder',
+  excluded: 'it is left out of sync or of the website in settings, or is in a hidden folder',
   conflict: 'it is a conflict copy of another file',
   name: 'its name can not be used on a website',
   clash: 'another file of the website has this name, in the same or other letter case',
@@ -82,7 +82,7 @@ export function summaryLines(p: Prepared): string[] {
   // Counted as the changes below count them: the front page is a page, the style sheet a file.
   const keys = [...p.site.files.keys()];
   const pageCount = keys.filter((k) => k.endsWith('.html')).length;
-  const lines = [`The website has ${plural(pageCount, 'page')} and ${plural(keys.length - pageCount, 'other file')}${plan.first ? ', published here for the first time' : ''}.`];
+  const lines = [`The website has ${plural(pageCount, 'page')} and ${plural(keys.length - pageCount, 'other file')}${report.whole ? ', made of the whole vault except notes that say publish: false' : ''}${plan.first ? ', published here for the first time' : ''}.`];
   if (c.nothing) lines.push('Nothing to upload or delete: the website at this location is up to date.');
   else {
     const counts = [

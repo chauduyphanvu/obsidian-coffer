@@ -121,7 +121,7 @@ export class SettingsTab extends PluginSettingTab {
         });
       },
     });
-    const siteToggle = (name: string, desc: string, key: 'pathStyle', visible?: () => boolean): SettingGroupItem => ({
+    const siteToggle = (name: string, desc: string, key: 'pathStyle' | 'whole', visible?: () => boolean): SettingGroupItem => ({
       name,
       desc,
       visible,
@@ -351,6 +351,24 @@ export class SettingsTab extends PluginSettingTab {
                 searchable: false,
                 visible: () => siteAtVaultStorage(site(), plugin.settings),
                 render: (setting) => setting.settingEl.addClass('coffer-publish-warning'),
+              },
+              siteToggle(
+                'Publish the whole vault',
+                'Every note becomes a page, and new notes join at the next publish, without marking each one. A note whose properties say publish: false stays off. Turned off, only notes that say publish: true are published.',
+                'whole',
+              ),
+              {
+                name: 'Keep off the website',
+                desc: 'Folders and files that are never published, one a line, written like the files left out of sync: Private/ for a folder, *.draft.md for a kind of file.',
+                aliases: ['website', 'publish', 'exclude', 'private'],
+                render: (setting) => {
+                  setting.addTextArea((t) => {
+                    t.setPlaceholder('Private/\nTemplates/').setValue(site().except).onChange((v) => {
+                      site().except = v;
+                      void plugin.saveSettings();
+                    });
+                  });
+                },
               },
               siteText('Website title', 'Shown at the top of every page.', 'title', 'Notes', undefined, ['name']),
               siteText(

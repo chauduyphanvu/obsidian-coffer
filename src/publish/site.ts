@@ -29,6 +29,11 @@ export interface SiteOptions {
   home: string;
   /** Files the caller keeps out of everything: what sync leaves out, the settings folder. Given a vault key (NFC path). */
   excluded: (key: string) => boolean;
+  /**
+   * The whole vault is the website: every note is a page unless its properties say otherwise (`publish: false`, or
+   * anything but `publish: true`). Without it, only the notes that say `publish: true` are.
+   */
+  whole?: boolean;
 }
 
 /**
@@ -50,6 +55,8 @@ export interface SiteReport {
   missing: { from: string; link: string }[];
   /** Files that would be on the site but are left out, each with why. */
   leftOut: { path: string; why: LeftOutWhy }[];
+  /** The site was built of the whole vault (`SiteOptions.whole`). */
+  whole: boolean;
   /** The note chosen as the front page, when it is not a note on the site: the front page is then the list of pages. '' otherwise. */
   homeNotFound: string;
 }
@@ -114,6 +121,18 @@ export function publishes(text: string): boolean {
   const [first, ...more] = splitLines(es.get(keys[0])!);
   const rest = first.slice(KEY.exec(first)![0].length).trim();
   return !rest || rest.startsWith('[') || rest.startsWith('#') || more.every((line) => /^[ \t]*(?:#.*)?\r?\n?$/.test(line));
+}
+
+/**
+ * Whether a note is a page of a website of the whole vault: it is unless it has a `publish` property that does not say
+ * true, as `publish: false` or an empty one. A note whose properties can not be read is not: it may be saying no.
+ */
+export function publishedInWhole(text: string): boolean {
+  const fm = frontmatter(text.startsWith(BOM) ? text.slice(1) : text);
+  if (!fm) return true;
+  const es = entries(fm.props);
+  if (!es) return false;
+  return [...es.keys()].some((k) => k.toLowerCase() === PUBLISH) ? publishes(text) : true;
 }
 
 /** Whether a property's value, as Obsidian has read it, is what `publishes` takes for `publish: true`: true, the text "true", or a list of one of those. */
@@ -387,7 +406,7 @@ export async function buildSite(vault: VaultReader, o: SiteOptions): Promise<Sit
   const texts = await inParallel(notes, READS, async (f) => {
     try {
       const text = decoder.decode(await vault.read(f.path));
-      return publishes(text) ? text : undefined;
+      return (o.whole ? publishedInWhole(text) : publishes(text)) ? text : undefined;
     } catch {
       return undefined;
     }
@@ -405,9 +424,11 @@ export async function buildSite(vault: VaultReader, o: SiteOptions): Promise<Sit
     const text = texts[i];
     if (text === undefined) return;
     const why = pathWhy(f.key, o.excluded) ?? (f.path === pathOf.get(f.key) ? undefined : 'clash');
-    if (why) return leave(f.path, f.key, why);
+    // In a website of the whole vault, a note kept out by a setting or as a conflict copy is only worth a word when it asks to be on it.
+    if (why) return o.whole && (why === 'excluded' || why === 'conflict') && !publishes(text) ? undefined : leave(f.path, f.key, why);
     const named = propertyValues(text, 'title');
-    const body = frontmatter(text.startsWith(BOM) ? text.slice(1) : text)!.body;
+    const bare = text.startsWith(BOM) ? text.slice(1) : text;
+    const body = frontmatter(bare)?.body ?? bare;
     candidates.push({ path: f.path, key: f.key, site: '', body, named: named?.length === 1 && oneLine(named[0]) ? oneLine(named[0]) : undefined });
   });
 
@@ -544,6 +565,7 @@ export async function buildSite(vault: VaultReader, o: SiteOptions): Promise<Sit
       attachments: attachments.sort(byPath),
       unpublished: links('unpublished'),
       missing: links('missing'),
+      whole: !!o.whole,
       homeNotFound: wanted && !chosen ? o.home.trim() : '',
       leftOut: [...leftOut].map(([path, why]) => ({ path, why })).sort(byPath),
     },

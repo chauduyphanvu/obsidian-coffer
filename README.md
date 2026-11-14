@@ -4,7 +4,7 @@ Sync your Obsidian vault between your devices through storage you own: an S3-com
 
 Coffer runs on desktop and mobile, keeps a version history of every file, merges edits made on two devices, and can bring back deleted files or a whole folder as it was at an earlier time.
 
-> Coffer is young (0.4). It is covered by 771 tests and has been run on macOS and iOS, but keep a backup of a vault you care about while you try it.
+> Coffer is young (0.4). It is covered by 774 tests and has been run on macOS and iOS, but keep a backup of a vault you care about while you try it.
 
 ## What you need to know first
 
@@ -22,7 +22,7 @@ Coffer runs on desktop and mobile, keeps a version history of every file, merges
 - **History and restore.** Every version is kept for a day, then hourly states for a week, then daily states for the retention window (30 days by default). You can restore a version of a file, bring back deleted files, or return a folder or the whole vault to an earlier time, with a preview of what will change.
 - **Safety checks.** A sync that would delete more than 10 files and half the vault stops and asks first. Each change is chained to the one before it, so a device notices if storage was rolled back or tampered with. A "Check synced data for damage" command checks the stored data end to end, and "Repair synced data" stores again, from the files on a device that has them, whatever it finds missing.
 - **Sharing.** Share one folder with other people as members who can edit, only read, or read and suggest changes, each joining through their own invite link; or share notes scattered across the vault by marking them with a property. A shared folder gets its own storage. See [Sharing](#sharing).
-- **Publishing a website** (optional). Mark notes with `publish: true` and Coffer turns them into web pages, with the pictures they show, at a bucket or WebDAV folder of its own. These pages are not encrypted. See [Publishing a website](#publishing-a-website).
+- **Publishing a website** (optional). Mark notes with `publish: true`, or publish the whole vault, and Coffer turns them into web pages, with the pictures they show, at a bucket or WebDAV folder of its own. These pages are not encrypted. See [Publishing a website](#publishing-a-website).
 - **Made for phones too.** Setup works from a phone, a new device joins by opening a setup link, and edits are sent before the app is suspended.
 - **Clear status.** The status bar says when the vault last synced; a problems screen says plainly what is wrong and what to do.
 - **Command-line tool** (optional) to keep a folder in sync from an always-on computer. See [Command line](#command-line).
@@ -114,7 +114,11 @@ Sharing sends notes, encrypted, to people who hold a key. Publishing is differen
 
 ### Marking notes
 
-A note is on the website when its properties say `publish: true` (in Obsidian, a checkbox property named `publish`). The commands **Put the current note on the website** and **Take the current note off the website** set and remove it. Notes that Obsidian Publish publishes carry the same property, so they are picked up too.
+There are two ways to choose what is published. Note by note: a note is on the website when its properties say `publish: true` (in Obsidian, a checkbox property named `publish`). Or the whole vault: turn on **Publish the whole vault** in the website's settings, and every note is a page, new ones included, except those whose properties say `publish: false`. Either way, **Keep off the website** in the same settings lists folders and files that are never published, such as `Private/` or `Templates/`.
+
+With the whole vault published, everything you write becomes public at the next publish unless you keep it off, so set the folders to keep off first and read the preview before you confirm.
+
+The commands **Put the current note on the website** and **Take the current note off the website** change the property for you. Notes that Obsidian Publish publishes carry the same property, so they are picked up too.
 
 ### What goes up
 
@@ -163,8 +167,8 @@ One page per note, at its place in the vault (`Folder/Note.html`), and an `index
 | Add the current note to the notes shared by property | Marks the note to be shared at the next sync |
 | Remove the current note from the notes shared by property… | Deletes the note for the people it is shared with, and keeps yours |
 | Publish notes to the website… | Shows what would change on the website, and uploads it once you confirm |
-| Put the current note on the website | Marks the note `publish: true`, so the next publish includes it |
-| Take the current note off the website | Removes `publish: true` from the note, so the next publish deletes its page |
+| Put the current note on the website | Marks the note so the next publish includes it: `publish: true`, or with the whole vault published, removes `publish: false` |
+| Take the current note off the website | Marks the note so the next publish deletes its page: removes `publish: true`, or with the whole vault published, sets `publish: false` |
 | Restore deleted files | Lists deleted files that can still be brought back |
 | Restore the vault or a folder to an earlier time | Previews and applies a point-in-time restore |
 | Resolve a file changed on two devices | Walks through a conflict copy line by line |
@@ -202,7 +206,7 @@ To check that the file was built by this repository's release workflow, run `gh 
 
 Secrets come from the environment: `COFFER_PASSPHRASE` (at least 8 characters to make a new vault, and the same for `COFFER_NEW_PASSPHRASE`), and `COFFER_ACCESS_KEY` with `COFFER_SECRET_KEY` for S3, or `COFFER_WEBDAV_PASSWORD` for WebDAV. Other commands: `join`, `sync`, `fetch`, `check`, `history`, `restore`, `deleted`, `log`, `restore-at`, `verify`, `repair`, `clean`, `change-passphrase`, `accept-storage` and `publish`. Run `node coffer.js --help` (from a clone, `npm run cli`) for details, and `--version` for the version.
 
-To publish a website (see [Publishing a website](#publishing-a-website)), add a `site` to `coffer.json`: where it goes, as a `remote` of type `s3`, `webdav` or `folder` with the same fields as the vault's `remote`, and optionally a `title` and a `home`, the note that is the front page.
+To publish a website (see [Publishing a website](#publishing-a-website)), add a `site` to `coffer.json`: where it goes, as a `remote` of type `s3`, `webdav` or `folder` with the same fields as the vault's `remote`, and optionally a `title`, a `home` (the note that is the front page), `"whole": true` to publish every note except those that say `publish: false`, and an `exclude` list of folders and files to keep off the website.
 
 ```json
 "site": {

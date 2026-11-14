@@ -29,7 +29,7 @@ import type { Entry, RemoteStore, Version } from '../core/types.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
 import { preparePublish, publishPrepared, type Prepared } from '../publish/publish.ts';
-import { PUBLISH, saysTrue, type VaultReader } from '../publish/site.ts';
+import { PUBLISH, type VaultReader } from '../publish/site.ts';
 import { arrivalLine, type Self } from './activity.ts';
 import { ChangeLog, fromEvents, type Why } from './changes.ts';
 import { chooseDeferred } from './deferred.ts';
@@ -58,8 +58,10 @@ import {
   setupLink,
   shareConfig,
   shareSecretName,
+  onWebsite,
   siteAtVaultStorage,
   siteConfigured,
+  siteExcept,
   siteSpec,
   statePath,
   storagePayload,
@@ -1869,7 +1871,9 @@ export default class CofferPlugin extends Plugin {
       list: async () => vault.getFiles().map((f) => f.path),
       read: async (path) => new Uint8Array(await vault.adapter.readBinary(path)),
     };
-    const prepared = await preparePublish(reader, store, { title: site.title, home: site.home, excluded: this.keptOut() });
+    const keptOut = this.keptOut();
+    const except = siteExcept(site);
+    const prepared = await preparePublish(reader, store, { title: site.title, home: site.home, whole: site.whole, excluded: (key) => keptOut(key) || except(key) });
     return { prepared, store };
   }
 
@@ -1889,19 +1893,19 @@ export default class CofferPlugin extends Plugin {
     }
   }
 
-  /** Whether the note's properties, as Obsidian has read them, say `publish: true` in any of the ways the website takes it. */
+  /** Whether the note is on the website by its properties, as Obsidian has read them: it says `publish: true`, or the whole vault is published and it does not say otherwise. */
   private marked(file: TFile): boolean {
-    const fm: Record<string, unknown> = this.app.metadataCache.getFileCache(file)?.frontmatter ?? {};
-    return Object.keys(fm).some((k) => k.toLowerCase() === PUBLISH && saysTrue(fm[k]));
+    return onWebsite(this.settings.site, this.app.metadataCache.getFileCache(file)?.frontmatter ?? {});
   }
 
-  /** Puts `publish: true` in the note's properties, or takes that property out. The website changes at the next publish. */
+  /** Changes the note's `publish` property so that it is on the website or off it. The website changes at the next publish. */
   private async markForWebsite(file: TFile, on: boolean): Promise<void> {
     try {
       await this.app.fileManager.processFrontMatter(file, (fm: Record<string, unknown>) => {
         // The website reads the name in any letter case but only one entry of it, so no other spelling stays.
-        for (const k of Object.keys(fm)) if (k.toLowerCase() === PUBLISH && (!on || k !== PUBLISH)) delete fm[k];
-        if (on) fm[PUBLISH] = true;
+        for (const k of Object.keys(fm)) if (k.toLowerCase() === PUBLISH) delete fm[k];
+        // When the whole vault is published a note is on the website without the property, and says false to stay off.
+        if (on !== this.settings.site.whole) fm[PUBLISH] = on;
       });
       new Notice(`“${file.basename}” ${on ? 'goes on' : 'comes off'} the website the next time you publish.`);
     } catch (e) {

@@ -32,7 +32,9 @@ import {
   shareConfig,
   shareSecretName,
   shareWith,
+  onWebsite,
   siteAtVaultStorage,
+  siteExcept,
   siteConfigured,
   siteLink,
   siteSpec,
@@ -425,7 +427,7 @@ test('site: settings saved before the website, or with part of it, load with eve
   const empty = defaultSettings(false).site;
   assert.deepEqual(empty, {
     storageType: 's3', webdavUrl: '', webdavUser: '', webdavPasswordSecret: '', endpoint: '', region: 'auto', bucket: '', prefix: '', pathStyle: true,
-    accessKeySecret: '', secretKeySecret: '', title: '', home: '', url: '', lastPublished: 0,
+    accessKeySecret: '', secretKeySecret: '', title: '', home: '', whole: false, except: '', url: '', lastPublished: 0,
   });
   const old = { ...s3(), deviceName: 'laptop' } as Partial<Settings>;
   delete old.site;
@@ -510,4 +512,26 @@ test('site: the public address is shown with one slash at the end, and only when
   assert.equal(link('ftp://notes.example.com'), '');
   assert.equal(link('https://'), '');
   assert.equal(link('https:///'), '');
+});
+
+test('website: which notes are on it by their properties, and what its own exclusions keep off', () => {
+  const marked = defaultSettings(false).site;
+  const whole = { ...marked, whole: true };
+  assert.ok(!onWebsite(marked, {}));
+  assert.ok(onWebsite(marked, { publish: true }));
+  assert.ok(onWebsite(marked, { Publish: 'true' }));
+  assert.ok(!onWebsite(marked, { publish: false }));
+  assert.ok(onWebsite(whole, {}), 'with the whole vault published a note needs no property');
+  assert.ok(onWebsite(whole, { title: 'x' }));
+  assert.ok(onWebsite(whole, { publish: true }));
+  assert.ok(!onWebsite(whole, { publish: false }));
+  assert.ok(!onWebsite(whole, { publish: null }), 'an empty property is not a yes');
+  assert.ok(!onWebsite(whole, { publish: true, Publish: true }), 'two spellings are read as the builder reads them: not published');
+
+  const except = siteExcept({ ...marked, except: 'Private/\n*.draft.md\n\n' });
+  assert.ok(except('Private/a.md'));
+  assert.ok(except('Notes/x.draft.md'));
+  assert.ok(!except('Notes/x.md'));
+  assert.ok(!siteExcept(marked)('anything.md'));
+  assert.equal(loadSettings({ site: { whole: true } } as never, false).site.except, '');
 });

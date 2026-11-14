@@ -7,7 +7,7 @@ import type { RemoteStore } from '../src/core/types.ts';
 import { propertyValues, shareValues } from '../src/plugin/byproperty.ts';
 import { MANIFEST } from '../src/publish/deploy.ts';
 import { changesOf, preparePublish, publishPrepared, summaryLines } from '../src/publish/publish.ts';
-import { PUBLISH, buildSite, saysTrue, linkIndex, publishes, relativeHref, resolveLink, resolveLinkDetail, type Site, type SiteOptions, type VaultReader } from '../src/publish/site.ts';
+import { PUBLISH, buildSite, publishedInWhole, saysTrue, linkIndex, publishes, relativeHref, resolveLink, resolveLinkDetail, type Site, type SiteOptions, type VaultReader } from '../src/publish/site.ts';
 import { THEME } from '../src/publish/theme.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
 
@@ -668,7 +668,7 @@ test('front page list: folders first, then pages, each by name ignoring letter c
   assert.deepEqual(keys(empty), ['index.html', 'site.css']);
   assert.equal(mainOf(page(empty, 'index.html')), '<h1 class="title">Notes</h1>\n<p class="empty">Nothing has been published here yet.</p>');
   assert.ok(page(empty, 'index.html').includes('<title>Notes</title>'));
-  assert.deepEqual(empty.report, { pages: [], attachments: [], unpublished: [], missing: [], homeNotFound: '', leftOut: [] });
+  assert.deepEqual(empty.report, { pages: [], attachments: [], unpublished: [], missing: [], whole: false, homeNotFound: '', leftOut: [] });
 });
 
 test('determinism: the same vault gives the same bytes, whatever order it is listed in and reads finish in', async () => {
@@ -791,7 +791,7 @@ test('changes and summary: the first publish, an update, and nothing to do', asy
     'New file: pics/c.png',
     'Changed file: pics/a.png',
     'Removed file: pics/b.png',
-    'Left out: Drafts/Later.md, because it is left out of sync on this device, or is in a hidden folder.',
+    'Left out: Drafts/Later.md, because it is left out of sync or of the website in settings, or is in a hidden folder.',
     'Not linked: “Private” in Blog/Three.md leads to a note that is not published, so its text is shown without a link.',
     'Not found: “Nowhere” in Blog/Three.md leads to no file in the vault.',
   ]);
@@ -823,7 +823,7 @@ test('summary: what was left out says why, for every reason; a note in a dot fol
   const p = await preparePublish(vault, store, opts());
   const lines = summaryLines(p);
   assert.deepEqual(lines.filter((l) => l.startsWith('Left out')), [
-    'Left out: .attachments/y.png, because it is left out of sync on this device, or is in a hidden folder.',
+    'Left out: .attachments/y.png, because it is left out of sync or of the website in settings, or is in a hidden folder.',
     'Left out: One/pic.png, because more than one file in the vault has this name; link it with its folder, as in [[Folder/name.png]].',
     'Left out: a.md, because another file of the website has this name, in the same or other letter case.',
     'Left out: bad\\name.png, because its name can not be used on a website.',
@@ -906,4 +906,40 @@ test('a front page that is not a published note is said, and the front page is t
 test('what Obsidian read of the property is judged as the note\'s text is', () => {
   for (const yes of [true, 'true', 'True', ' TRUE ', [true], ['true']]) assert.ok(saysTrue(yes), JSON.stringify(yes));
   for (const no of [false, 'yes', 1, null, undefined, [], [true, true], ['no'], {}]) assert.ok(!saysTrue(no), JSON.stringify(no));
+});
+
+test('the whole vault: every note is a page unless it says otherwise, and the same things stay off', async () => {
+  for (const yes of ['plain text\n', '---\ntitle: x\n---\nbody\n', '---\npublish: true\n---\n', '\uFEFF---\ntags: [a]\n---\n', '---\nnever closed\n']) assert.ok(publishedInWhole(yes), JSON.stringify(yes));
+  for (const no of ['---\npublish: false\n---\n', '---\nPublish: no\n---\n', '---\npublish:\n---\n', '---\npublish: [true, false]\n---\n', '---\nno colon here\npublish: true\n---\n']) assert.ok(!publishedInWhole(no), JSON.stringify(no));
+
+  const notes: Record<string, string> = {
+    'Plain.md': 'A plain note with [[Off]] and ![[pic.png]].\n',
+    'Props.md': '---\ntitle: With properties\nsecret: SENTINEL-PROP\n---\nbody %%SENTINEL-COMMENT%%\n',
+    'Off.md': '---\npublish: false\n---\nSENTINEL-OFF\n',
+    'Private/Diary.md': 'SENTINEL-DIARY\n',
+    'Private/Asked.md': '---\npublish: true\n---\nSENTINEL-ASKED\n',
+    '.trash/Old.md': 'SENTINEL-TRASH\n',
+    'Plain (conflict laptop 20260102-150405).md': 'SENTINEL-CONFLICT\n',
+    'Broken.md': '---\nno colon here\n---\nSENTINEL-BROKEN\n',
+    'pic.png': 'png',
+    'unused.png': 'SENTINEL-UNUSED',
+  };
+  const vault = { list: async () => Object.keys(notes), read: async (p: string) => new TextEncoder().encode(notes[p]) };
+  const o = { title: '', home: '', excluded: (k: string) => k.startsWith('Private/') };
+  const site = await buildSite(vault, { ...o, whole: true });
+  assert.deepEqual(site.report.pages.map((p) => p.path), ['Plain.md', 'Props.md']);
+  assert.deepEqual(site.report.attachments.map((a) => a.path), ['pic.png'], 'only the files a page shows, as ever');
+  assert.ok(site.report.whole);
+  // Only the note that asked to be published is worth a word; the rest of the folder kept off is not.
+  assert.deepEqual(site.report.leftOut, [{ path: 'Private/Asked.md', why: 'excluded' }]);
+  assert.deepEqual(site.report.unpublished, [{ from: 'Plain.md', link: 'Off' }]);
+  const all = [...site.files.values()].map((f) => new TextDecoder().decode(f.data)).join('\n');
+  assert.ok(!all.includes('SENTINEL'), 'nothing kept off, hidden, commented or said to be off reaches a file');
+  // Without it, the same vault publishes nothing: no note says publish: true outside the folder kept off.
+  const marked = await buildSite(vault, o);
+  assert.deepEqual(marked.report.pages, []);
+  assert.ok(!marked.report.whole);
+  const planned = { plan: { added: [], changed: [], removed: [], same: 0, bytes: 0, first: false }, hashes: new Map<string, string>(), before: null };
+  assert.match(summaryLines({ site, planned })[0], /made of the whole vault except notes that say publish: false/);
+  assert.doesNotMatch(summaryLines({ site: marked, planned })[0], /whole vault/);
 });

@@ -3,6 +3,7 @@ import { DEFAULT_CONFIG, compileExcludes, resolveConfig, type SyncConfig } from 
 import { MIN_PASSPHRASE, WrongPassphraseError, openWithPassphrase, sealWithPassphrase } from '../core/crypto.ts';
 import { FOLLOW_PREFIX, INVITE_PREFIX, ownerKeysFrom, type MemberKeys, type Role } from '../core/members.ts';
 import { vaultKey } from '../core/paths.ts';
+import { saysTrue } from '../publish/site.ts';
 import { DAY } from '../core/retention.ts';
 import { isInside } from '../core/scopedfs.ts';
 import type { RemoteSpec } from '../stores/open.ts';
@@ -98,6 +99,10 @@ export interface SiteSettings {
   title: string;
   /** Vault path of the note that is the front page; '' for a list of pages only. */
   home: string;
+  /** The whole vault is the website: every note is on it unless its properties say `publish: false`. */
+  whole: boolean;
+  /** Folders and files kept off the website, one pattern a line, written as the vault's own exclusions are. */
+  except: string;
   /** The address people open the website at, for the link shown after publishing; '' when not given. */
   url: string;
   /** When a publish last finished here; 0 before the first. */
@@ -154,6 +159,8 @@ const SITE_DEFAULTS: SiteSettings = {
   secretKeySecret: '',
   title: '',
   home: '',
+  whole: false,
+  except: '',
   url: '',
   lastPublished: 0,
 };
@@ -319,6 +326,19 @@ function overlappingLocation(a: Storage | SiteSettings, b: Storage | SiteSetting
  */
 export function siteAtVaultStorage(site: SiteSettings, s: Settings): boolean {
   return overlappingLocation(site, s) || s.shares.some((x) => !x.followUrl && overlappingLocation(site, x));
+}
+
+/** Whether the website's own exclusions (`SiteSettings.except`) keep a vault path off it. */
+export const siteExcept = (site: SiteSettings): ((key: string) => boolean) => compileExcludes(site.except.split('\n'));
+
+/**
+ * Whether a note is on the website by what Obsidian has read of its properties: it says `publish: true`, or the whole
+ * vault is published and it has no `publish` property saying otherwise.
+ */
+export function onWebsite(site: SiteSettings, properties: Record<string, unknown>): boolean {
+  const keys = Object.keys(properties).filter((k) => k.toLowerCase() === 'publish');
+  if (!keys.length) return site.whole;
+  return keys.length === 1 && saysTrue(properties[keys[0]]);
 }
 
 /** The website's public address with one slash at the end, or '' when none is given or it is not an http or https address. */

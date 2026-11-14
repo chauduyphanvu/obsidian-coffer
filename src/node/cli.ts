@@ -34,7 +34,7 @@ interface CliConfig {
   share?: string;
   sync?: Partial<SyncConfig>;
   /** Where `publish` puts the website: the notes marked to be published, as pages anyone with the address can read. `home` is the note that is the front page. */
-  site?: { remote: SiteRemote; title?: string; home?: string };
+  site?: { remote: SiteRemote; title?: string; home?: string; whole?: boolean; exclude?: string[] };
 }
 
 const USAGE = `Usage: node coffer.js <command> [--config=coffer.json]
@@ -86,7 +86,9 @@ const USAGE = `Usage: node coffer.js <command> [--config=coffer.json]
   publish [--dry-run]    publish the notes whose properties say publish: true as a website, with the pictures, sound,
                          video and PDF files they show, to the location "site" gives in coffer.json: a "remote" of
                          type s3, webdav or folder (plain files, to host anywhere), set as the vault's remote is, with
-                         "title" and "home" (the note that is the front page) if you want them. The pages are NOT
+                         "title" and "home" (the note that is the front page) if you want them. With "whole": true
+                         every note of the vault is published except those that say publish: false, and "exclude"
+                         lists folders and files to keep off it, written as sync.exclude is. The pages are NOT
                          encrypted: anyone with the address can read them. Only the vault folder is read, so no
                          passphrase is needed, a device that only receives may publish, and sync's own files are left
                          alone. Prints what is new, changed, removed and left out, then uploads what changed and
@@ -230,11 +232,13 @@ function configProblem(c: unknown): string | undefined {
   const problem = remoteProblem(remote, 'remote', 'saying where the vault is stored', true);
   if (problem || site === undefined) return problem;
   if (typeof site !== 'object' || site === null || Array.isArray(site)) return 'needs "site" to be a JSON object';
-  const { remote: where, title, home } = site as Record<string, unknown>;
+  const { remote: where, title, home, whole, exclude } = site as Record<string, unknown>;
   return (
     remoteProblem(where, 'site.remote', 'saying where the website goes', false) ??
     (title !== undefined && typeof title !== 'string' ? 'needs "site.title" to be a text' : undefined) ??
-    (home !== undefined && typeof home !== 'string' ? 'needs "site.home" to be a text' : undefined)
+    (home !== undefined && typeof home !== 'string' ? 'needs "site.home" to be a text' : undefined) ??
+    (whole !== undefined && typeof whole !== 'boolean' ? 'needs "site.whole" to be true or false' : undefined) ??
+    (exclude !== undefined && !(Array.isArray(exclude) && exclude.every((x) => typeof x === 'string')) ? 'needs "site.exclude" to be a list of texts' : undefined)
   );
 }
 
@@ -417,7 +421,8 @@ async function publish(cli: CliConfig, vault: string, configFile: string, dry: b
   const prepared = await preparePublish({ list: async () => (await fs.list()).map((f) => f.path), read: (path) => fs.read(path) }, store, {
     title: site.title ?? '',
     home: site.home ?? '',
-    excluded: compileExcludes([...(cli.sync?.exclude ?? DEFAULT_CONFIG.exclude), `${STATE_DIR}/**`, `${configDir}/**`]),
+    whole: site.whole ?? false,
+    excluded: compileExcludes([...(cli.sync?.exclude ?? DEFAULT_CONFIG.exclude), ...(site.exclude ?? []), `${STATE_DIR}/**`, `${configDir}/**`]),
   });
   for (const line of summaryLines(prepared)) console.log(line);
   if (dry) {

@@ -124,6 +124,7 @@ export class PublishModal extends Modal {
     const changes = changesOf(prepared);
     for (const line of lines.slice(0, 2)) c.createEl('p', { text: line });
     if (prepared.planned.plan.first) message(c, 'These pages will be readable by anyone who has the address.', 'coffer-note');
+    if (prepared.site.report.whole && changes.newPages.length) message(c, 'The whole vault is published: every note is a page unless its properties say publish: false, or it is kept off the website in settings.', 'coffer-note');
 
     // A new page's address, which the title does not always say; in the order of the titles.
     const addresses = new Map<string, string[]>();

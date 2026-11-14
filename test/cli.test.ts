@@ -2301,3 +2301,27 @@ test('cli publish: refuses the place the vault is stored, also before the first 
     t.done();
   }
 });
+
+test('cli publish: with "whole" every note is published except those that say publish: false and what "exclude" keeps off', () => {
+  const t = siteSetup({}, { whole: true, exclude: ['Private/'] });
+  try {
+    writeFileSync(join(t.vault, 'One.md'), 'one, no properties\n');
+    writeFileSync(join(t.vault, 'Two.md'), '---\ntitle: Second\n---\ntwo\n');
+    writeFileSync(join(t.vault, 'Off.md'), '---\npublish: false\n---\nOFF-TEXT\n');
+    mkdirSync(join(t.vault, 'Private'));
+    writeFileSync(join(t.vault, 'Private', 'Diary.md'), 'DIARY-TEXT\n');
+    const r = t.publish();
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /made of the whole vault except notes that say publish: false/);
+    assert.ok(existsSync(join(t.folder, 'One.html')) && existsSync(join(t.folder, 'Two.html')));
+    assert.ok(!existsSync(join(t.folder, 'Off.html')) && !existsSync(join(t.folder, 'Private')));
+    const all = readdirSync(t.folder, { recursive: true, encoding: 'utf8' }).filter((f) => statSync(join(t.folder, f)).isFile()).map((f) => readFileSync(join(t.folder, f), 'utf8')).join('\n');
+    assert.ok(!all.includes('OFF-TEXT') && !all.includes('DIARY-TEXT'));
+    t.withSite({ remote: { type: 'folder', path: t.folder }, whole: 'yes' });
+    assert.match(t.publish().stderr, /needs "site.whole" to be true or false/);
+    t.withSite({ remote: { type: 'folder', path: t.folder }, exclude: 'Private/' });
+    assert.match(t.publish().stderr, /needs "site.exclude" to be a list of texts/);
+  } finally {
+    t.done();
+  }
+});
