@@ -4,10 +4,10 @@ import { WrongPassphraseError } from '../src/core/crypto.ts';
 import { HistoryError, SafetyError, type SyncResult } from '../src/core/engine.ts';
 import { MissingFolderError } from '../src/core/scopedfs.ts';
 import { plural } from '../src/core/text.ts';
-import { connectError, describeFailure, inShare, isConflictProblem, keptNote, keysMissingProblem, leftInStorage, missingProblem, quietText, resultProblems, staleProblem, statusText, summarize, targetProblems, type Problem } from '../src/plugin/status.ts';
+import { connectError, describeFailure, inShare, isConflictProblem, keptNote, keysMissingProblem, leftInStorage, missingProblem, quietText, resultProblems, RunProgress, staleProblem, statusText, summarize, targetProblems, type Problem } from '../src/plugin/status.ts';
 
 const result = (over: Partial<SyncResult> = {}): SyncResult => ({
-  pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0, conflictCopies: [], skipped: 0, tooLarge: [], deferred: [], unsent: [], errors: [], commits: 0, rounds: 1, ...over,
+  pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0, conflictCopies: [], skipped: 0, tooLarge: [], deferred: [], unsent: [], arrived: [], errors: [], commits: 0, rounds: 1, ...over,
 });
 
 test('summaries count in words that read right for one', () => {
@@ -103,6 +103,20 @@ test('a failed storage check says what to check in the words of that kind of sto
   assert.match(connectError('S3 GET failed with HTTP 403 AccessDenied', 's3'), /keys/);
   assert.match(connectError('net::ERR_CONNECTION_REFUSED', 'webdav'), /^Can't reach the storage/);
   assert.match(connectError('something odd', 's3'), /^Connecting failed\.\nsomething odd$/);
+  // Keys checked for reading only are not asked to write.
+  assert.match(connectError(refused, 'webdav', false), /may read this folder\./);
+  assert.match(connectError('S3 GET failed with HTTP 403 AccessDenied', 's3', false), /may read this bucket\./);
+});
+
+test('refused keys of a member: they came from the owner, so the owner is who to ask; the owner and other places check their own', () => {
+  const refused = new Error('WebDAV refused the login or the folder (HTTP 401)');
+  const member = describeFailure(refused, { owner: false, ownerName: 'Ann' });
+  assert.equal(member.id, 'access');
+  assert.match(member.detail, /Ask Ann for a new invite/);
+  assert.doesNotMatch(member.detail, /turn on Only receive changes/);
+  assert.match(describeFailure(refused, { owner: false, ownerName: '' }).detail, /Ask the owner for a new invite/);
+  assert.match(describeFailure(refused, { owner: true, ownerName: 'Ann' }).detail, /turn on Only receive changes/);
+  assert.match(describeFailure(refused).detail, /turn on Only receive changes/);
 });
 
 test('a day without a successful sync is a problem; never having synced is not this one', () => {
@@ -118,7 +132,7 @@ test('a missing shared folder is a critical problem that offers to download it a
   assert.match(p.detail, /“Projects\/Team”/);
   assert.match(p.detail, /Nothing was deleted for the others/);
   assert.deepEqual(missingProblem('Projects/Team'), p);
-  assert.equal(keysMissingProblem().severity, 'critical');
+  assert.equal(keysMissingProblem({ role: '', memberKeysSecret: '' }).severity, 'critical');
 });
 
 test("a shared folder's problems say which folder, stay apart from the vault's, and keep what they act on", () => {
@@ -187,4 +201,69 @@ test('keeping all files says how many come back and how many stay in storage ove
   assert.equal(keptNote(42, 3), '39 files will be copied back. 3 files over the download limit stay in storage until you choose them.');
   assert.equal(keptNote(2, 1), '1 file will be copied back. 1 file over the download limit stays in storage until you choose it.');
   assert.equal(keptNote(3, 3), '3 files over the download limit stay in storage until you choose them.');
+});
+
+test('a run shows the vault, then how many shared folders are left, then the last one, without jumping between the ones that sync side by side', () => {
+  const vault = { id: '' };
+  const [a, b, c] = ['Family', 'Work', 'Club'].map((folder, i) => ({ id: `s${i}`, folder }));
+  const run = new RunProgress();
+  run.plan([vault, a, b, c]);
+  assert.equal(run.line(), 'Syncing…');
+  run.start(vault);
+  run.say(vault, 'Receiving 40 of 249');
+  assert.equal(run.line(), 'Receiving 40 of 249');
+  assert.equal(run.stateOf(''), 'syncing');
+  assert.equal(run.stateOf('s0'), 'waiting');
+  run.say(a, 'Sending 1 of 4');
+  assert.equal(run.line(), 'Receiving 40 of 249', 'a place that is not the vault says nothing on the line while the vault syncs');
+  run.end(vault);
+  assert.equal(run.line(), 'Syncing 3 shared folders…');
+  run.start(a);
+  run.start(b);
+  run.say(b, 'Receiving 3 of 9');
+  run.say(a, 'Sending 2 of 4');
+  assert.equal(run.line(), 'Syncing 3 shared folders…', 'what each says does not change the line');
+  assert.deepEqual([a, b, c].map((p) => run.stateOf(p.id)), ['syncing', 'syncing', 'waiting']);
+  run.end(a);
+  assert.equal(run.line(), 'Syncing 2 shared folders…');
+  assert.equal(run.stateOf('s0'), undefined, 'a place that has ended is not busy');
+  run.end(c);
+  assert.equal(run.line(), '“Work”: Receiving 3 of 9', 'the last one left is followed by name');
+  run.say(b, 'Receiving 4 of 9');
+  assert.equal(run.line(), '“Work”: Receiving 4 of 9');
+  run.end(b);
+  assert.equal(run.line(), 'Syncing…');
+});
+
+test('a lone shared folder that has not said anything yet reads as syncing; one vault says only what it is doing', () => {
+  const run = new RunProgress();
+  const a = { id: 'x', folder: 'Family' };
+  run.plan([a]);
+  assert.equal(run.line(), 'Syncing…');
+  run.say(a, 'Sending 5 of 60');
+  assert.equal(run.line(), '“Family”: Sending 5 of 60');
+  const renamed = { id: 'y', folder: 'Old' };
+  run.plan([renamed]);
+  run.say(renamed, 'Receiving 1 of 2');
+  renamed.folder = 'New';
+  assert.equal(run.line(), '“New”: Receiving 1 of 2', 'a folder renamed during the run is named as it is now');
+});
+
+test('an engine that keeps working after its place ended says nothing that shows, and a place nobody planned still shows', () => {
+  const run = new RunProgress();
+  const a = { id: 'a', folder: 'A' };
+  const b = { id: 'b', folder: 'B' };
+  run.plan([a, b]);
+  run.start(a);
+  run.end(a);
+  run.say(a, 'Sending 9 of 10');
+  assert.equal(run.stateOf('a'), undefined);
+  assert.equal(run.line(), 'Syncing…', 'one place left, and it has said nothing');
+  run.clear();
+  assert.equal(run.stateOf('b'), undefined);
+  run.say(b, 'Receiving 1 of 3');
+  assert.equal(run.stateOf('b'), 'syncing', 'a download of one folder outside a full run');
+  assert.equal(run.line(), '“B”: Receiving 1 of 3');
+  run.clear();
+  assert.equal(run.line(), 'Syncing…');
 });

@@ -1,6 +1,6 @@
 // Settling a file changed on two devices: change by change when it is text, otherwise by keeping whole files.
 import { Modal, Notice, TFile, type App } from 'obsidian';
-import { applyChoices, hunks, type Choice, type Hunk } from '../core/merge.ts';
+import { applyChoices, hunks, type Choice, type DiffRegion, type Hunk } from '../core/merge.ts';
 import { conflictOriginal, fileName } from '../core/paths.ts';
 import { errorText, plural } from '../core/text.ts';
 import type CofferPlugin from './main.ts';
@@ -18,6 +18,14 @@ const WHY: Record<WholeReason, (name: string) => string> = {
   binary: () => "This kind of file can't be compared line by line. Open each version to look, then choose which to keep.",
   structured: () => 'Mixing lines from two versions could break this kind of file. Open each version to look, then choose which to keep.',
   different: () => 'The two versions are too different to compare line by line. Open each to look, then choose which to keep.',
+};
+
+const DEVICES: PickerLabels = {
+  mine: 'This device',
+  theirs: 'Other device',
+  allMine: 'Use all from this device',
+  allTheirs: 'Use all from other device',
+  both: "Both keeps this device's lines first, then the other device's.",
 };
 
 /** Opens the resolver for one conflict copy. */
@@ -39,6 +47,119 @@ function showLines(parent: HTMLElement, lines: string[], cls: string): void {
   for (const l of lines) box.createDiv({ cls: 'coffer-line', text: l.replace(/\r?\n$/, '') });
 }
 
+/** What a change picker calls the two texts: the first (`a`, kept by "mine") and the second (`b`, "theirs"). */
+export interface PickerLabels {
+  mine: string;
+  theirs: string;
+  /** The buttons that choose one side at every change. */
+  allMine: string;
+  allTheirs: string;
+  /** Under the choices, when both can be kept: in which order "Both" keeps them. */
+  both: string;
+}
+
+/**
+ * Two texts compared change by change, one change at a time, choosing what to keep at each: the conflict resolver's,
+ * and the owner's when a suggestion and the note both changed the same lines. `text` is the result once every change
+ * has a choice.
+ */
+export class ChangePicker {
+  private regions: DiffRegion[];
+  private labels: PickerLabels;
+  private hunks: Hunk[];
+  private choices: (Choice | undefined)[];
+  private at = 0;
+
+  constructor(regions: DiffRegion[], labels: PickerLabels) {
+    this.regions = regions;
+    this.labels = labels;
+    this.hunks = hunks(regions, CONTEXT);
+    this.choices = this.hunks.map(() => undefined);
+  }
+
+  get total(): number {
+    return this.hunks.length;
+  }
+
+  /** How many changes still have no choice. */
+  get left(): number {
+    return this.choices.filter((x) => !x).length;
+  }
+
+  /** The text the choices make; undefined while a change has none. */
+  text(): string | undefined {
+    const choices = this.choices.filter((x): x is Choice => !!x);
+    return choices.length === this.hunks.length ? applyChoices(this.regions, choices) : undefined;
+  }
+
+  /** Draws the change on show and the choices for it into `c`; `redraw` draws the whole screen again after a choice. */
+  render(c: HTMLElement, redraw: () => void, busy: boolean): void {
+    const total = this.hunks.length;
+    const h = this.hunks[this.at];
+    const picked = this.choices[this.at];
+    if (total > 1) {
+      const nav = c.createDiv({ cls: 'coffer-resolve-nav' });
+      nav.createDiv({ cls: 'coffer-resolve-count', text: `Change ${this.at + 1} of ${total}` });
+      button(nav, '', () => this.go(this.at - 1, redraw, c)).setIcon('chevron-left').setTooltip('Previous change').setDisabled(this.at === 0);
+      button(nav, '', () => this.go(this.at + 1, redraw, c)).setIcon('chevron-right').setTooltip('Next change').setDisabled(this.at === total - 1);
+    }
+
+    const card = c.createDiv({ cls: 'coffer-hunk' });
+    showLines(card, h.before, 'coffer-context');
+    this.side(card, this.labels.mine, h.change.a, 'mine', picked);
+    this.side(card, this.labels.theirs, h.change.b, 'theirs', picked);
+    showLines(card, h.after, 'coffer-context');
+
+    c.createDiv({ cls: 'coffer-pick-label', text: 'Keep' });
+    const pick = c.createDiv({ cls: 'coffer-pick' });
+    const options: [Choice, string][] = [['mine', this.labels.mine], ['theirs', this.labels.theirs]];
+    if (h.change.a.length && h.change.b.length) options.push(['both', 'Both']);
+    for (const [value, text] of options) {
+      const b = button(pick, text, () => this.choose(value, redraw, c)).setDisabled(busy);
+      b.buttonEl.toggleClass('is-selected', picked === value);
+      b.buttonEl.setAttr('aria-pressed', String(picked === value));
+    }
+    if (options.length === 3) c.createDiv({ cls: 'coffer-hint', text: this.labels.both });
+    if (total > 1) {
+      const all = buttonRow(c);
+      button(all, this.labels.allMine, () => this.chooseAll('mine', redraw)).setDisabled(busy);
+      button(all, this.labels.allTheirs, () => this.chooseAll('theirs', redraw)).setDisabled(busy);
+    }
+  }
+
+  private side(parent: HTMLElement, label: string, lines: string[], which: 'mine' | 'theirs', picked: Choice | undefined): void {
+    const box = parent.createDiv({ cls: `coffer-side is-${which}` });
+    const kept = picked === which || picked === 'both';
+    if (picked) box.addClass(kept ? 'is-kept' : 'is-dropped');
+    const head = box.createDiv({ cls: 'coffer-side-label' });
+    head.createSpan({ text: label });
+    if (picked) head.createSpan({ cls: 'coffer-side-state', text: kept ? 'Keeping' : 'Not keeping' });
+    if (lines.length) showLines(box, lines, 'coffer-changed');
+    else box.createDiv({ cls: 'coffer-none', text: 'Not in this version' });
+  }
+
+  private go(at: number, redraw: () => void, c: HTMLElement): void {
+    this.at = Math.max(0, Math.min(this.hunks.length - 1, at));
+    redraw();
+    c.querySelector('.coffer-resolve-nav')?.scrollIntoView({ block: 'nearest' });
+  }
+
+  /** A first choice at a change moves on to the next one still open. */
+  private choose(value: Choice, redraw: () => void, c: HTMLElement): void {
+    const first = !this.choices[this.at];
+    this.choices[this.at] = value;
+    const n = this.choices.length;
+    const next = first ? [...Array(n).keys()].map((k) => (this.at + k) % n).find((i) => !this.choices[i]) : undefined;
+    if (next === undefined) redraw();
+    else this.go(next, redraw, c);
+  }
+
+  private chooseAll(value: Choice, redraw: () => void): void {
+    this.choices = this.hunks.map(() => value);
+    redraw();
+  }
+}
+
 class ConflictModal extends Modal {
   private plugin: CofferPlugin;
   /** This device's version, kept aside by the sync. */
@@ -49,9 +170,7 @@ class ConflictModal extends Modal {
   /** Both files as they were compared; nothing is written unless they are still so. */
   private shown?: { mine: Snapshot; theirs?: Snapshot };
   private comparison?: Comparison;
-  private hunks: Hunk[] = [];
-  private choices: (Choice | undefined)[] = [];
-  private at = 0;
+  private picker?: ChangePicker;
   private error = '';
   private stale = '';
   private busy = false;
@@ -90,9 +209,7 @@ class ConflictModal extends Modal {
       const theirs = await this.snapshot(this.original);
       this.shown = { mine, theirs };
       this.comparison = compareConflict(this.original, mine, theirs);
-      this.hunks = this.comparison.kind === 'lines' ? hunks(this.comparison.regions, CONTEXT) : [];
-      this.choices = this.hunks.map(() => undefined);
-      this.at = 0;
+      this.picker = this.comparison.kind === 'lines' ? new ChangePicker(this.comparison.regions, DEVICES) : undefined;
     } catch (e) {
       this.comparison = undefined;
       this.error = `Could not read the two versions: ${errorText(e)}`;
@@ -125,82 +242,20 @@ class ConflictModal extends Modal {
   }
 
   private renderChanges(c: HTMLElement): void {
-    const total = this.hunks.length;
-    const h = this.hunks[this.at];
-    const picked = this.choices[this.at];
+    const picker = this.picker!;
+    const total = picker.total;
     c.createEl('p', {
       cls: 'coffer-intro',
       text: total === 1 ? 'The two versions differ in one place. Choose what to keep.' : `The two versions differ in ${total} places. Choose what to keep at each.`,
     });
-    if (total > 1) {
-      const nav = c.createDiv({ cls: 'coffer-resolve-nav' });
-      nav.createDiv({ cls: 'coffer-resolve-count', text: `Change ${this.at + 1} of ${total}` });
-      button(nav, '', () => this.go(this.at - 1)).setIcon('chevron-left').setTooltip('Previous change').setDisabled(this.at === 0);
-      button(nav, '', () => this.go(this.at + 1)).setIcon('chevron-right').setTooltip('Next change').setDisabled(this.at === total - 1);
-    }
-
-    const card = c.createDiv({ cls: 'coffer-hunk' });
-    showLines(card, h.before, 'coffer-context');
-    this.side(card, 'This device', h.change.a, 'mine', picked);
-    this.side(card, 'Other device', h.change.b, 'theirs', picked);
-    showLines(card, h.after, 'coffer-context');
-
-    c.createDiv({ cls: 'coffer-pick-label', text: 'Keep' });
-    const pick = c.createDiv({ cls: 'coffer-pick' });
-    const options: [Choice, string][] = [['mine', 'This device'], ['theirs', 'Other device']];
-    if (h.change.a.length && h.change.b.length) options.push(['both', 'Both']);
-    for (const [value, text] of options) {
-      const b = button(pick, text, () => this.choose(value)).setDisabled(this.busy);
-      b.buttonEl.toggleClass('is-selected', picked === value);
-      b.buttonEl.setAttr('aria-pressed', String(picked === value));
-    }
-    if (options.length === 3) c.createDiv({ cls: 'coffer-hint', text: "Both keeps this device's lines first, then the other device's." });
-    if (total > 1) {
-      const all = buttonRow(c);
-      button(all, 'Use all from this device', () => this.chooseAll('mine')).setDisabled(this.busy);
-      button(all, 'Use all from other device', () => this.chooseAll('theirs')).setDisabled(this.busy);
-    }
-
-    const left = this.choices.filter((x) => !x).length;
+    picker.render(c, () => this.render(), this.busy);
+    const left = picker.left;
     this.footer(c, left ? `Still to choose: ${plural(left, 'change')}.` : '', () => this.saveLines(), left > 0);
   }
 
-  private side(parent: HTMLElement, label: string, lines: string[], which: 'mine' | 'theirs', picked: Choice | undefined): void {
-    const box = parent.createDiv({ cls: `coffer-side is-${which}` });
-    const kept = picked === which || picked === 'both';
-    if (picked) box.addClass(kept ? 'is-kept' : 'is-dropped');
-    const head = box.createDiv({ cls: 'coffer-side-label' });
-    head.createSpan({ text: label });
-    if (picked) head.createSpan({ cls: 'coffer-side-state', text: kept ? 'Keeping' : 'Not keeping' });
-    if (lines.length) showLines(box, lines, 'coffer-changed');
-    else box.createDiv({ cls: 'coffer-none', text: 'Not in this version' });
-  }
-
-  private go(at: number): void {
-    this.at = Math.max(0, Math.min(this.hunks.length - 1, at));
-    this.render();
-    this.contentEl.querySelector('.coffer-resolve-nav')?.scrollIntoView({ block: 'nearest' });
-  }
-
-  /** A first choice at a change moves on to the next one still open. */
-  private choose(value: Choice): void {
-    const first = !this.choices[this.at];
-    this.choices[this.at] = value;
-    const n = this.choices.length;
-    const next = first ? [...Array(n).keys()].map((k) => (this.at + k) % n).find((i) => !this.choices[i]) : undefined;
-    if (next === undefined) this.render();
-    else this.go(next);
-  }
-
-  private chooseAll(value: Choice): void {
-    this.choices = this.hunks.map(() => value);
-    this.render();
-  }
-
   private async saveLines(): Promise<void> {
-    const choices = this.choices.filter((x): x is Choice => !!x);
-    if (this.comparison?.kind !== 'lines' || choices.length !== this.hunks.length) return;
-    const text = applyChoices(this.comparison.regions, choices);
+    const text = this.picker?.text();
+    if (text === undefined) return;
     await this.settle(async (copy, original) => {
       await this.app.vault.modify(original!, text);
       await this.app.fileManager.trashFile(copy);

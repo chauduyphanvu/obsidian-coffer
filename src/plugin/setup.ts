@@ -84,14 +84,19 @@ export function readOnlyBox(c: HTMLElement, value: boolean, onChange: (v: boolea
   c.createDiv({ cls: 'coffer-hint', text: 'This device never writes to storage, so keys that may only read are enough. What you change here stays here.' });
 }
 
+/** A store that reaches `storage` with keys `k`, as typed into a form and not kept yet. */
+export function trialStore(storage: Storage, k: Keys) {
+  const values: Record<string, string> = { a: k.access.trim(), s: k.secret.trim(), p: k.password };
+  return openRemote(remoteSpec({ ...storage, accessKeySecret: 'a', secretKeySecret: 's', webdavPasswordSecret: 'p' }, (n) => values[n] ?? ''), obsidianHttp);
+}
+
 /**
  * Checks that `storage` works with keys `k`; true when it already holds synced data. Fails in words the user can act on.
  * With `readOnly` it only reads, and storage that holds nothing yet is refused.
  */
 export async function tryStorage(base: Storage, storage: Partial<Storage>, k: Keys, readOnly = false): Promise<boolean> {
-  const values: Record<string, string> = { a: k.access.trim(), s: k.secret.trim(), p: k.password };
-  const trial: Storage = { ...base, ...storage, accessKeySecret: 'a', secretKeySecret: 's', webdavPasswordSecret: 'p' };
-  const store = openRemote(remoteSpec(trial, (n) => values[n] ?? ''), obsidianHttp);
+  const trial: Storage = { ...base, ...storage };
+  const store = trialStore(trial, k);
   let exists: boolean;
   try {
     const report = await checkStore(store, readOnly);

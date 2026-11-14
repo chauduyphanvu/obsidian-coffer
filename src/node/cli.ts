@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path';
 import { DEFAULT_CONFIG, resolveConfig, type SyncConfig } from '../core/config.ts';
 import { MIN_PASSPHRASE } from '../core/crypto.ts';
 import { heartbeatDue, writeHeartbeat } from '../core/devices.ts';
-import { HistoryError, SafetyError, SyncEngine, type SyncResult } from '../core/engine.ts';
+import { HistoryError, RemovedError, SafetyError, SyncEngine, UnverifiedError, type SyncOptions, type SyncResult } from '../core/engine.ts';
 import { vaultKey } from '../core/paths.ts';
 import { Repo } from '../core/repo.ts';
 import { errorText, plural } from '../core/text.ts';
@@ -15,6 +15,7 @@ import { applyRestore, countSteps, deleteLimitCrossed, keepDeferred, keepOut, le
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
 import type { S3Config } from '../stores/s3.ts';
+import { KEYS_FILE, POSITION_FILE, STATE_FILE, credentialsFrom, joinWithLink, loadKeyFile, saveKeyFile, storageProblem, type Credentials, type KeyFile, type MemberRemote } from './member.ts';
 import { FileState, FolderStore, NodeFS } from './nodefs.ts';
 import { SyncLoop, watchVault } from './watch.ts';
 
@@ -26,13 +27,26 @@ interface CliConfig {
   remote:
     | ({ type: 's3' } & Omit<S3Config, 'accessKey' | 'secretKey'>)
     | { type: 'webdav'; url: string; username: string }
-    | { type: 'folder'; path: string };
+    | { type: 'folder'; path: string }
+    | { type: 'follow'; url: string };
+  /** Set by `join`: the name of a shared folder with members, whose keys are in the state folder's keys file. */
+  share?: string;
   sync?: Partial<SyncConfig>;
 }
 
 const USAGE = `Usage: node coffer.js <command> [--config=coffer.json]
        node coffer.js --help | --version
 
+  join - [--vault=<folder>]
+                         join a shared folder with members from its invite link (coffershare3.…), or follow a
+                         public copy of one from a follow link (cofferfollow1.…), read from standard input, or
+                         from COFFER_LINK when there is no -. The link alone opens the folder: given as an
+                         argument instead (join <link>), other users of this computer can see it, and it stays
+                         in shell history. Writes the config file given by --config, which must not exist yet, and keeps the keys
+                         in <folder>/.coffer/keys.json, readable by you alone. The folder is --vault, or the name
+                         the link suggests, here. The other commands then work on it: a writing member sends
+                         changes once the owner's device has confirmed it, a reading one and a follower only
+                         receive
   sync [--force]         sync the vault once
   fetch <path>...        download files that sync.deferAboveMB leaves in storage: set it under "sync" in
                          coffer.json to a size in MB above which files are not downloaded (0, the default,
@@ -68,13 +82,15 @@ const USAGE = `Usage: node coffer.js <command> [--config=coffer.json]
                          purpose, as then someone else may have changed what is stored
 
 Secrets come from the environment: COFFER_PASSPHRASE, and for S3
-COFFER_ACCESS_KEY and COFFER_SECRET_KEY, for WebDAV COFFER_WEBDAV_PASSWORD.`;
+COFFER_ACCESS_KEY and COFFER_SECRET_KEY, for WebDAV COFFER_WEBDAV_PASSWORD. A shared folder joined with a link keeps
+its keys in .coffer/keys.json instead, and the environment is not read for it.`;
 
 /** The options that take a value, as `--name=value` or `--name value`; every other option takes none. */
-const VALUED = ['config', 'poll', 'interval', 'limit'];
+const VALUED = ['config', 'poll', 'interval', 'limit', 'vault'];
 
 /** Each command's options besides --config (and --help and --version, which stop any command). */
 const OPTIONS: Record<string, string[]> = {
+  join: ['vault'],
   sync: ['force'],
   fetch: [],
   watch: ['poll', 'interval'],
@@ -100,6 +116,17 @@ const WRITES: Record<string, string> = {
   'change-passphrase': 'it cannot change the passphrase in storage',
 };
 
+/** What a device that is a member of a shared folder cannot do, as each command's reason. */
+const NOT_FOR_MEMBERS: Record<string, string> = {
+  'change-passphrase': 'a device joins it with the keys of an invite and has no passphrase to change',
+};
+
+/** What a followed folder cannot do: it is read over a public address, by name. */
+const NOT_FOR_FOLLOWERS: Record<string, string> = {
+  check: 'it is read over its public address, which cannot be listed or written to',
+  verify: 'it is read over its public address, which cannot be listed',
+};
+
 const STATE_DIR = '.coffer';
 const FORCE_HINT = 'to delete them anyway, run sync --force';
 const READ_ONLY_HINT = 'if these keys may only read, set "readOnly": true under "sync" in the config file, so this device only receives';
@@ -110,7 +137,25 @@ const SYSTEMS: Record<string, string> = { darwin: 'macOS', win32: 'Windows', lin
 
 /** Set once the config is read: a refusal to write only suggests `readOnly` to a device that does write. */
 let receivesOnly = false;
-const refusedWriting = (e: unknown) => !receivesOnly && /HTTP 403\b|AccessDenied/.test(errorText(e));
+/** Set for a shared folder with members: its name, and what its last sync said about this device, if anything. */
+let shareName = '';
+let memberNote: string | undefined;
+/** What a device that lost its shared folder does to join it again, and with which link: set with the config, as it names its files. */
+let newLink = 'invite';
+let rejoin = '';
+const refusedWriting = (e: unknown) => !receivesOnly && !shareName && /HTTP 403\b|AccessDenied/.test(errorText(e));
+
+/** What to do about a sync that stopped for a reason of a shared folder with members. */
+function memberHint(e: unknown): string | undefined {
+  if (e instanceof RemovedError) return `“${shareName}” is not synced here any more; to join it again, ask its owner for a new ${newLink}, ${rejoin}`;
+  if (e instanceof UnverifiedError) {
+    return `“${shareName}” stays as it was here: this device applies nothing from that change on, and syncs again once the owner has removed it from storage`;
+  }
+  if (shareName && /HTTP 40[13]\b|AccessDenied/.test(errorText(e))) {
+    return `the storage refused the keys this device holds for “${shareName}”; if the owner gave everyone new storage keys since this device last synced, those no longer work, so ask for a new ${newLink}, ${rejoin}`;
+  }
+  return undefined;
+}
 
 const env = (name: string) => {
   const v = process.env[name];
@@ -118,23 +163,35 @@ const env = (name: string) => {
   return v;
 };
 
-/** `firstRun`: this device has not synced yet, so a missing storage folder is created rather than taken for one not mounted. */
-function makeStore(remote: CliConfig['remote'], firstRun: boolean): RemoteStore {
+/**
+ * `firstRun`: this device has not synced yet, so a missing storage folder is created rather than taken for one not mounted.
+ * `creds`: the keys a shared folder with members was joined with, which are used instead of the environment's.
+ */
+function makeStore(remote: CliConfig['remote'] | MemberRemote, firstRun: boolean, creds?: Credentials): RemoteStore {
+  const key = (field: keyof Credentials, name: string) => (creds ? creds[field] || fail(`the keys kept for this shared folder lack ${field}`) : env(name));
   if (remote.type === 'folder') return new FolderStore(resolve(remote.path), { create: firstRun });
-  if (remote.type === 'webdav') return openRemote({ type: 'webdav', url: remote.url, username: remote.username, password: env('COFFER_WEBDAV_PASSWORD') });
-  return openRemote({ ...remote, pathStyle: remote.pathStyle ?? true, prefix: remote.prefix ?? '', accessKey: env('COFFER_ACCESS_KEY'), secretKey: env('COFFER_SECRET_KEY') });
+  if (remote.type === 'follow') return openRemote({ type: 'follow', url: remote.url });
+  if (remote.type === 'webdav') {
+    return openRemote({ type: 'webdav', url: remote.url, username: creds?.webdavUser ?? remote.username, password: key('webdavPassword', 'COFFER_WEBDAV_PASSWORD') });
+  }
+  return openRemote({ ...remote, pathStyle: remote.pathStyle ?? true, prefix: remote.prefix ?? '', accessKey: key('accessKey', 'COFFER_ACCESS_KEY'), secretKey: key('secretKey', 'COFFER_SECRET_KEY') });
 }
+
+const fail = (message: string): never => {
+  throw new Error(message);
+};
 
 const version = async () =>
   typeof COFFER_VERSION === 'string' ? COFFER_VERSION : (JSON.parse(await readFile(new URL('../../manifest.json', import.meta.url), 'utf8')) as { version: string }).version;
 
-const REMOTE_FIELDS: Record<string, string[]> = { s3: ['endpoint', 'bucket'], webdav: ['url', 'username'], folder: ['path'] };
+const REMOTE_FIELDS: Record<string, string[]> = { s3: ['endpoint', 'bucket'], webdav: ['url', 'username'], folder: ['path'], follow: ['url'] };
 
 /** Why `c`, parsed from the config file, cannot be a config, in words that follow "config file <path>". */
 function configProblem(c: unknown): string | undefined {
   if (typeof c !== 'object' || c === null || Array.isArray(c)) return 'must hold a JSON object';
-  const { vault, remote, sync } = c as Record<string, unknown>;
+  const { vault, remote, sync, share } = c as Record<string, unknown>;
   if (typeof vault !== 'string' || !vault) return 'needs "vault", the path of the folder to sync';
+  if (share !== undefined && typeof share !== 'string') return 'needs "share" to be the name of the shared folder, as join writes it';
   if (sync !== undefined) {
     if (typeof sync !== 'object' || sync === null || Array.isArray(sync)) return 'needs "sync" to be a JSON object';
     // A misspelt key would otherwise be dropped in silence: "readonly" would leave a device sending its changes.
@@ -161,6 +218,7 @@ function configProblem(c: unknown): string | undefined {
 function describeRemote(remote: CliConfig['remote']): string {
   if (remote.type === 'folder') return `folder ${resolve(remote.path)}`;
   if (remote.type === 'webdav') return `WebDAV ${remote.url}`;
+  if (remote.type === 'follow') return `followed folder ${remote.url}`;
   return `S3 bucket ${remote.bucket}${remote.prefix ? `/${remote.prefix}` : ''} at ${remote.endpoint}`;
 }
 
@@ -194,6 +252,7 @@ const leftAlone = (r: SyncResult) => [
   ...r.tooLarge.map((path) => `not synced, over the size limit: ${path}`),
   ...r.unsent.map((path) => `not sent, this device only receives: ${path}`),
   ...r.deferred.map((path) => `not downloaded, over sync.deferAboveMB (run fetch to download): ${path}`),
+  ...(memberNote ? [memberNote] : []),
 ];
 
 /** `notes` is which of the lines about what the sync left alone to print: all, unless the caller says them only once. */
@@ -280,6 +339,12 @@ async function restoreAt(engine: SyncEngine, fs: NodeFS, when: string, folder: s
   return failed || r.errors.length ? 1 : 0;
 }
 
+async function readStdin(): Promise<string> {
+  const parts: Buffer[] = [];
+  for await (const part of process.stdin) parts.push(part as Buffer);
+  return Buffer.concat(parts).toString('utf8');
+}
+
 async function main(): Promise<number> {
   const { flags, words, error } = parseArgs(process.argv.slice(2));
   if (error) {
@@ -315,6 +380,26 @@ async function main(): Promise<number> {
     return 2;
   }
   const configFile = flags.get('config') ?? 'coffer.json';
+  if (command === 'join') {
+    const link = rest.length > 1 ? '' : rest[0] === '-' ? await readStdin() : (rest[0] ?? process.env.COFFER_LINK ?? '');
+    if (!link.trim()) {
+      console.error('join takes the link to join with on standard input: join - [--vault=<folder>], or in COFFER_LINK');
+      return 2;
+    }
+    const j = await joinWithLink(link, { config: configFile, vault: flags.get('vault'), stateDir: STATE_DIR, open: (remote, creds) => makeStore(remote, false, creds) });
+    console.log(`joined “${j.share}” ${j.role === 'follow' ? 'as a follower' : `as a member who ${j.role === 'write' ? 'writes' : 'reads'}`}`);
+    console.log(`  folder  ${j.vault}`);
+    console.log(`  config  ${j.config}`);
+    console.log(`  keys    ${j.keys}, readable by you alone; it holds what opens the shared folder, so keep it private`);
+    if (j.late) console.error(`could not tell the owner's device about this one yet (${j.late}); sync tries again`);
+    console.log(
+      j.role === 'write'
+        ? 'this device only receives until the owner\'s device confirms it, which sync tells you about; then it sends changes'
+        : 'this device only receives',
+    );
+    console.log(`next: sync --config=${j.config}`);
+    return 0;
+  }
   const cli = await readFile(configFile, 'utf8').then(
     (text) => {
       let parsed: unknown;
@@ -331,44 +416,114 @@ async function main(): Promise<number> {
       throw e.code === 'ENOENT' ? new Error(`config file ${resolve(configFile)} not found; pass --config=<file>`) : e;
     },
   );
-  receivesOnly = !!cli.sync?.readOnly;
+  const vault = resolve(cli.vault);
+  const stateFile = join(vault, STATE_DIR, STATE_FILE);
+  const keysFile = join(vault, STATE_DIR, KEYS_FILE);
+  // A shared folder with members: its keys are in a file of their own. A device without a signing key (a reader, a follower) only receives.
+  let member: KeyFile | undefined = cli.share === undefined ? undefined : await loadKeyFile(keysFile);
+  shareName = cli.share ?? '';
+  newLink = cli.remote.type === 'follow' ? 'follow link' : 'invite';
+  rejoin = `delete ${resolve(configFile)} and ${join(vault, STATE_DIR)} (the files in the folder stay) and run join with it`;
+  receivesOnly = !!cli.sync?.readOnly || (!!member && !member.member.key);
+  if (member && NOT_FOR_MEMBERS[command]) {
+    console.error(`${command} does not work on a shared folder with members: ${NOT_FOR_MEMBERS[command]}`);
+    return 1;
+  }
+  if (cli.remote.type === 'follow' && NOT_FOR_FOLLOWERS[command]) {
+    console.error(`${command} does not work on a followed folder: ${NOT_FOR_FOLLOWERS[command]}`);
+    return 1;
+  }
   // restore-at --dry-run only reads, so a device that only receives may look at what a restore would do.
-  if (cli.sync?.readOnly && WRITES[command] && !(command === 'restore-at' && flags.has('dry-run'))) {
+  if (receivesOnly && WRITES[command] && !(command === 'restore-at' && flags.has('dry-run'))) {
     console.error(`this device only receives changes, so ${WRITES[command]}; run ${command} from a device that sends them`);
     return 1;
   }
-  const vault = resolve(cli.vault);
-  const stateFile = join(vault, STATE_DIR, 'state.json');
-  const store = makeStore(cli.remote, !existsSync(stateFile));
+  let store = makeStore(cli.remote, !existsSync(stateFile), member?.storage);
 
   if (command === 'check') {
-    const report = await checkStore(store, !!cli.sync?.readOnly);
+    const report = await checkStore(store, receivesOnly);
     for (const c of report.checks) console.log(`${c.ok ? 'ok  ' : 'FAIL'} ${c.name}${c.detail ? `: ${c.detail}` : ''}`);
     return report.ok ? 0 : 1;
   }
 
-  const passphrase = env('COFFER_PASSPHRASE');
+  const passphrase = member ? '' : env('COFFER_PASSPHRASE');
   // Opening empty storage makes a vault, so a short passphrase is refused there. Only a short one pays the request to look.
-  if (passphrase.length < MIN_PASSPHRASE && !receivesOnly && !(await Repo.exists(store))) {
+  if (passphrase.length < MIN_PASSPHRASE && !member && !receivesOnly && !(await Repo.exists(store))) {
     throw new Error(`a new vault needs a passphrase of at least ${MIN_PASSPHRASE} characters, and COFFER_PASSPHRASE has ${passphrase.length}`);
   }
   const fs = new NodeFS(vault);
-  const engine = new SyncEngine({
-    fs,
-    store,
-    stateStore: new FileState(stateFile),
-    passphrase,
-    config: resolveConfig({
-      deviceName: hostname().split('.')[0],
-      ...cli.sync,
-      // A custom list replaces the defaults, but this device's own state must never sync.
-      exclude: [...(cli.sync?.exclude ?? DEFAULT_CONFIG.exclude), `${STATE_DIR}/**`],
-    }),
-    log: console.error,
-  });
+  const build = (remote: RemoteStore) =>
+    new SyncEngine({
+      fs,
+      store: remote,
+      stateStore: new FileState(stateFile),
+      passphrase,
+      config: resolveConfig({
+        deviceName: hostname().split('.')[0],
+        ...cli.sync,
+        ...(member && { readOnly: receivesOnly }),
+        // A custom list replaces the defaults, but this device's own state must never sync.
+        exclude: [...(cli.sync?.exclude ?? DEFAULT_CONFIG.exclude), `${STATE_DIR}/**`],
+      }),
+      log: console.error,
+      // Its member list lives apart from the sync state, which accepting storage resets.
+      ...(member && { member: { keys: member.member, position: new FileState(join(vault, STATE_DIR, POSITION_FILE)) } }),
+    });
+  let engine = build(store);
+
+  // New storage keys from the owner: used once they are shown to work for this device on this share, else the old ones stay.
+  let toldRekey = 0;
+  const switchKeys = async () => {
+    if (!member || cli.remote.type === 'follow') return;
+    const offer = await engine.rekeyOffer();
+    if (!offer) return;
+    const creds = credentialsFrom(member.storage, offer.storage);
+    let next: RemoteStore | undefined;
+    let problem = 'it holds no keys this version can use';
+    if (creds) {
+      try {
+        next = makeStore(cli.remote, false, creds);
+        problem = (await storageProblem(next, member.member)) ?? '';
+      } catch (e) {
+        problem = errorText(e);
+      }
+    }
+    if (!creds || !next || problem) {
+      if (toldRekey !== offer.n) console.error(`the owner sent new storage keys, but they do not work here (${problem}); this device keeps the ones it has`);
+      toldRekey = offer.n;
+      return;
+    }
+    member = { member: member.member, storage: creds };
+    await saveKeyFile(keysFile, member);
+    await engine.acceptRekey(offer.n);
+    store = next;
+    engine = build(store);
+    console.error('the owner sent new storage keys, and this device now uses them');
+  };
+  const noteStanding = async () => {
+    const standing = member && (await engine.memberStanding());
+    memberNote = standing?.waiting ? `waiting for ${standing.owner || 'the owner'}'s device to confirm this device; until then it only receives` : undefined;
+  };
+  const syncNow = async (options?: SyncOptions) => {
+    const r = await engine.sync(options);
+    await noteStanding();
+    return r;
+  };
+  if (command !== 'watch') await switchKeys();
+  // A writing device the owner has not confirmed yet, or has removed, sends nothing: what would write, or would never be sent, is refused as on a device set to only receive.
+  if (member?.member.key && WRITES[command] && !(command === 'restore-at' && flags.has('dry-run'))) {
+    const standing = await engine.memberStanding();
+    if (standing?.removed) throw new RemovedError();
+    if (standing?.role && !standing.mayWrite) {
+      const why = standing.waiting ? `this device only receives until ${standing.owner || 'the owner'}'s device confirms it` : 'this device may not send changes to this shared folder';
+      console.error(`${why}, so ${WRITES[command]}; run ${command} once it may send them`);
+      return 1;
+    }
+  }
 
   const heartbeat = async () => {
-    if (cli.sync?.readOnly) return;
+    // Nothing is written into a shared folder with members that other people read, as in the plugin.
+    if (receivesOnly || member) return;
     try {
       await writeHeartbeat(await engine.view(), { platform: `CLI on ${SYSTEMS[process.platform] ?? process.platform}`, version: await version() });
     } catch (e) {
@@ -377,7 +532,7 @@ async function main(): Promise<number> {
   };
 
   if (command === 'sync') {
-    const r = await engine.sync({ force: flags.has('force') });
+    const r = await syncNow({ force: flags.has('force') });
     report(r);
     await heartbeat();
     return r.errors.length ? 1 : 0;
@@ -393,9 +548,12 @@ async function main(): Promise<number> {
     const stamp = () => new Date().toISOString();
     let lastBeat = 0;
     let lastLeft = new Set<string>();
+    let removed = false;
+    let leave = () => {};
     const loop = new SyncLoop({
       sync: async () => {
-        const r = await engine.sync();
+        await switchKeys();
+        const r = await syncNow();
         if (heartbeatDue(lastBeat, Date.now())) {
           lastBeat = Date.now();
           await heartbeat();
@@ -413,10 +571,18 @@ async function main(): Promise<number> {
       },
       onFailure: (e, retryMs) => {
         const message = errorText(e);
-        console.error(`${stamp()} ${e instanceof SafetyError ? `${message} Not retrying until something changes.` : `sync failed: ${message}; retrying in ${retryMs! / 1000}s`}`);
+        const why = e instanceof SafetyError ? `${message} Not retrying until something changes.` : e instanceof RemovedError ? `${message}. Not watching any more.` : `sync failed: ${message}; retrying in ${retryMs! / 1000}s`;
+        console.error(`${stamp()} ${why}`);
         if (e instanceof SafetyError) console.error(`${stamp()} ${FORCE_HINT}`);
         if (e instanceof HistoryError) console.error(`${stamp()} ${ACCEPT_HINT}`);
         if (refusedWriting(e)) console.error(`${stamp()} ${READ_ONLY_HINT}`);
+        const hint = memberHint(e);
+        if (hint) console.error(`${stamp()} ${hint}`);
+        // Nothing a removed device does is ever accepted again.
+        if (e instanceof RemovedError) {
+          removed = true;
+          leave();
+        }
       },
       debounceMs: WATCH_SETTLE_MS,
       pollMs,
@@ -425,6 +591,7 @@ async function main(): Promise<number> {
     // Watching starts before the first sync so that edits made during it are not missed.
     const watcher = watchVault(vault, fs, STATE_DIR, () => loop.changed(), (e) => console.error(`${stamp()} watching failed: ${e.message}; relying on the --interval syncs`));
     const signalled = new Promise<void>((done) => {
+      leave = done;
       for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => done());
     });
     console.log(
@@ -435,7 +602,7 @@ async function main(): Promise<number> {
     await signalled;
     watcher.close();
     await loop.stop();
-    return 0;
+    return removed ? 1 : 0;
   }
   if (command === 'fetch' && rest.length) {
     const left = new Set((await engine.deferred()).map((f) => f.path));
@@ -444,7 +611,7 @@ async function main(): Promise<number> {
       console.error(`cannot fetch ${not.join(', ')}: not a file left in storage by sync.deferAboveMB; nothing was downloaded`);
       return 1;
     }
-    const r = await engine.sync({ fetch: rest });
+    const r = await syncNow({ fetch: rest });
     report(r);
     return r.errors.length ? 1 : 0;
   }
@@ -535,7 +702,7 @@ async function main(): Promise<number> {
   if (command === 'accept-storage') {
     await engine.acceptStorage();
     console.log('carrying on from storage as it is now');
-    const r = await engine.sync();
+    const r = await syncNow();
     report(r);
     return r.errors.length ? 1 : 0;
   }
@@ -550,6 +717,8 @@ main().then(
     if (e instanceof HistoryError) console.error(ACCEPT_HINT);
     if (e instanceof SafetyError) console.error(FORCE_HINT);
     if (refusedWriting(e)) console.error(READ_ONLY_HINT);
+    const hint = memberHint(e);
+    if (hint) console.error(hint);
     process.exit(1);
   },
 );

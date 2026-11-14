@@ -1,13 +1,20 @@
-// Shared folders: which engine a path belongs to, how each engine is built, and syncing them one after another.
+// Shared folders: which engine a path belongs to, how each engine is built, and syncing them in one run.
 // No Obsidian import, so it runs under plain Node tests.
+import { pool } from '../core/bytes.ts';
+import { compileExcludes } from '../core/config.ts';
 import { SyncEngine, type EngineOptions, type SyncResult } from '../core/engine.ts';
 import { vaultKey } from '../core/paths.ts';
 import { plural } from '../core/text.ts';
 import { MissingFolderError, ScopedFS, below, isAtOrInside, isInside, type FolderFS } from '../core/scopedfs.ts';
+import { parseMemberKeys, type MemberKeys } from '../core/members.ts';
 import { LocalState } from '../core/state.ts';
-import type { RemoteStore, StateStore } from '../core/types.ts';
+import type { LocalFS, RemoteStore, StateStore } from '../core/types.ts';
 import type { RemoteSpec } from '../stores/open.ts';
-import { encodeSetupCode, isConfigured, remoteSpec, shareConfig, statePath, storageLocation, storageProblem, syncConfig, type SecretLookup, type Settings, type Share } from './settings.ts';
+import { PropertyFS, allowed, type Catalog } from './byproperty.ts';
+import {
+  encodeSetupCode, folderShares, isConfigured, labelOf, positionPath, propertyConfig, remoteSpec, shareConfig, statePath, storageLocation, storageProblem, syncConfig,
+  type SecretLookup, type Settings, type Share,
+} from './settings.ts';
 
 /** Where a vault path syncs: inside a shared folder, by its path there, or with the vault, by the same path. */
 export interface Place {
@@ -20,23 +27,30 @@ export interface Place {
 
 const depth = (folder: string) => folder.split('/').length;
 
-/** The innermost shared folder holding `path` (a shared folder's own path gives '' inside it), or the vault. */
+/**
+ * The innermost shared folder holding `path` (a shared folder's own path gives '' inside it), or the vault. Notes shared
+ * by a property are the vault's: they stay in its sync, and their share only sends them.
+ */
 export function placeOf(shares: Share[], path: string): Place {
   let best: Share | undefined;
   for (const s of shares) {
-    if (!isAtOrInside(s.folder, path)) continue;
+    if (s.property || !isAtOrInside(s.folder, path)) continue;
     if (!best || depth(s.folder) > depth(best.folder)) best = s;
   }
   return best ? { share: best, path: below(best.folder, path) } : { path };
 }
 
-/** The vault path of `path` inside `share`, or `path` itself for the vault. */
-export const vaultPath = (share: Share | undefined, path: string) => (share ? (path ? `${share.folder}/${path}` : share.folder) : path);
+/** The vault path of `path` inside `share`, or `path` itself for the vault and for notes shared by a property, which keep their vault paths. */
+export const vaultPath = (share: Share | undefined, path: string) => (share && !share.property ? (path ? `${share.folder}/${path}` : share.folder) : path);
+
+/** The ids of the shares by property a change at vault path `path` may be in: a note or attachment outside every shared folder. */
+export const propertyPlaces = (shares: Share[], path: string): string[] =>
+  allowed(path.normalize('NFC')) && !placeOf(shares, path).share ? shares.filter((s) => s.property).map((s) => s.id) : [];
 
 /** Points every share at or under `from` at its place under `to`, after a folder was renamed or moved. Returns those that moved. */
 export function followRename(shares: Share[], from: string, to: string): Share[] {
   const moved: Share[] = [];
-  for (const s of shares) {
+  for (const s of folderShares(shares)) {
     if (!isAtOrInside(from, s.folder)) continue;
     const rest = below(from, s.folder);
     s.folder = rest ? `${to}/${rest}` : to;
@@ -46,7 +60,7 @@ export function followRename(shares: Share[], from: string, to: string): Share[]
 }
 
 /** The shares whose folder went with a deleted folder at `path`. */
-export const goneWith = (shares: Share[], path: string) => shares.filter((s) => isAtOrInside(path, s.folder));
+export const goneWith = (shares: Share[], path: string) => folderShares(shares).filter((s) => isAtOrInside(path, s.folder));
 
 /*
  * Sharing a folder that the vault already syncs takes it out of the vault on this device only. The vault's files in it
@@ -147,7 +161,7 @@ function commonFolder(paths: string[]): string {
 export function locationClash(s: Settings, share?: Share): string {
   if (share) return storageProblem(s, share, share.id);
   const other = s.shares.find((x) => storageLocation(x) === storageLocation(s));
-  return other ? `This vault and the shared folder “${other.folder}” are set to the same storage location. Change the vault's storage, or stop sharing that folder.` : '';
+  return other ? `This vault and the shared ${other.property ? 'notes' : 'folder'} “${labelOf(other)}” are set to the same storage location. Change the vault's storage, or stop sharing ${other.property ? 'them' : 'that folder'}.` : '';
 }
 
 /** A share syncs when this device has its keys and its folder has not gone missing. */
@@ -170,65 +184,149 @@ export interface EngineHost {
   secret: SecretLookup;
   openStore(spec: RemoteSpec): RemoteStore;
   stateStore(path: string): StateStore;
+  /**
+   * For notes shared by a property: the vault's files as Obsidian's index has them, and what Obsidian has read of them.
+   * Only the app has these, so only the app sends such a share.
+   */
+  notes?: { files: LocalFS; catalog: Catalog };
 }
+
+/** The files an engine of the vault or of a share sees, with the vault path of a path in them. */
+export type ShareFS = LocalFS & { pathOf(path: string): string };
 
 /**
  * The engine for the vault (no `share`) or for one shared folder, and the files it sees: the vault without its
  * shared folders, or one shared folder as if it were a vault. The folder is read through the share, so it follows a rename.
+ * A shared folder with members opens with this device's keys to it, and keeps the member list it accepted in a file
+ * of its own, which nothing that resets its sync state touches.
  */
-export function makeEngine(h: EngineHost, share: Share | undefined, extra: Pick<EngineOptions, 'onProgress' | 'now'> = {}): { engine: SyncEngine; fs: ScopedFS } {
+export function makeEngine(h: EngineHost, share: Share | undefined, extra: Pick<EngineOptions, 'onProgress' | 'now'> = {}): { engine: SyncEngine; fs: ShareFS } {
   const s = h.settings;
+  if (share?.property) return propertyEngine(h, share, extra);
   // A folder of '' would be the whole vault.
   if (share && !share.folder) throw new Error('A shared folder has to be a folder inside the vault');
-  const fs = new ScopedFS(h.files, () => share?.folder ?? '', () => h.settings.shares.map((x) => x.folder));
+  const fs = new ScopedFS(h.files, () => share?.folder ?? '', () => folderShares(h.settings.shares).map((x) => x.folder));
   const storage = share ?? s;
+  const member = share?.memberKeysSecret ? { keys: memberKeysIn(share, h.secret), position: h.stateStore(positionPath(h.pluginDir, share.id)) } : undefined;
   const engine = new SyncEngine({
     fs,
     store: h.openStore(remoteSpec(storage, h.secret)),
     stateStore: h.stateStore(statePath(h.pluginDir, share?.id)),
-    passphrase: h.secret(storage.passphraseSecret),
+    passphrase: member ? '' : h.secret(storage.passphraseSecret),
     config: share ? shareConfig(s, share, h.configDir) : syncConfig(s, h.configDir, h.pluginDir),
+    ...(member && { member }),
     ...extra,
   });
   return { engine, fs };
 }
 
+/**
+ * The engine of notes shared by a property (byproperty.ts), on the one device that sends them: it sees the vault's
+ * notes and attachments in the share at their vault paths, can write and remove none of them (`PropertyFS`), sends
+ * again whatever storage holds otherwise (`sendOnly`), and leaves a shared note alone while its properties no longer
+ * say it is shared (`only`).
+ */
+function propertyEngine(h: EngineHost, share: Share, extra: Pick<EngineOptions, 'onProgress' | 'now'>): { engine: SyncEngine; fs: PropertyFS } {
+  if (!h.notes) throw new Error('Notes shared by a property are sent only from Obsidian, which reads their properties.');
+  const config = propertyConfig(h.settings, h.configDir, h.pluginDir);
+  const fs = new PropertyFS({ inner: h.notes.files, catalog: h.notes.catalog, share: () => share, excluded: compileExcludes(config.exclude) });
+  const engine = new SyncEngine({
+    fs,
+    store: h.openStore(remoteSpec(share, h.secret)),
+    stateStore: h.stateStore(statePath(h.pluginDir, share.id)),
+    passphrase: '',
+    config,
+    member: { keys: memberKeysIn(share, h.secret), position: h.stateStore(positionPath(h.pluginDir, share.id)) },
+    only: (key) => fs.sends(key),
+    sendOnly: true,
+    ...extra,
+  });
+  return { engine, fs };
+}
+
+/** This device's keys to `share`, a shared folder with members, as kept in secret storage. */
+export function memberKeysIn(share: Share, secret: SecretLookup): MemberKeys {
+  const kept = secret(share.memberKeysSecret);
+  if (!kept) throw new Error('This device no longer has its keys to this shared folder. Sync status says what to do.');
+  return parseMemberKeys(kept);
+}
+
+/** What joining `share` again takes, once this device stops sharing it. Nobody can invite an owner: its own link brings it back. */
+export function rejoinNeeds(share: Pick<Share, 'role' | 'memberKeysSecret'>): string {
+  if (share.role === 'owner') return 'the link for your other devices and its passphrase';
+  return share.memberKeysSecret ? 'a new invite' : 'the invite link and the passphrase';
+}
+
+/** Whether `share` is a shared folder with members, whose devices each hold keys of their own. */
+export const hasMembers = (share: Share | undefined): share is Share => !!share?.memberKeysSecret;
+
 export type Outcome<T, R> = { target: T; result: R; error?: undefined } | { target: T; result?: undefined; error: unknown };
 
-/** Runs `run` for each target in order. One failing does not stop the ones after it. */
-export async function syncEach<T, R>(targets: T[], run: (target: T) => Promise<R>): Promise<Outcome<T, R>[]> {
-  const out: Outcome<T, R>[] = [];
-  for (const target of targets) {
+/** How many shared folders sync, or are asked for changes, at the same time. */
+export const SHARES_AT_ONCE = 3;
+
+/**
+ * Runs `run` for each target, `limit` at a time, starting them in order. One failing does not stop the others. The
+ * outcomes are in the order of `targets`, whichever finishes first.
+ */
+export async function syncEach<T, R>(targets: T[], run: (target: T) => Promise<R>, limit = 1): Promise<Outcome<T, R>[]> {
+  const out = new Array<Outcome<T, R>>(targets.length);
+  await pool(targets, limit, async (target, i) => {
     try {
-      out.push({ target, result: await run(target) });
+      out[i] = { target, result: await run(target) };
     } catch (error) {
-      out.push({ target, error });
+      out[i] = { target, error };
     }
-  }
+  });
   return out;
 }
 
 /** The vault, then every shared folder that can sync here. */
 export const targetsOf = (s: Settings, secret: SecretLookup): (Share | undefined)[] => [undefined, ...s.shares.filter((x) => syncable(x, secret))];
 
+/** What a run reports as it goes, so progress and status can follow each place on its own. */
+export interface RunEvents {
+  /** Once, before anything runs: the places this run covers, the vault (undefined) first. */
+  planned?: (targets: (Share | undefined)[]) => void;
+  started?: (target: Share | undefined) => void;
+  /** `error` is what made it fail, when it did. */
+  ended?: (target: Share | undefined, error?: unknown) => void;
+}
+
 /**
  * One sync run: `run` for the vault and then for each shared folder that can sync and `include` lets in, one failing
- * not stopping the rest. Nothing runs on a storage location that two of them are set to, and a shared folder whose
- * folder is missing pauses.
+ * not stopping the rest. The vault goes first and alone, so its sync runs as it always did and no shared folder slows it
+ * down. The shared folders follow, `SHARES_AT_ONCE` at a time. The outcomes are the vault's, then the shared folders' in
+ * the order of the settings. Nothing runs on a storage location that two of them are set to, and a shared folder whose
+ * folder is missing pauses as soon as its sync fails.
  */
 export async function syncAll<R>(
   s: Settings,
   secret: SecretLookup,
   run: (share?: Share) => Promise<R>,
   include: (share?: Share) => boolean = () => true,
+  events: RunEvents = {},
 ): Promise<Outcome<Share | undefined, R>[]> {
-  const out = await syncEach(targetsOf(s, secret).filter(include), async (share) => {
-    const clash = locationClash(s, share);
-    if (clash) throw new Error(clash);
-    return run(share);
-  });
-  for (const o of out) if (o.target && 'error' in o) pauseIfMissing(o.target, o.error);
-  return out;
+  const targets = targetsOf(s, secret).filter(include);
+  events.planned?.(targets);
+  const one = async (share?: Share): Promise<R> => {
+    let error: unknown;
+    events.started?.(share);
+    try {
+      const clash = locationClash(s, share);
+      if (clash) throw new Error(clash);
+      return await run(share);
+    } catch (e) {
+      error = e;
+      if (share) pauseIfMissing(share, e);
+      throw e;
+    } finally {
+      events.ended?.(share, error);
+    }
+  };
+  const vault = await syncEach(targets.filter((t) => !t), one);
+  const shares = await syncEach(targets.filter((t) => t), one, SHARES_AT_ONCE);
+  return [...vault, ...shares];
 }
 
 /** A share's sync result with the paths it names given as vault paths, for problems that open the files. */

@@ -157,7 +157,8 @@ export function merge3(base: string, ours: string, theirs: string): string | nul
   return mergeTokens(splitLines(base), splitLines(ours), splitLines(theirs), undefined, mergeWords);
 }
 
-interface Front {
+/** A note's properties block, cut so that `open + props + close + body` is the whole text. */
+export interface Front {
   open: string;
   props: string;
   close: string;
@@ -165,7 +166,7 @@ interface Front {
 }
 
 /** The properties block at the top of a note: from a first line of exactly `---` to the next such line. */
-function frontmatter(text: string): Front | undefined {
+export function frontmatter(text: string): Front | undefined {
   const lines = splitLines(text);
   if (!/^---\r?\n$/.test(lines[0])) return undefined;
   const end = lines.findIndex((l, i) => i > 0 && /^---\r?\n?$/.test(l));
@@ -174,12 +175,12 @@ function frontmatter(text: string): Front | undefined {
 }
 
 // A key is quoted or plain, at column 0, and followed by `:` and a space or the end of the line.
-const KEY = /^(?:"((?:[^"\\\r\n]|\\.)+)"|'((?:[^'\r\n]|'')+)'|([^\s"'#\-[\]{}&*!|>%@`,?:][^\r\n:]*))[ \t]*:(?=[ \t\r\n]|$)/;
+export const KEY = /^(?:"((?:[^"\\\r\n]|\\.)+)"|'((?:[^'\r\n]|'')+)'|([^\s"'#\-[\]{}&*!|>%@`,?:][^\r\n:]*))[ \t]*:(?=[ \t\r\n]|$)/;
 // What belongs to the key above it: indented lines, `- item` lines, comments and blank lines.
 const CONTINUES = /^(?:[ \t#\r\n]|-(?:[ \t\r\n]|$))/;
 
 /** The top-level entries of a properties block by key, each with its lines; '' holds what precedes the first key. Undefined when a line fits nowhere or a key repeats. */
-function entries(props: string): Map<string, string> | undefined {
+export function entries(props: string): Map<string, string> | undefined {
   const out = new Map<string, string>();
   let key = '';
   let text = '';

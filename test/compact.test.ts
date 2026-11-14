@@ -765,7 +765,7 @@ async function oldIndex(mem: MemoryStore, seq: number): Promise<void> {
   const key = seqKey('idx', seq);
   const aad = `${header.id}:${key}`;
   const { plain } = await open(keys, mem.objects.get(key)!.data, aad);
-  const commits = JSON.parse(new TextDecoder().decode(await inflate(plain))) as { d: unknown; t: unknown; p: unknown; c: unknown }[];
+  const commits = JSON.parse(new TextDecoder().decode(await inflate(plain, Infinity))) as { d: unknown; t: unknown; p: unknown; c: unknown }[];
   const old = commits.map(({ d, t, p, c }) => ({ d, t, p, c }));
   mem.objects.get(key)!.data = await seal(keys, await deflate(utf8.encode(JSON.stringify(old))), aad);
 }

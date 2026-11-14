@@ -1,4 +1,5 @@
 import type { SyncConfig } from './config.ts';
+import type { Member } from './members.ts';
 import { vaultKey } from './paths.ts';
 import type { Repo } from './repo.ts';
 import { Backward, Forward, HOUR, Reads, Thinning, historyFloor, keptState, type Snapshot } from './retention.ts';
@@ -166,9 +167,10 @@ async function backward(reads: Reads, snaps: Snapshot[], k: Kept, remote: Map<st
 
 /**
  * From snapshot `base` (0: an empty vault), replaying commits up to the moment wanted. Undefined when
- * no kept moment from `from` on that it wants falls after `base`.
+ * no kept moment from `from` on that it wants falls after `base`; null when the snapshot reads as missing, as one
+ * found not to verify in a shared folder with members does.
  */
-async function replay(reads: Reads, k: Kept, from: number, base: number, lastSeq: number, want: Want): Promise<Found | undefined> {
+async function replay(reads: Reads, k: Kept, from: number, base: number, lastSeq: number, want: Want): Promise<Found | undefined | null> {
   const seen: Commit[] = [];
   let prev: Commit | undefined = base ? await reads.get(base) : undefined;
   if (prev?.moved) prev = undefined;
@@ -192,7 +194,7 @@ async function replay(reads: Reads, k: Kept, from: number, base: number, lastSeq
   if (!stopped && prev) consider(prev, undefined, lastSeq);
   if (!best) return undefined;
   const snap = base ? await reads.snapshot(base) : new Map<string, Entry>();
-  if (!snap) throw new Error(`Snapshot ${base} cannot be read`);
+  if (!snap) return null;
   const files = new Map(snap);
   for (const c of seen) {
     if (c.seq > best.end) break;
@@ -206,6 +208,7 @@ async function forward(reads: Reads, bases: Snapshot[], k: Kept, from: number, l
   for (let i = bases.length - 1; ; i--) {
     const base = i >= 0 ? bases[i].seq : 0;
     const found = await replay(reads, k, from, base, lastSeq, want);
+    if (found === null) continue;
     if (found || base <= from) return found;
   }
 }
@@ -377,6 +380,67 @@ export async function listCommits(
   }
   for (const [path, entry] of await walk.entries([...open.keys()])) settle(path, entry);
   return out;
+}
+
+/** One change to the files, or to the members of a shared folder, as `listActivity` lists it. */
+export interface Activity extends Moment {
+  /** In a shared folder with members: the member who signed it. */
+  signer?: string;
+  /** The files it added, changed and deleted, by path, each list sorted. */
+  added: string[];
+  changed: string[];
+  deleted: string[];
+  /** A change to the members: the member list before it (empty for the first) and after it. It changes no file. */
+  members?: { before: Member[]; after: Member[] };
+}
+
+/**
+ * Every commit that changed files or members, newest first, each with the files it added, changed and deleted. Commits
+ * that only moved stored data are left out; unlike `listCommits`, nothing is thinned, and every commit the log holds
+ * counts. Stops after `limit` of them; `beforeSeq` starts at the newest before that commit. `next` is the `beforeSeq`
+ * of the page after this one, undefined once the log's start is reached.
+ */
+export async function listActivity(
+  repo: Repo,
+  lastSeq: number,
+  cfg: SyncConfig,
+  opts: { limit?: number; beforeSeq?: number } = {},
+): Promise<{ items: Activity[]; next?: number }> {
+  const { limit = Infinity, beforeSeq = Infinity } = opts;
+  const snaps = (await repo.snapshots()).filter((s) => s.seq <= lastSeq);
+  const reads = new Reads(repo, cfg);
+  const walk = new Backward(reads, snaps, Math.max(0, Math.min(lastSeq, beforeSeq - 1)));
+  const items: Activity[] = [];
+  // Files a listed commit changed, with their entry then, until an older commit or a snapshot shows what they were before it.
+  const open = new Map<string, { a: Activity; after: Entry | null }>();
+  const settle = (path: string, was: Entry | null) => {
+    const o = open.get(path);
+    if (!o) return;
+    open.delete(path);
+    if (!o.after) o.a.deleted.push(path);
+    else if (!was) o.a.added.push(path);
+    else if (!sameContent(o.after, was)) o.a.changed.push(path);
+  };
+  let next: number | undefined;
+  for (let c: Commit | undefined; (c = await walk.peek()); await walk.next()) {
+    const listed = !c.moved || !!c.members;
+    if (listed && items.length >= limit) {
+      next = c.seq + 1;
+      break;
+    }
+    for (const { path, entry } of c.changes) settle(path, entry);
+    if (!listed) continue;
+    const a: Activity = { ...moment(c), ...(c.signer && { signer: c.signer }), added: [], changed: [], deleted: [] };
+    if (c.members) {
+      const prev = c.members.earlier.at(-1);
+      a.members = { before: prev ? ((await reads.get(prev)).members?.members ?? []) : [], after: c.members.members };
+    }
+    items.push(a);
+    for (const { path, entry } of c.changes) open.set(path, { a, after: entry });
+  }
+  for (const [path, entry] of await walk.entries([...open.keys()])) settle(path, entry);
+  for (const a of items) for (const list of [a.added, a.changed, a.deleted]) list.sort();
+  return { items, ...(next !== undefined && { next }) };
 }
 
 /**

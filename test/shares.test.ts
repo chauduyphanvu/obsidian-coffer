@@ -7,7 +7,7 @@ import { MissingFolderError, ScopedFS, type FolderFS } from '../src/core/scopedf
 import { ChangeLog, type Why } from '../src/plugin/changes.ts';
 import { defaultSettings, shareWith, statePath, type Settings, type Share } from '../src/plugin/settings.ts';
 import { vaultKey } from '../src/core/paths.ts';
-import { followRename, freeTaken, goneWith, inVault, makeEngine, mountHint, placeOf, rejoin, rejoinNote, syncAll, takeVaultCopies, vaultPath, type EngineHost } from '../src/plugin/shares.ts';
+import { SHARES_AT_ONCE, followRename, freeTaken, goneWith, inVault, makeEngine, mountHint, placeOf, rejoin, rejoinNote, syncAll, syncEach, takeVaultCopies, vaultPath, type EngineHost, type RunEvents } from '../src/plugin/shares.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
 import { MemFS, MemState } from '../src/testing/memfs.ts';
 import { Device, TEST_CONFIG } from './helpers.ts';
@@ -233,7 +233,7 @@ test('routing: a path goes to the innermost shared folder holding it, by its pat
   assert.equal(vaultPath(work, 'a.md'), 'Work/a.md');
   assert.equal(vaultPath(work, ''), 'Work');
   assert.equal(vaultPath(undefined, 'a.md'), 'a.md');
-  const r = inVault(work, { pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0, conflictCopies: ['x (conflict).md'], skipped: 0, tooLarge: ['big.mov'], deferred: ['d.mov'], unsent: ['u.md'], errors: [{ path: 'e.md', message: 'no' }], commits: 0, rounds: 1 });
+  const r = inVault(work, { pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0, conflictCopies: ['x (conflict).md'], skipped: 0, tooLarge: ['big.mov'], deferred: ['d.mov'], unsent: ['u.md'], arrived: [], errors: [{ path: 'e.md', message: 'no' }], commits: 0, rounds: 1 });
   assert.deepEqual([r.conflictCopies, r.tooLarge, r.deferred, r.unsent, r.errors.map((e) => e.path)], [['Work/x (conflict).md'], ['Work/big.mov'], ['Work/d.mov'], ['Work/u.md'], ['Work/e.md']]);
 });
 
@@ -695,4 +695,246 @@ test('mounting at a folder that has files says what happens to them, for a devic
   assert.match(mountHint('Crew', 1200, true), /^“Crew” already has 1,200 files\. They stay on this device and are not sent, /);
   assert.ok(!/everyone who shares/.test(mountHint('Crew', 2, true)));
   assert.ok(mountHint('Crew', 2, true).endsWith('Nothing is deleted.'));
+});
+
+/** Settings for a vault and `n` shared folders s1…sn, each with a storage location of its own and its keys. */
+function manyShares(n: number): Settings {
+  const storage = { endpoint: 'https://s3.test', bucket: 'b', accessKeySecret: 'ak', secretKeySecret: 'sk', passphraseSecret: 'pass' };
+  const s = { ...defaultSettings(false), ...storage, prefix: 'vault' };
+  s.shares = Array.from({ length: n }, (_, i) => shareWith({ id: `s${i + 1}`, folder: `F${i + 1}`, ...storage, prefix: `p${i + 1}` }));
+  return s;
+}
+
+const haveKeys = (name: string) => (name ? 'x' : '');
+const idOf = (share?: Share) => share?.id ?? 'vault';
+/** Lets everything that can run without waiting for something else run. */
+const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+/** Places that wait, each until the test lets it go; `starts` is the order they began in. */
+function held() {
+  const release = new Map<string, () => void>();
+  const starts: string[] = [];
+  const wait = async (share?: Share) => {
+    starts.push(idOf(share));
+    await new Promise<void>((resolve) => release.set(idOf(share), resolve));
+  };
+  return { release, starts, wait };
+}
+
+test('a run syncs the vault alone first, then the shared folders, and reports the vault and then the shares in settings order however they end', async () => {
+  const s = manyShares(3);
+  const { release, starts, wait } = held();
+  const done = syncAll(s, haveKeys, async (share) => {
+    await wait(share);
+    return `${idOf(share)} done`;
+  });
+  await settle();
+  assert.deepEqual(starts, ['vault'], 'no shared folder starts while the vault syncs');
+  release.get('vault')!();
+  await settle();
+  assert.deepEqual(starts, ['vault', 's1', 's2', 's3']);
+  for (const id of ['s3', 's1', 's2']) {
+    release.get(id)!();
+    await settle();
+  }
+  const out = await done;
+  assert.deepEqual(out.map((o) => idOf(o.target)), ['vault', 's1', 's2', 's3']);
+  assert.deepEqual(out.map((o) => o.result), ['vault done', 's1 done', 's2 done', 's3 done']);
+});
+
+test('shared folders sync at most three at a time, each one starting when another ends', async () => {
+  const s = manyShares(8);
+  const { release, starts, wait } = held();
+  let active = 0;
+  let most = 0;
+  const done = syncAll(s, haveKeys, async (share) => {
+    active++;
+    most = Math.max(most, active);
+    try {
+      await wait(share);
+    } finally {
+      active--;
+    }
+  });
+  await settle();
+  release.get('vault')!();
+  await settle();
+  assert.equal(SHARES_AT_ONCE, 3);
+  assert.deepEqual(starts, ['vault', 's1', 's2', 's3']);
+  release.get('s2')!();
+  await settle();
+  assert.deepEqual(starts.slice(4), ['s4'], 'the next in line takes the free place, not a fourth at once');
+  // Let every place that waits go, until none is left.
+  while (starts.length < 9 || release.size) {
+    for (const [id, go] of [...release]) {
+      release.delete(id);
+      go();
+    }
+    await settle();
+  }
+  const out = await done;
+  assert.equal(most, 3);
+  assert.deepEqual(starts, ['vault', ...Array.from({ length: 8 }, (_, i) => `s${i + 1}`)]);
+  ok(out);
+  assert.equal(out.length, 9);
+});
+
+test('one place failing does not stop the vault or the shared folders, running or waiting, and frees its place for the next', async () => {
+  const s = manyShares(5);
+  const { release, starts, wait } = held();
+  const done = syncAll(s, haveKeys, async (share) => {
+    if (!share) throw new Error('the vault is down');
+    if (share.id === 's2') throw new Error('s2 is down');
+    await wait(share);
+    return share.id;
+  });
+  await settle();
+  assert.deepEqual(starts, ['s1', 's3', 's4'], 'the vault failing does not stop them, and a failing s2 gives its place to s4');
+  for (const id of ['s4', 's1', 's3']) {
+    release.get(id)!();
+    await settle();
+  }
+  assert.deepEqual(starts.slice(3), ['s5']);
+  release.get('s5')!();
+  const out = await done;
+  assert.deepEqual(out.map((o) => idOf(o.target)), ['vault', 's1', 's2', 's3', 's4', 's5']);
+  assert.deepEqual(out.map((o) => (o.error ? (o.error as Error).message : o.result)), ['the vault is down', 's1', 's2 is down', 's3', 's4', 's5']);
+});
+
+test('a shared folder whose folder is missing pauses the moment its sync fails, while the others still sync', async () => {
+  const s = manyShares(3);
+  const [s1, s2, s3] = s.shares;
+  const { release, wait } = held();
+  const done = syncAll(s, haveKeys, async (share) => {
+    if (!share) return;
+    if (share === s2) throw new MissingFolderError('F2');
+    if (share === s3) throw new Error('offline');
+    await wait(share);
+  });
+  await settle();
+  assert.equal(s2.missing, true, 'paused while s1 is still syncing');
+  assert.equal(s1.missing, false);
+  assert.equal(s3.missing, false, 'another kind of failure pauses nothing');
+  release.get('s1')!();
+  const out = await done;
+  assert.ok(out[2].error instanceof MissingFolderError);
+  assert.equal(out[1].error, undefined);
+  const again = await syncAll(s, haveKeys, async () => 'again');
+  assert.deepEqual(again.map((o) => idOf(o.target)), ['vault', 's1', 's3'], 'a paused shared folder is left out of the next run');
+});
+
+test('the include gate keeps a place out of a run, and a shared folder without its folder or keys is never in one', async () => {
+  const s = manyShares(5);
+  s.shares[2].missing = true;
+  s.shares[3].passphraseSecret = '';
+  const ran: string[] = [];
+  const planned: string[] = [];
+  const out = await syncAll(
+    s,
+    (name) => (name === 'pass' || name === 'ak' || name === 'sk' ? 'x' : ''),
+    async (share) => {
+      ran.push(idOf(share));
+    },
+    (share) => share?.id !== 's2' && share !== undefined,
+    { planned: (targets) => planned.push(...targets.map(idOf)) },
+  );
+  assert.deepEqual(ran.sort(), ['s1', 's5']);
+  assert.deepEqual(planned, ['s1', 's5']);
+  assert.deepEqual(out.map((o) => idOf(o.target)), ['s1', 's5']);
+  ran.length = 0;
+  ok(await syncAll(s, (name) => (name === 'pass' || name === 'ak' || name === 'sk' ? 'x' : ''), async (share) => void ran.push(idOf(share))));
+  assert.deepEqual(ran, ['vault', 's1', 's2', 's5'], 'without the gate: all but s3, whose folder is missing, and s4, which has no passphrase here');
+});
+
+test('a run tells what it plans, then when each place starts and ends and what made it fail, and a storage location two places share runs nothing', async () => {
+  const s = manyShares(3);
+  s.shares[1].prefix = 'vault';
+  const log: string[] = [];
+  const events: RunEvents = {
+    planned: (targets) => log.push(`plan ${targets.map(idOf).join(',')}`),
+    started: (share) => log.push(`start ${idOf(share)}`),
+    ended: (share, error) => log.push(`end ${idOf(share)}${error ? ' failed' : ''}`),
+  };
+  const ran: string[] = [];
+  const out = await syncAll(
+    s,
+    haveKeys,
+    async (share) => {
+      ran.push(idOf(share));
+      if (share?.id === 's3') throw new Error('broke');
+    },
+    () => true,
+    events,
+  );
+  assert.deepEqual(log.slice(0, 3), ['plan vault,s1,s2,s3', 'start vault', 'end vault failed'], 'the plan comes first, and the vault is over before any shared folder starts');
+  for (const [id, end] of [['s1', 'end s1'], ['s2', 'end s2 failed'], ['s3', 'end s3 failed']]) assert.ok(log.indexOf(`start ${id}`) < log.indexOf(end), id);
+  assert.equal(log.length, 9);
+  assert.deepEqual(ran, ['s1', 's3'], 'the vault and s2 are at one location: neither runs');
+  assert.match(String(out[0].error), /This vault and the shared folder “F2” are set to the same storage location/);
+  assert.match(String(out[2].error), /where this vault itself syncs/);
+  assert.equal(String(out[3].error), 'Error: broke');
+  assert.equal(out[1].error, undefined);
+});
+
+test('syncEach runs one at a time unless told more, and keeps the order of its targets', async () => {
+  let active = 0;
+  let most = 0;
+  const work = async (n: number) => {
+    active++;
+    most = Math.max(most, active);
+    await settle();
+    active--;
+    if (n === 2) throw new Error('two');
+    return n * 10;
+  };
+  const one = await syncEach([1, 2, 3, 4], work);
+  assert.equal(most, 1);
+  most = 0;
+  const many = await syncEach([1, 2, 3, 4], work, 4);
+  assert.equal(most, 4);
+  for (const out of [one, many]) {
+    assert.deepEqual(out.map((o) => o.target), [1, 2, 3, 4]);
+    assert.deepEqual(out.map((o) => o.result), [10, undefined, 30, 40]);
+    assert.equal((out[1].error as Error).message, 'two');
+  }
+});
+
+test('shared folders with real engines sync side by side, three at a time, each into its own storage, and arrive on the other device', async () => {
+  const w = await world();
+  const { a, b, stores, secrets } = w;
+  for (const name of ['t1', 't2', 't3', 't4']) {
+    stores[name] = new MemoryStore();
+    secrets[`pass:${name}`] = `${name} passphrase`;
+    await Repo.open(stores[name], secrets[`pass:${name}`], { kdfIterations: TEST_CONFIG.kdfIterations!, chunk: TEST_CONFIG.chunk! });
+  }
+  a.fs.put('a.md', 'in the vault');
+  const mine: Share[] = [];
+  for (const [i, name] of ['t1', 't2', 't3', 't4'].entries()) {
+    a.fs.put(`Group ${i + 1}/n.md`, `note ${i + 1}`);
+    mine.push(await a.share(`g${i + 1}`, `Group ${i + 1}`, name));
+    b.fs.put(`Their ${i + 1}/m.md`, `theirs ${i + 1}`);
+    await b.share(`h${i + 1}`, `Their ${i + 1}`, name);
+  }
+  let active = 0;
+  let most = 0;
+  const sync = (p: typeof a) =>
+    syncAll(p.settings, p.host.secret, async (share) => {
+      active++;
+      most = Math.max(most, active);
+      try {
+        return await p.engine(share).sync();
+      } finally {
+        active--;
+      }
+    });
+  ok(await sync(a));
+  assert.equal(most, SHARES_AT_ONCE);
+  ok(await sync(b));
+  ok(await sync(a));
+  for (const [i, share] of mine.entries()) {
+    assert.deepEqual(await a.remote(share), ['m.md', 'n.md']);
+    assert.equal(a.fs.text(`Group ${i + 1}/m.md`), `theirs ${i + 1}`);
+    assert.equal(b.fs.text(`Their ${i + 1}/n.md`), `note ${i + 1}`);
+  }
+  assert.deepEqual(await a.remote(), ['a.md']);
 });

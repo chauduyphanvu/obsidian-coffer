@@ -1,6 +1,8 @@
 // How often to ask the storage whether another device has committed, which places to ask, and when to try again a
 // place whose sync failed. No Obsidian import, so it runs under plain Node tests.
-import type { SyncResult } from '../core/engine.ts';
+import { pool } from '../core/bytes.ts';
+import { RemovedError, SafetyError, type SyncResult } from '../core/engine.ts';
+import { NotSendingError, OtherSenderError } from './byproperty.ts';
 import type { Why } from './changes.ts';
 
 const FAST_MIN_MS = 5_000;
@@ -24,6 +26,13 @@ export function nextPollDelay(pollSeconds: number, lastActivity: number, now: nu
 
 /** Whether a sync brought changes from another device, which suggests the user is switching devices. */
 export const receivedChanges = (r: SyncResult) => r.pulled + r.deletedLocal + r.merged + r.conflictCopies.length > 0;
+
+/**
+ * Whether a failed sync pauses its place (`Pauses`) rather than waiting to try it again (`Retries`): a mass delete to
+ * confirm, or this device removed from a shared folder, which trying again only finds again. A change no member made
+ * waits instead: the owner removes it from another device, and nothing on this one would lift a pause then.
+ */
+export const pausesOn = (e: unknown) => e instanceof SafetyError || e instanceof RemovedError || e instanceof NotSendingError || e instanceof OtherSenderError;
 
 /**
  * Places, the vault ('') or a shared folder (its id), whose last sync paused before deleting many files. Syncing one
@@ -85,17 +94,23 @@ export class Retries {
 }
 
 /**
- * One poll: asks each place that a poll includes whether its storage has changes, until one has. True means a sync is
- * due; a place that can not be asked (offline) counts as unchanged, the next sync reports it.
+ * One poll: asks each place that a poll includes whether its storage has changes, `limit` at a time, until one has.
+ * True means a sync is due; once a place has said so, no other is started, and the ones already asked are waited for.
+ * A place that can not be asked (offline) counts as unchanged, the next sync reports it.
  */
-export async function pollPlaces(ids: string[], gate: { includes(id: string, why: Why): boolean }, changed: (id: string) => Promise<boolean>): Promise<boolean> {
-  for (const id of ids) {
-    if (!gate.includes(id, 'poll')) continue;
-    try {
-      if (await changed(id)) return true;
-    } catch {
-      // Offline or unreachable.
-    }
-  }
-  return false;
+export async function pollPlaces(ids: string[], gate: { includes(id: string, why: Why): boolean }, changed: (id: string) => Promise<boolean>, limit = 1): Promise<boolean> {
+  let due = false;
+  await pool(
+    ids.filter((id) => gate.includes(id, 'poll')),
+    limit,
+    async (id) => {
+      if (due) return;
+      try {
+        if (await changed(id)) due = true;
+      } catch {
+        // Offline or unreachable.
+      }
+    },
+  );
+  return due;
 }

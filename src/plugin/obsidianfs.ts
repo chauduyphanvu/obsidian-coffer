@@ -1,5 +1,6 @@
-import { TFile, TFolder, Vault, requestUrl, type App, type TAbstractFile } from 'obsidian';
+import { TFile, TFolder, Vault, getLinkpath, requestUrl, type App, type TAbstractFile } from 'obsidian';
 import { vaultKey } from '../core/paths.ts';
+import { PROPERTY, readAlready, type Catalog } from './byproperty.ts';
 import type { FolderFS } from '../core/scopedfs.ts';
 import type { FileStat, LocalFile, StateStore } from '../core/types.ts';
 import { uncachedHeaders, type Http } from '../stores/http.ts';
@@ -141,5 +142,58 @@ export class PluginState implements StateStore {
   }
   async save(data: string): Promise<void> {
     await this.app.vault.adapter.write(this.path, data);
+  }
+}
+
+/** What Obsidian's metadata cache has read of the vault, for notes shared by a property (byproperty.ts): a first guess, which the files' bytes confirm. */
+export class ObsidianCatalog implements Catalog {
+  private app: App;
+  private resolved = false;
+
+  constructor(app: App) {
+    this.app = app;
+  }
+
+  /** Obsidian has read the whole vault since the app started. */
+  markReady(): void {
+    this.resolved = true;
+  }
+
+  ready(): boolean {
+    return this.resolved;
+  }
+
+  /** See `readAlready`. */
+  readAlready(loadedLate: boolean): boolean {
+    const cache = this.app.metadataCache;
+    return readAlready(loadedLate, this.app.vault.getMarkdownFiles().map((f) => f.path), (p) => cache.getCache(p) !== null, (p) => Object.hasOwn(cache.resolvedLinks, p));
+  }
+
+  tagged(name: string): string[] {
+    return this.app.vault.getMarkdownFiles().filter((f) => this.cacheSays(f, name)).map((f) => f.path);
+  }
+
+  /** Whether Obsidian read the properties of the note at `path` as saying share: <name>. */
+  says(path: string, name: string): boolean {
+    const file = lookup(this.app, path);
+    return file instanceof TFile && this.cacheSays(file, name);
+  }
+
+  private cacheSays(file: TFile, name: string): boolean {
+    const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+    if (!fm) return false;
+    const want = name.normalize('NFC').trim().toLowerCase();
+    const says = (v: unknown) => (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') && String(v).normalize('NFC').trim().toLowerCase() === want;
+    return Object.entries(fm).some(([key, value]) => key.toLowerCase() === PROPERTY && (Array.isArray(value) ? value.some(says) : says(value)));
+  }
+
+  embeds(note: string): { original: string; target: string | null }[] {
+    const file = lookup(this.app, note);
+    if (!(file instanceof TFile)) return [];
+    return (this.app.metadataCache.getFileCache(file)?.embeds ?? []).map((e) => ({ original: e.original, target: this.resolve(e.link, file.path) }));
+  }
+
+  resolve(link: string, from: string): string | null {
+    return this.app.metadataCache.getFirstLinkpathDest(getLinkpath(link), from)?.path ?? null;
   }
 }

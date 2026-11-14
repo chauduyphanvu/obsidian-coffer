@@ -5,12 +5,14 @@ import { fileName, vaultKey } from '../core/paths.ts';
 import type { RepairReport } from '../core/repair.ts';
 import { listVersions } from '../core/retention.ts';
 import { plural } from '../core/text.ts';
-import { TooOldError, listCommits, listDeleted, planRestore, tableAt, type CommitSummary, type DeletedFile, type PastVault } from '../core/timeline.ts';
+import { TooOldError, listActivity, listCommits, listDeleted, planRestore, tableAt, type CommitSummary, type DeletedFile, type PastVault } from '../core/timeline.ts';
 import { sameContent, type Version } from '../core/types.ts';
 import type { VerifyReport } from '../core/verify.ts';
+import { ActivityPages, activityRows, savedBy, type ActivityRow, type Self } from './activity.ts';
 import type CofferPlugin from './main.ts';
 import type { Failed, Look, RestoreOutcome } from './main.ts';
-import type { Share } from './settings.ts';
+import { folderShares, labelOf, type Share } from './settings.ts';
+import { vaultPath } from './shares.ts';
 import {
   MomentPages,
   byDay,
@@ -53,7 +55,7 @@ const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
 /** Which synced place a screen is about, once the vault has shared folders: each has a history of its own. */
 function placeLine(parent: HTMLElement, plugin: CofferPlugin, share: Share | undefined): void {
-  const text = share ? `Shared folder “${share.folder}”` : plugin.settings.shares.length ? 'This vault, without its shared folders' : '';
+  const text = share ? (share.property ? `Shared notes “${share.property}”` : `Shared folder “${share.folder}”`) : folderShares(plugin.settings.shares).length ? 'This vault, without its shared folders' : '';
   if (text) parent.createDiv({ cls: 'coffer-place', text });
 }
 
@@ -87,7 +89,7 @@ function days<T>(parent: HTMLElement, items: T[], timeOf: (item: T) => number, e
   }
 }
 
-function showDiff(parent: HTMLElement, lines: DiffLine[]): void {
+export function showDiff(parent: HTMLElement, lines: DiffLine[]): void {
   const box = parent.createDiv({ cls: 'coffer-diff' });
   for (const l of lines.slice(0, MAX_LINES)) {
     if (l.kind === 'gap') {
@@ -101,7 +103,7 @@ function showDiff(parent: HTMLElement, lines: DiffLine[]): void {
   if (lines.length > MAX_LINES) parent.createDiv({ cls: 'coffer-hint', text: `Only the first ${MAX_LINES.toLocaleString()} lines are shown. “Whole text” shows all of this version.` });
 }
 
-function showWhole(parent: HTMLElement, text: string): void {
+export function showWhole(parent: HTMLElement, text: string): void {
   parent.createDiv({ cls: 'coffer-whole', text: text.slice(0, MAX_CHARS) });
   if (text.length > MAX_CHARS) parent.createDiv({ cls: 'coffer-hint', text: 'Only the beginning of this version is shown.' });
 }
@@ -181,13 +183,18 @@ export class VersionsModal extends Modal {
   private previewEl?: HTMLElement;
   /** Where the list was scrolled when a version was picked, to return there on a phone. */
   private scrolled = 0;
+  /** The change to show first, as Activity opens it: the version commit `seq` made, or for a deletion, the one before. */
+  private first?: { seq: number; deleted: boolean };
+  /** Who this device is in the history, for naming who saved each version (`savedBy`). */
+  private self?: Self;
 
-  constructor(app: App, plugin: CofferPlugin, path: string) {
+  constructor(app: App, plugin: CofferPlugin, path: string, first?: { seq: number; deleted: boolean }) {
     super(app);
     this.plugin = plugin;
     this.path = path;
     this.place = plugin.placeOf(path);
     this.name = fileName(path);
+    this.first = first;
   }
 
   onOpen(): void {
@@ -208,6 +215,7 @@ export class VersionsModal extends Modal {
     try {
       const look = await this.plugin.look(this.place.share);
       const key = vaultKey(this.place.path);
+      this.self = this.place.share ? this.plugin.selfIn(this.place.share, look.members) : undefined;
       this.versions = await listVersions(look.repo, look.lastSeq, key, look.cfg, look.now);
       const synced = look.remote.get(key);
       const newest = this.versions.find((v) => v.entry);
@@ -217,7 +225,12 @@ export class VersionsModal extends Modal {
     } catch (e) {
       this.error = `Could not load the versions: ${historyFailure(e)}`;
     }
-    if (!this.closed) this.render();
+    if (this.closed) return;
+    this.render();
+    const f = this.first;
+    // A version thinned out of history is not offered: then the list is shown as it is.
+    const shown = f && this.versions.find((v) => v.entry && (f.deleted ? v.seq < f.seq : v.seq === f.seq));
+    if (shown) this.pick(shown);
   }
 
   /** A version's bytes, downloaded once while the dialog is open; only the last few are kept. */
@@ -265,14 +278,14 @@ export class VersionsModal extends Modal {
     });
     days(list, this.versions, (v) => v.time, (el, v, time) => {
       if (!v.entry) {
-        row(el, time, `Deleted on ${deviceLabel(v.device, me)}`).addClass('is-deleted');
+        row(el, time, v.signer ? `Deleted by ${this.by(v)}` : `Deleted on ${deviceLabel(v.device, me)}`).addClass('is-deleted');
         return;
       }
       const r = row(el, time, '', () => this.pick(v));
       this.rows.set(v.seq, r);
       if (v === this.now) r.querySelector('.coffer-row-title')!.createSpan({ cls: 'coffer-tag', text: 'Now' });
       const sub = r.createDiv({ cls: 'coffer-row-sub' });
-      sub.createSpan({ text: `${deviceLabel(v.device, me)} · ${sizeLabel(v.entry.size)}` });
+      sub.createSpan({ text: `${this.by(v)} · ${sizeLabel(v.entry.size)}` });
       const counts = sub.createSpan({ cls: 'coffer-counts' });
       jobs.set(r, () => this.count(v, counts));
       this.observer!.observe(r);
@@ -307,6 +320,11 @@ export class VersionsModal extends Modal {
     if (Platform.isPhone) this.modalEl.scrollTop = 0;
   }
 
+  /** Who saved `v`: in a shared folder with members, the member, as Activity names them; elsewhere the device. */
+  private by(v: Version): string {
+    return savedBy(v, this.self ?? { device: this.plugin.settings.deviceName, changes: [] });
+  }
+
   /** On a phone the preview takes the whole screen; this goes back to the list where it was. */
   private unpick(): void {
     this.panes?.removeClass('is-picked');
@@ -334,10 +352,9 @@ export class VersionsModal extends Modal {
       p.createDiv({ cls: 'coffer-hint', text: 'Pick a version to see it here.' });
       return;
     }
-    const me = this.plugin.settings.deviceName;
     button(p, '‹ All versions', () => this.unpick()).buttonEl.addClass('coffer-back');
     p.createDiv({ cls: 'coffer-preview-title', text: `The version from ${momentLabel(v.time, Date.now())}` });
-    p.createDiv({ cls: 'coffer-row-sub', text: `Saved by ${deviceLabel(v.device, me)} · ${sizeLabel(v.entry!.size)}` });
+    p.createDiv({ cls: 'coffer-row-sub', text: `Saved by ${this.by(v)} · ${sizeLabel(v.entry!.size)}` });
     const pv = this.preview;
     if (!pv) {
       if (this.error) message(p, this.error);
@@ -662,7 +679,7 @@ export class RestoreEarlierModal extends Modal {
       f.createSpan({ text: this.share && !this.folder ? `${this.share.folder} (shared folder)` : this.share ? `${this.share.folder}/${this.folder}` : this.folder });
       button(f, 'Change', () => this.chooseFolder());
     }
-    if (whole && this.plugin.settings.shares.length) {
+    if (whole && folderShares(this.plugin.settings.shares).length) {
       c.createDiv({ cls: 'coffer-hint', text: 'Shared folders are not part of it: each has a history of its own. To restore one, choose it under “One folder”.' });
     }
 
@@ -829,6 +846,91 @@ export class RestoreEarlierModal extends Modal {
       );
     }
     button(buttonRow(c), 'Close', () => this.close(), 'cta');
+  }
+}
+
+/** Files listed under one change at most; the rest are counted. */
+const MAX_FILES = 20;
+const KIND_LABEL = { added: 'added', changed: 'changed', deleted: 'deleted' } as const;
+
+/**
+ * Who changed what in a shared folder, newest first, grouped by change: by member name (in a folder shared with a
+ * passphrase, by device), with the files each change added, changed and deleted, and who joined or was removed.
+ * Tapping a file shows its versions, the one that change made picked.
+ */
+export class ActivityModal extends Modal {
+  private plugin: CofferPlugin;
+  private share: Share;
+  private pages: ActivityPages<Look>;
+  private error = '';
+  private closed = false;
+
+  constructor(app: App, plugin: CofferPlugin, share: Share) {
+    super(app);
+    this.plugin = plugin;
+    this.share = share;
+    this.pages = new ActivityPages(
+      () => plugin.look(share),
+      (l, beforeSeq) => listActivity(l.repo, l.lastSeq, l.cfg, { limit: PAGE, beforeSeq }),
+    );
+  }
+
+  onOpen(): void {
+    this.modalEl.addClass('coffer-modal', 'coffer-past');
+    this.setTitle(`Activity in “${labelOf(this.share)}”`);
+    void this.loadMore();
+  }
+
+  onClose(): void {
+    this.closed = true;
+    this.contentEl.empty();
+  }
+
+  private async loadMore(): Promise<void> {
+    const loading = this.pages.next();
+    this.error = '';
+    this.render();
+    try {
+      await loading;
+    } catch (e) {
+      this.error = `Could not load the changes: ${historyFailure(e)}`;
+    }
+    this.render();
+  }
+
+  private render(): void {
+    if (this.closed) return;
+    const c = this.contentEl;
+    c.empty();
+    const { items, look, loading, more } = this.pages;
+    c.createEl('p', { cls: 'coffer-intro', text: `Changes to ${this.share.property ? `the notes shared in “${this.share.property}”` : 'this shared folder'}, newest first. Tap a file to see its versions.` });
+    const rows = look ? activityRows(items, this.plugin.selfIn(this.share, look.members)) : [];
+    const list = c.createDiv({ cls: 'coffer-list' });
+    days(list, rows, (r) => r.time, (el, r, time) => this.row(el, r, time));
+    message(c, this.error);
+    if (loading) c.createDiv({ cls: 'coffer-hint', text: 'Loading…' });
+    else if (!rows.length && !this.error && !more) c.createEl('p', { cls: 'coffer-intro', text: 'Nothing has changed in this folder yet.' });
+    const r = buttonRow(c);
+    button(r, 'Close', () => this.close());
+    if (more && !loading) button(r, items.length || !this.error ? 'Show earlier changes' : 'Try again', () => this.loadMore());
+  }
+
+  private row(parent: HTMLElement, r: ActivityRow, time: string): void {
+    if (!r.who) {
+      row(parent, r.text, time).addClass('coffer-activity-event');
+      return;
+    }
+    const box = parent.createDiv({ cls: 'coffer-activity' });
+    row(box, r.who, `${time} · ${r.text}`);
+    const files = box.createDiv({ cls: 'coffer-activity-files' });
+    for (const f of r.files.slice(0, MAX_FILES)) {
+      // Notes shared by a property keep their versions in the vault's history, which counts its changes apart.
+      const pick = this.share.property ? undefined : { seq: r.seq, deleted: f.kind === 'deleted' };
+      const el = row(files, f.path, '', () => new VersionsModal(this.app, this.plugin, vaultPath(this.share, f.path), pick).open());
+      el.querySelector('.coffer-row-title')!.createSpan({ cls: 'coffer-tag', text: KIND_LABEL[f.kind] });
+      if (f.kind === 'deleted') el.addClass('is-deleted');
+    }
+    if (r.files.length > MAX_FILES) files.createDiv({ cls: 'coffer-hint', text: `…and ${(r.files.length - MAX_FILES).toLocaleString()} more` });
   }
 }
 

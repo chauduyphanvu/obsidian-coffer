@@ -21,7 +21,8 @@ export async function chooseDeferred(plugin: CofferPlugin): Promise<void> {
   const looking = new Notice('Looking in storage…', 0);
   const left: Left[] = [];
   try {
-    for (const share of plugin.targets()) {
+    // Notes shared by a property only send: nothing is downloaded into the vault through them.
+    for (const share of plugin.targets().filter((s) => !s?.property)) {
       for (const f of await plugin.getEngine(share).deferred()) left.push({ share, ...f });
     }
   } catch (e) {

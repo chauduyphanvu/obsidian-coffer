@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { SyncResult } from '../src/core/engine.ts';
+import { RemovedError, SafetyError, UnverifiedError, type SyncResult } from '../src/core/engine.ts';
 import type { Why } from '../src/plugin/changes.ts';
-import { Pauses, Retries, nextPollDelay, pollPlaces, receivedChanges } from '../src/plugin/polling.ts';
+import { Pauses, Retries, nextPollDelay, pausesOn, pollPlaces, receivedChanges } from '../src/plugin/polling.ts';
 
 const S = 1000;
 const MIN = 60 * S;
@@ -33,7 +33,7 @@ test('the fast spell polls six times as often as the setting, never faster than 
 });
 
 const result = (over: Partial<SyncResult> = {}): SyncResult => ({
-  pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0, conflictCopies: [], skipped: 0, tooLarge: [], deferred: [], unsent: [], errors: [], commits: 0, rounds: 1, ...over,
+  pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0, conflictCopies: [], skipped: 0, tooLarge: [], deferred: [], unsent: [], arrived: [], errors: [], commits: 0, rounds: 1, ...over,
 });
 
 test('a sync counts as activity only when it received changes from another device, not when it only sent this one\'s', () => {
@@ -91,6 +91,13 @@ test('a poll does not ask a place that waits after failing, so a sync that keeps
   assert.deepEqual(asked, ['']);
 });
 
+test('a sync pauses its place only where trying again finds the same; a change no member made is tried again later, as the owner may remove it from elsewhere', () => {
+  assert.equal(pausesOn(new SafetyError(0, 100)), true);
+  assert.equal(pausesOn(new RemovedError()), true);
+  assert.equal(pausesOn(new UnverifiedError(7, 'it cannot be opened')), false);
+  assert.equal(pausesOn(new Error('HTTP 503')), false);
+});
+
 test('a retry, like any sync nobody asked for, leaves out a place paused before deleting many files', () => {
   const p = new Pauses();
   p.pause('');
@@ -144,4 +151,72 @@ test('a poll does not ask a paused place, so its storage, which keeps saying som
   asked.length = 0;
   assert.equal(await pollPlaces(['', 'w'], p, changed([''])), true);
   assert.deepEqual(asked, ['']);
+});
+
+const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+test('a poll asks several places at once, at most the limit, and each as soon as another has answered', async () => {
+  const ids = ['', 'a', 'b', 'c', 'd'];
+  const open = new Map<string, (changed: boolean) => void>();
+  const asked: string[] = [];
+  let active = 0;
+  let most = 0;
+  const changed = async (id: string) => {
+    asked.push(id);
+    active++;
+    most = Math.max(most, active);
+    try {
+      return await new Promise<boolean>((resolve) => open.set(id, resolve));
+    } finally {
+      active--;
+    }
+  };
+  const poll = pollPlaces(ids, new Pauses(), changed, 3);
+  await settle();
+  assert.deepEqual(asked, ['', 'a', 'b'], 'the first three at once, in order');
+  open.get('a')!(false);
+  await settle();
+  assert.deepEqual(asked, ['', 'a', 'b', 'c'], 'the next one takes the free place');
+  for (const id of ['', 'b', 'c']) open.get(id)!(false);
+  await settle();
+  open.get('d')!(false);
+  assert.equal(await poll, false);
+  assert.equal(most, 3);
+});
+
+test('once a place has changes no other is started, and the ones already asked are waited for', async () => {
+  const open = new Map<string, (changed: boolean) => void>();
+  const asked: string[] = [];
+  const changed = (id: string) => {
+    asked.push(id);
+    return new Promise<boolean>((resolve) => open.set(id, resolve));
+  };
+  let settled = false;
+  const poll = pollPlaces(['', 'a', 'b', 'c', 'd'], new Pauses(), changed, 2).then((due) => {
+    settled = true;
+    return due;
+  });
+  await settle();
+  open.get('a')!(true);
+  await settle();
+  assert.deepEqual(asked, ['', 'a'], 'nothing more is asked once a sync is due');
+  assert.equal(settled, false, 'the vault was asked too, and its answer comes first');
+  open.get('')!(false);
+  assert.equal(await poll, true);
+});
+
+test('a place that can not be asked, or is held back, does not stop the others from being asked', async () => {
+  const pauses = new Pauses();
+  pauses.pause('held');
+  const asked: string[] = [];
+  const changed = async (id: string) => {
+    asked.push(id);
+    if (id === 'down') throw new Error('offline');
+    return id === 'b';
+  };
+  assert.equal(await pollPlaces(['', 'held', 'down', 'a', 'b'], pauses, changed, 3), true);
+  assert.deepEqual(asked, ['', 'down', 'a', 'b']);
+  asked.length = 0;
+  assert.equal(await pollPlaces(['held', 'down'], pauses, changed, 3), false);
+  assert.deepEqual(asked, ['down']);
 });

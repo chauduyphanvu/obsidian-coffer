@@ -326,7 +326,7 @@ export async function listVersions(repo: Repo, lastSeq: number, path: string, cf
     }
     moved = undefined;
     if (ch) {
-      if (kept) out.push({ seq: c.seq, time: c.time, device: c.device, entry: entry === undefined ? ch.entry : entry });
+      if (kept) out.push({ seq: c.seq, time: c.time, device: c.device, ...(c.signer && { signer: c.signer }), entry: entry === undefined ? ch.entry : entry });
       kept = false;
       entry = undefined;
     }
@@ -363,6 +363,7 @@ export async function keptVersions(
   const older: Commit[] = [];
   let earliest: Commit | undefined;
   let base = 0;
+  let files: Map<string, Entry> | null = new Map();
   if (floor) {
     const thin = new Thinning(floor, at, after.find((c) => !c.moved)?.time);
     const walk = new Backward(reads, snaps, floor);
@@ -372,13 +373,16 @@ export async function keptVersions(
       if (thin.done) earliest = c;
     }
     if (earliest) {
-      base = snaps.filter((s) => s.seq <= earliest!.seq).pop()?.seq ?? 0;
-      for (let c: Commit | undefined; walk.seq > base && (c = await walk.next()); ) older.push(c);
+      // A snapshot found not to verify, in a shared folder with members, reads as missing: then from an older one.
+      const bases = snaps.filter((s) => s.seq <= earliest!.seq);
+      do {
+        base = bases.pop()?.seq ?? 0;
+        for (let c: Commit | undefined; walk.seq > base && (c = await walk.next()); ) older.push(c);
+        files = base ? await reads.snapshot(base) : new Map<string, Entry>();
+      } while (!files);
     }
   }
   const commits = older.reverse().filter((c) => c.seq > base).concat(after);
-  const files = base ? await reads.snapshot(base) : new Map<string, Entry>();
-  if (!files) throw new Error(`Snapshot ${base} cannot be read`);
 
   // Replay, keeping each entry that was current at the end of a kept moment: just before the next user
   // commit, so moves made in between are part of it. An entry is current from `since` until replaced.

@@ -1,6 +1,7 @@
 // The plugin's settings and what they translate into. No Obsidian import, so it runs under plain Node tests.
 import { DEFAULT_CONFIG, compileExcludes, resolveConfig, type SyncConfig } from '../core/config.ts';
 import { MIN_PASSPHRASE, WrongPassphraseError, openWithPassphrase, sealWithPassphrase } from '../core/crypto.ts';
+import { FOLLOW_PREFIX, INVITE_PREFIX, ownerKeysFrom, type MemberKeys, type Role } from '../core/members.ts';
 import { vaultKey } from '../core/paths.ts';
 import { DAY } from '../core/retention.ts';
 import { isInside } from '../core/scopedfs.ts';
@@ -45,6 +46,36 @@ export interface Share extends Storage {
    * keeps them for devices that did not add the share, and this device's vault sync leaves them alone: see shares.ts.
    */
   vaultCopies: string[];
+  /** In a shared folder with members, this device's role, as it joined or started it; '' in one shared with a passphrase. */
+  role: '' | Role;
+  /** In a shared folder with members, the secret holding this device's keys to it (`MemberKeys`, as JSON); otherwise ''. */
+  memberKeysSecret: string;
+  /**
+   * A shared folder followed with a follow link: the public address it is read from, with no storage keys; otherwise ''.
+   * Such a share's storage fields are unused.
+   */
+  followUrl: string;
+  /**
+   * This device still owes the vault's storage its offer of the share to the vault's other devices (offers.ts): 'add'
+   * once added here, 'update' after its keys changed, which rewrites an offer only where one is still kept.
+   */
+  offerPending: '' | 'add' | 'update';
+  /**
+   * A member's device that only reads: the files it sent the owner as a suggestion, by path inside the folder, each with
+   * a fingerprint of the text sent, so the same text is not sent again. Kept while the file is still not sent.
+   */
+  suggested: [string, string][];
+  /**
+   * Notes shared by a property (byproperty.ts): the name, which its notes carry as `share: <name>`; '' for a shared
+   * folder. Such a share's `folder` is '': its files are wherever they are in the vault.
+   */
+  property: string;
+  /** Notes shared by a property: files the sharer took out of it, by vault path; see `PropertyShare`. */
+  removed: string[];
+  /** Notes shared by a property: attachments the sharer said to share after they waited, by vault path. */
+  approved: string[];
+  /** Notes shared by a property: attachments that wait for the sharer, brought by a suggestion taken in, by vault path. */
+  ask: string[];
 }
 
 export interface Settings extends Storage {
@@ -71,6 +102,10 @@ export interface Settings extends Storage {
   /** Conflict copies made here that still exist, so they stay on the problem list until dealt with. */
   conflictCopies: string[];
   shares: Share[];
+  /** Shared folders offered by the vault's other devices (offers.ts) that this device has announced, by share id. */
+  offersTold: string[];
+  /** Offers the user chose not to add on this device, by share id. */
+  offersHidden: string[];
 }
 
 export function defaultSettings(isMobile: boolean): Settings {
@@ -106,6 +141,8 @@ export function defaultSettings(isMobile: boolean): Settings {
     lastSuccess: 0,
     conflictCopies: [],
     shares: [],
+    offersTold: [],
+    offersHidden: [],
   };
 }
 
@@ -127,7 +164,11 @@ const STORAGE_DEFAULTS: Storage = {
 
 /** A share with every field present, as saved by any version. */
 export function shareWith(fields: Partial<Share> & Pick<Share, 'id' | 'folder'>): Share {
-  return { ...STORAGE_DEFAULTS, lastSuccess: 0, lastCleanup: 0, conflictCopies: [], missing: false, vaultCopies: [], ...fields };
+  return {
+    ...STORAGE_DEFAULTS, lastSuccess: 0, lastCleanup: 0, conflictCopies: [], missing: false, vaultCopies: [], role: '', memberKeysSecret: '', followUrl: '', offerPending: '', suggested: [],
+    property: '', removed: [], approved: [], ask: [],
+    ...fields,
+  };
 }
 
 /** The settings as saved, with defaults for whatever an older version did not save. */
@@ -137,24 +178,39 @@ export function loadSettings(saved: Partial<Settings> | null, isMobile: boolean)
   return s;
 }
 
+/** Whether `s` shares notes by a property rather than a folder. */
+export const byProperty = (s: Pick<Share, 'property'>) => !!s.property;
+
+/** The shares that are folders of this vault, which take their folder out of the vault's sync. */
+export const folderShares = (shares: Share[]) => shares.filter((x) => !x.property);
+
+/** What a share is called on screen: its folder, or for notes shared by a property, its name. */
+export const labelOf = (s: Pick<Share, 'property' | 'folder'>) => s.property || s.folder;
+
 /** Reads a secret by the name a setting holds; '' when unset. */
 export type SecretLookup = (name: string) => string;
 
-/** Storage, its credentials and the passphrase are all there. */
-export function isConfigured(s: Storage, secret: SecretLookup): boolean {
+/** Storage as a shared folder has it, which may be a public address it follows instead (`Share.followUrl`). */
+type Place = Storage & { followUrl?: string };
+
+/** Storage, its credentials and what opens it are all there: the passphrase, or in a shared folder with members its keys. */
+export function isConfigured(s: Place & { memberKeysSecret?: string }, secret: SecretLookup): boolean {
+  if (s.followUrl) return !!secret(s.memberKeysSecret ?? '');
   const storage =
     s.storageType === 'webdav'
       ? s.webdavUrl && s.webdavUser && secret(s.webdavPasswordSecret)
       : s.endpoint && s.bucket && secret(s.accessKeySecret) && secret(s.secretKeySecret);
-  return !!(storage && secret(s.passphraseSecret));
+  return !!(storage && secret(s.memberKeysSecret || s.passphraseSecret));
 }
 
 /** Enough to try a connection. */
-export function hasStorageAddress(s: Storage): boolean {
+export function hasStorageAddress(s: Place): boolean {
+  if (s.followUrl) return true;
   return !(s.storageType === 'webdav' ? !s.webdavUrl : !s.endpoint || !s.bucket);
 }
 
-export function remoteSpec(s: Storage, secret: SecretLookup): RemoteSpec {
+export function remoteSpec(s: Place, secret: SecretLookup): RemoteSpec {
+  if (s.followUrl) return { type: 'follow', url: s.followUrl.trim() };
   if (s.storageType === 'webdav') {
     return { type: 'webdav', url: s.webdavUrl.trim(), username: s.webdavUser, password: secret(s.webdavPasswordSecret) };
   }
@@ -172,6 +228,12 @@ export function remoteSpec(s: Storage, secret: SecretLookup): RemoteSpec {
 
 /** Where an engine keeps this device's sync state, inside the plugin's own folder: the vault's, or share `id`'s. */
 export const statePath = (pluginDir: string, id = '') => `${pluginDir}/${id ? `state-${id}` : 'state'}.json`;
+
+/**
+ * Where a shared folder with members keeps the newest member list this device accepted: apart from its sync state,
+ * which carrying on from storage or downloading again resets, and this must survive.
+ */
+export const positionPath = (pluginDir: string, id: string) => `${pluginDir}/members-${id}.json`;
 
 const tuning = (s: Settings) => ({
   conflictStrategy: s.conflictStrategy,
@@ -208,11 +270,25 @@ export function syncConfig(s: Settings, configDir: string, pluginDir: string): S
       statePath(pluginDir),
       `${pluginDir}/data.json`,
       ...s.exclude.split('\n'),
-      ...s.shares.flatMap((x) => [`${vaultKey(x.folder)}/`, ...x.vaultCopies.filter((key) => !isInside(x.folder, key)), statePath(pluginDir, x.id)]),
+      // Notes shared by a property stay in the vault's sync: only their share's own files are left out.
+      ...s.shares.flatMap((x) => [
+        ...(x.property ? [] : [`${vaultKey(x.folder)}/`, ...x.vaultCopies.filter((key) => !isInside(x.folder, key))]),
+        statePath(pluginDir, x.id),
+        positionPath(pluginDir, x.id),
+      ]),
     ],
     ...tuning(s),
     readOnly: s.readOnly,
   });
+}
+
+/**
+ * Notes shared by a property, with vault paths: never more than the vault's own sync reaches here (shared folders and
+ * what is left out included), and never the settings folder or a name starting with a dot, even when the vault syncs them.
+ */
+export function propertyConfig(s: Settings, configDir: string, pluginDir: string): SyncConfig {
+  const vault = syncConfig(s, configDir, pluginDir);
+  return resolveConfig({ ...vault, exclude: [...vault.exclude, `${configDir}/`, '.*', '**/.*/'], readOnly: false });
 }
 
 /**
@@ -229,7 +305,7 @@ export function shareConfig(s: Settings, share: Share, configDir: string): SyncC
     if (!p.includes('/') || p.startsWith('**/')) exclude.push(p);
     else if (p.startsWith(at) && p.length > at.length) exclude.push(p.slice(at.length));
   }
-  for (const other of s.shares) if (isInside(share.folder, other.folder)) exclude.push(`${vaultKey(other.folder).slice(at.length)}/`);
+  for (const other of folderShares(s.shares)) if (isInside(share.folder, other.folder)) exclude.push(`${vaultKey(other.folder).slice(at.length)}/`);
   // Obsidian's file list has no name starting with a dot, at any depth of a shared folder: see `unlisted`.
   exclude.push('.*', '**/.*/');
   return resolveConfig({ deviceName: s.deviceName, configDir, exclude, ...tuning(s), readOnly: share.readOnly });
@@ -242,15 +318,16 @@ const folded = (path: string) => vaultKey(path).toLowerCase();
 
 /**
  * Why `folder` cannot be a shared folder in this vault, or '' when it can. Folders are compared ignoring case, as
- * some file systems do. `id` is a share being changed, which does not count against itself.
+ * some file systems do. `id` is a share being changed, which does not count against itself. `byProperty` are the files
+ * notes shared by a property hold here: a shared folder would freeze them there, so it may not hold any.
  */
-export function folderProblem(s: Settings, folder: string, configDir: string, pluginDir: string, id = ''): string {
+export function folderProblem(s: Settings, folder: string, configDir: string, pluginDir: string, id = '', byProperty: Iterable<string> = []): string {
   if (!folder) return 'A shared folder is a folder inside the vault. The whole vault can not be one.';
   if (folder !== normalFolder(folder) || folder.split('/').some((p) => p === '.' || p === '..')) return 'That is not a folder name.';
   if (/[*?"<>:|]/.test(folder)) return 'Folder names can not contain * ? " < > : or |.';
   if (folded(folder) === folded(configDir) || isInside(folded(configDir), folded(folder))) return `The settings folder (${configDir}) can not be shared.`;
   if (folder.split('/').some((p) => p.startsWith('.'))) return 'Obsidian does not show folders whose name starts with a dot, so they can not be shared.';
-  for (const other of s.shares) {
+  for (const other of folderShares(s.shares)) {
     if (other.id === id) continue;
     const [a, b] = [folded(folder), folded(other.folder)];
     if (a === b) return `“${other.folder}” is already a shared folder.`;
@@ -259,21 +336,27 @@ export function folderProblem(s: Settings, folder: string, configDir: string, pl
   }
   const excluded = compileExcludes(syncConfig({ ...s, shares: [] }, configDir, pluginDir).exclude);
   if (excluded(`${vaultKey(folder)}/`)) return `“${folder}” is left out of sync on this device (What to sync → Leave out), so it can not be shared.`;
+  const inside = [...byProperty].filter((key) => isInside(folded(folder), folded(key))).length;
+  const property = s.shares.find((x) => x.property);
+  if (inside && property) {
+    return `“${folder}” holds ${inside === 1 ? 'a file' : `${inside.toLocaleString()} files`} shared in “${property.property}”. Remove ${inside === 1 ? 'it' : 'them'} from “${property.property}” first, or choose another folder.`;
+  }
   return '';
 }
 
 /** Where `s` keeps its data: the same text for any two settings that reach the same place. */
-export function storageLocation(s: Storage): string {
+export function storageLocation(s: Place): string {
+  if (s.followUrl) return `follow ${withScheme(s.followUrl).toLowerCase()}`;
   if (s.storageType === 'webdav') return `webdav ${withScheme(s.webdavUrl).toLowerCase()}`;
   return `s3 ${withScheme(s.endpoint).toLowerCase()} ${s.bucket.trim()} ${s.prefix.replace(/^\/+|\/+$/g, '')}`;
 }
 
 /** Why a share cannot sync with `storage`, or '' when it can. `id` is a share being changed. */
-export function storageProblem(s: Settings, storage: Storage, id = ''): string {
+export function storageProblem(s: Settings, storage: Place, id = ''): string {
   const here = storageLocation(storage);
   if (hasStorageAddress(s) && storageLocation(s) === here) return 'That is where this vault itself syncs. A shared folder needs a location of its own.';
   const other = s.shares.find((x) => x.id !== id && storageLocation(x) === here);
-  return other ? `The shared folder “${other.folder}” already syncs with that location.` : '';
+  return other ? `${other.property ? 'The shared notes' : 'The shared folder'} “${labelOf(other)}” already ${other.property ? 'sync' : 'syncs'} with that location.` : '';
 }
 
 const origin = (url: string) => {
@@ -285,7 +368,8 @@ const origin = (url: string) => {
 };
 
 /** `a` reaches the bucket or server of `b` with the same keys, so whoever holds one could change the other. */
-export function sameKeys(a: Storage, b: Storage, secret: SecretLookup): boolean {
+export function sameKeys(a: Place, b: Place, secret: SecretLookup): boolean {
+  if (a.followUrl || b.followUrl) return false;
   if (a.storageType !== b.storageType || !hasStorageAddress(a) || !hasStorageAddress(b)) return false;
   if (a.storageType === 'webdav') return origin(a.webdavUrl) === origin(b.webdavUrl) && a.webdavUser.trim() === b.webdavUser.trim();
   return withScheme(a.endpoint).toLowerCase() === withScheme(b.endpoint).toLowerCase() && a.bucket.trim() === b.bucket.trim() && secret(a.accessKeySecret) === secret(b.accessKeySecret);
@@ -332,11 +416,21 @@ const SHARE_CODE = 'coffershare2.';
 /** Version 1 (0.1 and 0.2) sealed at a fixed 200,000 iterations and left the count out. */
 const CODE = /^coffer(share)?([12])\./;
 
-/** What a code is: a vault's setup code, an invite to a shared folder, or neither. */
+/** What a code is: a vault's setup code, an invite to a shared folder (with a passphrase, a member's, or a follow link), or neither. */
 export function codeKind(code: string): 'vault' | 'share' | undefined {
+  if (isMemberInvite(code) || isFollowLink(code)) return 'share';
   const m = CODE.exec(code.trim());
   return m ? (m[1] ? 'share' : 'vault') : undefined;
 }
+
+/** An invite of a member to a shared folder with members, which needs no passphrase: the link is all it takes. */
+export const isMemberInvite = (code: string) => code.trim().startsWith(INVITE_PREFIX);
+
+/** A follow link, which reads a public copy of a shared folder with members: no passphrase and no storage keys. */
+export const isFollowLink = (code: string) => code.trim().startsWith(FOLLOW_PREFIX);
+
+/** A link that opens with nothing typed: a member's invite or a follow link. */
+export const opensAlone = (code: string) => isMemberInvite(code) || isFollowLink(code);
 
 /** The PBKDF2 cost a link is sealed at: the vault's own, and never less than a new vault gets. */
 export function codeIterations(vault?: number): number {
@@ -344,19 +438,51 @@ export function codeIterations(vault?: number): number {
 }
 
 /**
- * Storage settings and keys, encrypted under the passphrase, for pasting into another device. With `folder`, an
- * invite to a shared folder, which suggests that folder name to whoever joins and, from a place that only receives,
- * turns that on for them. A vault's link leaves it to the device that joins.
+ * Where `s` is stored and the keys that reach it, as a setup code and a member's invite carry them. The same fields in
+ * both, so whatever reads one reads the other.
  */
-export async function encodeSetupCode(s: Storage, secret: SecretLookup, folder?: string, iterations = codeIterations()): Promise<string> {
+export function storagePayload(s: Storage, secret: SecretLookup): Record<string, unknown> {
   const payload: Record<string, unknown> = {};
   for (const f of SETUP_FIELDS) payload[f] = s[f];
   for (const [field, setting] of SETUP_SECRETS) payload[field] = secret(s[setting]);
+  return payload;
+}
+
+/**
+ * The storage settings a payload of `storagePayload` describes, and its keys as secrets to store first, named by
+ * `name`. A member's invite is not sealed, so every field is checked to be what it should be.
+ */
+export function storageFromPayload(p: Record<string, unknown>, name: (base: string) => string): { storage: Partial<Storage>; secrets: [string, string][] } {
+  const storage: Record<string, unknown> = { storageType: p.storageType === 'webdav' ? 'webdav' : 's3' };
+  for (const f of SETUP_FIELDS) {
+    if (f === 'storageType') continue;
+    if (f === 'pathStyle') storage[f] = p[f] !== false;
+    else storage[f] = typeof p[f] === 'string' ? p[f] : '';
+  }
+  const secrets: [string, string][] = [];
+  for (const [field, setting, base] of SETUP_SECRETS) {
+    const value = p[field];
+    storage[setting] = typeof value === 'string' && value ? name(base) : '';
+    if (storage[setting]) secrets.push([storage[setting] as string, value as string]);
+  }
+  return { storage, secrets };
+}
+
+/**
+ * Storage settings and keys, encrypted under the passphrase, for pasting into another device. With `folder`, an
+ * invite to a shared folder, which suggests that folder name to whoever joins and, from a place that only receives,
+ * turns that on for them. A vault's link leaves it to the device that joins. `extra` adds to what it carries, as an
+ * owner link adds the owner's keys.
+ */
+export async function encodeSetupCode(s: Storage, secret: SecretLookup, folder?: string, iterations = codeIterations(), extra: Record<string, unknown> = {}): Promise<string> {
+  const payload = { ...storagePayload(s, secret), ...extra };
   if (folder !== undefined) {
     if (s.readOnly) payload.readOnly = true;
     payload.folder = folder;
   }
-  return `${folder === undefined ? VAULT_CODE : SHARE_CODE}${await sealWithPassphrase(JSON.stringify(payload), secret(s.passphraseSecret), iterations)}`;
+  const passphrase = secret(s.passphraseSecret);
+  if (!passphrase) throw new Error('This device does not have the passphrase that seals the link');
+  return `${folder === undefined ? VAULT_CODE : SHARE_CODE}${await sealWithPassphrase(JSON.stringify(payload), passphrase, iterations)}`;
 }
 
 /**
@@ -393,20 +519,14 @@ async function openSealed(code: string, passphrase: string): Promise<string> {
 }
 
 async function openCode(code: string, passphrase: string, name: (base: string) => string) {
-  const p = JSON.parse(await openSealed(code.trim(), passphrase)) as Record<string, string | boolean>;
-  const settings: Record<string, unknown> = { storageType: p.storageType === 'webdav' ? 'webdav' : 's3' };
-  for (const f of SETUP_FIELDS) if (f !== 'storageType') settings[f] = p[f];
-  const secrets: [string, string][] = [];
-  const keep = (base: string, value: string | boolean) => {
-    const id = name(base);
-    if (value) secrets.push([id, String(value)]);
-    return value ? id : '';
-  };
-  for (const [field, setting, id] of SETUP_SECRETS) settings[setting] = keep(id, p[field]);
+  const p = JSON.parse(await openSealed(code.trim(), passphrase)) as Record<string, unknown>;
+  const { storage, secrets } = storageFromPayload(p, name);
+  const settings: Record<string, unknown> = { ...storage };
   const invite = typeof p.folder === 'string';
   if (invite && p.readOnly === true) settings.readOnly = true;
-  settings.passphraseSecret = keep('coffer-passphrase', passphrase);
-  return { settings, secrets, folder: invite ? (p.folder as string) : '' };
+  settings.passphraseSecret = passphrase ? name('coffer-passphrase') : '';
+  if (passphrase) secrets.push([settings.passphraseSecret as string, passphrase]);
+  return { settings, secrets, folder: invite ? (p.folder as string) : '', member: ownerKeysFrom(p) };
 }
 
 /** The settings a setup code fills in, and the secrets to store first, in order, named for `vault`. */
@@ -419,13 +539,23 @@ export async function decodeSetupCode(code: string, passphrase: string, vault: s
 /**
  * An invite's storage settings and the secrets to store first, named for share `id` of `vault`, and the name of the
  * folder it was shared from. The name comes from someone else, so only its last part is kept, to be checked like any.
+ * An owner link, which sets up another of the owner's devices for a shared folder with members, also gives the
+ * owner's keys (`member`).
  */
-export async function decodeInvite(code: string, passphrase: string, vault: string, id: string): Promise<{ storage: Partial<Storage>; secrets: [string, string][]; folder: string }> {
+export async function decodeInvite(
+  code: string,
+  passphrase: string,
+  vault: string,
+  id: string,
+): Promise<{ storage: Partial<Storage>; secrets: [string, string][]; folder: string; member?: MemberKeys }> {
   const kind = codeKind(code);
-  if (kind !== 'share') throw new Error(kind === 'vault' ? 'This is a setup link for a whole vault, not an invite to a shared folder.' : 'That is not an invite link.');
-  const { settings, secrets, folder } = await openCode(code, passphrase, (base) => shareSecretName(base, vault, id));
-  return { storage: settings, secrets, folder: normalFolder(folder).split('/').pop() ?? '' };
+  if (kind !== 'share' || opensAlone(code)) throw new Error(kind === 'vault' ? 'This is a setup link for a whole vault, not an invite to a shared folder.' : 'That is not an invite link.');
+  const { settings, secrets, folder, member } = await openCode(code, passphrase, (base) => shareSecretName(base, vault, id));
+  return { storage: settings, secrets, folder: lastPart(folder), ...(member && { member }) };
 }
+
+/** The last part of a folder name someone else suggests, to be checked like any. */
+export const lastPart = (folder: string) => normalFolder(folder).split('/').pop() ?? '';
 
 export type Provider = 'r2' | 'b2' | 'aws' | 's3' | 'webdav';
 
@@ -498,7 +628,14 @@ export function providerOf(s: Storage): Provider {
 }
 
 /** One line naming where this vault, or a shared folder, syncs to. */
-export function describeStorage(s: Storage): string {
+export function describeStorage(s: Place): string {
+  if (s.followUrl) {
+    try {
+      return `Public copy · ${new URL(s.followUrl.trim()).host}`;
+    } catch {
+      return 'Public copy';
+    }
+  }
   if (s.storageType === 'webdav') {
     try {
       return `WebDAV · ${new URL(withScheme(s.webdavUrl)).host}`;

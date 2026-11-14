@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -11,11 +11,15 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { resolveConfig } from '../src/core/config.ts';
 import { listDevices } from '../src/core/devices.ts';
 import { SafetyError, SyncEngine, type SyncResult } from '../src/core/engine.ts';
+import { decodeInvite, encodeFollow, encodeInvite } from '../src/core/members.ts';
+import { createMemberShare } from '../src/core/membership.ts';
+import { seqKey } from '../src/core/repo.ts';
 import type { RemoteStore } from '../src/core/types.ts';
+import { placeOf } from '../src/node/member.ts';
 import { FolderStore, NodeFS } from '../src/node/nodefs.ts';
 import { SyncLoop, watchVault, type LoopOptions } from '../src/node/watch.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
-import { Device } from './helpers.ts';
+import { DAY, Device, TEST_CONFIG, rawRepo } from './helpers.ts';
 
 const PASSPHRASE = 'pw-for-tests';
 // COFFER_CLI points the same tests at the release bundle, dist/coffer.js.
@@ -43,9 +47,10 @@ const bare = (cwd: string, args: string[], env: Record<string, string> = {}) =>
   spawnSync('node', [CLI, ...args], { cwd, encoding: 'utf8', env: { ...process.env, COFFER_PASSPHRASE: PASSPHRASE, ...env } });
 
 /** As `bare`, for a run that must leave this process free to answer, as a test server does. */
-const bareAsync = (args: string[], env: Record<string, string>) =>
+const bareAsync = (args: string[], env: Record<string, string>, cwd?: string, input?: string) =>
   new Promise<{ status: number | null; stdout: string; stderr: string }>((done) => {
-    const child = spawn('node', [CLI, ...args], { env: { ...process.env, ...env } });
+    const child = spawn('node', [CLI, ...args], { env: { ...process.env, ...env }, cwd });
+    if (input !== undefined) child.stdin.end(input);
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8').on('data', (d: string) => (stdout += d));
@@ -555,7 +560,7 @@ test('a folder remote that disappears is reported missing by every operation and
 });
 
 const result = (over: Partial<SyncResult> = {}): SyncResult => ({
-  pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0, conflictCopies: [], skipped: 0, tooLarge: [], deferred: [], unsent: [], errors: [], commits: 0, rounds: 1, ...over,
+  pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0, conflictCopies: [], skipped: 0, tooLarge: [], deferred: [], unsent: [], arrived: [], errors: [], commits: 0, rounds: 1, ...over,
 });
 
 const immediate = () => new Promise<void>((done) => setImmediate(done));
@@ -1270,5 +1275,654 @@ test('cli: verify says which files have an earlier version that can no longer be
     assert.match(repair.stdout, /^earlier versions cannot be restored: note\.md\n/);
   } finally {
     t.done();
+  }
+});
+
+// Shared folders with members. The owner's device runs in this process over a storage folder, a WebDAV server over that
+// folder stands in for the provider (keys that write, keys that only read, and an address anyone may read), and each
+// CLI device joins with a link and syncs through that server.
+
+/** What the CLI is run with for a shared folder with members: nothing it should read, and a wrong key it must not use. */
+const MEMBER_ENV = { COFFER_PASSPHRASE: '', COFFER_ACCESS_KEY: '', COFFER_SECRET_KEY: '', COFFER_WEBDAV_PASSWORD: 'wrong-key-from-the-environment' };
+
+/** A WebDAV server over `root`. `seen` lists each request with the account that made it ('' for none); with `publicRead`, anyone may GET. */
+async function davServer(root: string) {
+  const accounts = new Map<string, { password: string; write: boolean }>();
+  const seen: { user: string; method: string; key: string }[] = [];
+  const state = { publicRead: false };
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => chunks.push(c));
+    req.on('end', () => {
+      const method = req.method!;
+      const key = decodeURIComponent(new URL(req.url!, 'http://x').pathname).replace(/^\/dav\/?/, '').replace(/\/+$/, '');
+      const file = join(root, ...key.split('/').filter(Boolean));
+      const [name = '', ...pw] = Buffer.from(/^Basic (.+)$/.exec(req.headers.authorization ?? '')?.[1] ?? '', 'base64').toString('utf8').split(':');
+      const user = accounts.get(name)?.password === pw.join(':') ? name : '';
+      seen.push({ user, method, key });
+      const reply = (status: number, data?: Buffer | string, headers: Record<string, string> = {}) => {
+        res.writeHead(status, headers);
+        res.end(data);
+      };
+      if (!user && !(method === 'GET' && state.publicRead)) return reply(401);
+      if (method !== 'GET' && method !== 'PROPFIND' && !accounts.get(user)?.write) return reply(403);
+      if (method === 'GET') {
+        if (!existsSync(file) || !statSync(file).isFile()) return reply(404);
+        const data = readFileSync(file);
+        const range = /^bytes=(\d+)-(\d+)$/.exec(String(req.headers.range ?? ''));
+        if (!range) return reply(200, data);
+        return Number(range[1]) >= data.length ? reply(416) : reply(206, data.subarray(Number(range[1]), Number(range[2]) + 1));
+      }
+      if (method === 'PUT') {
+        if (req.headers['if-none-match'] === '*' && existsSync(file)) return reply(412);
+        mkdirSync(dirname(file), { recursive: true });
+        writeFileSync(file, Buffer.concat(chunks));
+        return reply(201);
+      }
+      if (method === 'DELETE') {
+        if (!existsSync(file)) return reply(404);
+        rmSync(file, { recursive: true });
+        return reply(204);
+      }
+      if (method === 'MKCOL') {
+        mkdirSync(file, { recursive: true });
+        return reply(201);
+      }
+      if (method === 'PROPFIND' && existsSync(file)) {
+        const rows = readdirSync(file)
+          .filter((n) => !n.endsWith('.tmp') && statSync(join(file, n)).isFile())
+          .map((n) => {
+            const st = statSync(join(file, n));
+            return `<d:response><d:href>/dav/${key}/${encodeURIComponent(n)}</d:href><d:propstat><d:prop><d:resourcetype/><d:getcontentlength>${st.size}</d:getcontentlength><d:getlastmodified>${st.mtime.toUTCString()}</d:getlastmodified></d:prop></d:propstat></d:response>`;
+          });
+        return reply(207, `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">${rows.join('')}</d:multistatus>`, { 'content-type': 'application/xml' });
+      }
+      return reply(404);
+    });
+  });
+  await new Promise<void>((done) => server.listen(0, '127.0.0.1', done));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/dav`;
+  return { url, accounts, seen, state, close: () => server.close() };
+}
+
+/** A member share started by an owner's device, its storage served by `davServer`, and a way to make a CLI device for it. */
+async function memberHarness() {
+  const dir = mkdtempSync(join(tmpdir(), 'coffer-cli-'));
+  const remote = join(dir, 'remote');
+  const dav = await davServer(remote);
+  dav.accounts.set('writer', { password: 'w-pw', write: true });
+  dav.accounts.set('reader', { password: 'r-pw', write: false });
+  const store = new FolderStore(remote);
+  const clock = { now: Date.now() };
+  const keys = await createMemberShare(store, { owner: 'Vu', device: 'owner-mac', passphrase: 'owner passphrase', kdfIterations: 1000, chunk: TEST_CONFIG.chunk!, now: clock.now });
+  const owner = new Device('owner-mac', store, clock, {}, keys);
+  await owner.sync();
+  const where = (user: string, password: string) => ({ storageType: 'webdav', webdavUrl: dav.url, webdavUser: user, webdavPassword: password });
+  const link = async (name: string, role: 'write' | 'read', o: { expires?: number; folder?: string } = {}) => {
+    const grant = await owner.engine.invite({ name, role, expires: o.expires ?? clock.now + 7 * DAY });
+    return encodeInvite({ ...grant, storage: role === 'write' ? where('writer', 'w-pw') : where('reader', 'r-pw'), share: 'Family', folder: o.folder ?? 'Family' });
+  };
+  const followLink = async (name: string) => encodeFollow({ ...(await owner.engine.invite({ name, role: 'read', expires: 0 })), url: dav.url, share: 'Family', folder: 'Family' });
+  const device = (name: string) => {
+    const vault = join(dir, name);
+    const config = join(dir, `${name}.json`);
+    return {
+      vault,
+      config,
+      keys: join(vault, '.coffer', 'keys.json'),
+      run: (args: string[], env: Record<string, string> = {}) => bareAsync([...args, `--config=${config}`], { ...MEMBER_ENV, ...env }),
+      join: (text: string) => bareAsync(['join', text, `--vault=${vault}`, `--config=${config}`], MEMBER_ENV),
+      watch: (...args: string[]) => watching([...args, `--config=${config}`], MEMBER_ENV),
+    };
+  };
+  const lastSigner = async () => {
+    const raw = await rawRepo(store, keys);
+    return (await raw.readCommit((await raw.commitSeqsAfter(0)).at(-1)!))!.signer;
+  };
+  return { dir, remote, dav, store, keys, owner, clock, link, followLink, device, lastSigner, done: () => (dav.close(), rmSync(dir, { recursive: true, force: true })) };
+}
+
+/** `watch` running, for a test to look at and stop. */
+function watching(args: string[], env: Record<string, string>) {
+  const child = spawn('node', [CLI, 'watch', ...args], { env: { ...process.env, ...env } });
+  let out = '';
+  let err = '';
+  child.stdout.setEncoding('utf8').on('data', (d: string) => (out += d));
+  child.stderr.setEncoding('utf8').on('data', (d: string) => (err += d));
+  const exited = new Promise<number | null>((done) => child.once('exit', (code) => done(code)));
+  return { child, exited, out: () => out, err: () => err };
+}
+
+const WAITING = "waiting for Vu's device to confirm this device; until then it only receives";
+
+test("cli join: a write invite writes a config with no secret in it and keys only its owner can read, waits for the owner's device, then sends signed changes", async () => {
+  const h = await memberHarness();
+  try {
+    h.owner.fs.put('plan.md', 'v1\n');
+    await h.owner.sync();
+    const invite = await h.link('Lan', 'write');
+    const lan = h.device('lan');
+    const joined = await lan.join(invite);
+    assert.equal(joined.status, 0, joined.stderr);
+    assert.match(joined.stdout, /^joined “Family” as a member who writes\n/);
+    assert.match(joined.stdout, /this device only receives until the owner's device confirms it/);
+    assert.equal(joined.stderr, '');
+
+    assert.deepEqual(JSON.parse(readFileSync(lan.config, 'utf8')), { vault: lan.vault, remote: { type: 'webdav', url: h.dav.url, username: 'writer' }, share: 'Family' });
+    const kept = JSON.parse(readFileSync(lan.keys, 'utf8')) as { member: { id: string; master: string; key: { d: string } }; storage: object };
+    assert.deepEqual(kept.storage, { webdavPassword: 'w-pw' });
+    assert.equal(kept.member.id, decodeInvite(invite).member);
+    if (process.platform !== 'win32') assert.equal(statSync(lan.keys).mode & 0o777, 0o600);
+    const configText = readFileSync(lan.config, 'utf8');
+    for (const secret of ['w-pw', kept.member.master, kept.member.key.d, decodeInvite(invite).secret]) assert.ok(!configText.includes(secret), 'the config holds no secret');
+    assert.equal((await lan.run(['check'])).status, 0);
+
+    const first = await lan.run(['sync']);
+    assert.equal(first.status, 0, first.stderr);
+    assert.match(first.stdout, /^sent 0, received 1,/);
+    assert.equal(first.stderr, `${WAITING}\n`);
+    assert.equal(readFileSync(join(lan.vault, 'plan.md'), 'utf8'), 'v1\n');
+
+    put(lan.vault, 'lan.md', 'by lan\n');
+    const held = await lan.run(['sync']);
+    assert.match(held.stdout, /^sent 0, received 0,/);
+    assert.equal(held.stderr, `not sent, this device only receives: lan.md\n${WAITING}\n`);
+
+    assert.deepEqual(await h.owner.engine.confirmJoins(), [kept.member.id]);
+    const sent = await lan.run(['sync']);
+    assert.match(sent.stdout, /^sent 1,/);
+    assert.equal(sent.stderr, '');
+    assert.equal(await h.lastSigner(), kept.member.id, 'the change is signed with the key this device made');
+    await h.owner.sync();
+    assert.equal(h.owner.fs.text('lan.md'), 'by lan\n');
+    assert.equal((await lan.run(['verify'])).status, 0);
+    assert.equal(existsSync(join(h.remote, 'dev')), false, 'no heartbeat is written into a shared folder with members');
+  } finally {
+    h.done();
+  }
+});
+
+test('cli join: a read invite and a follow link only receive, never write to storage, and say so when asked for what would write or list', async () => {
+  const h = await memberHarness();
+  try {
+    h.owner.fs.put('plan.md', 'v1\n');
+    await h.owner.sync();
+    const mai = h.device('mai');
+    const joinedRead = await mai.join(await h.link('Mai', 'read'));
+    assert.equal(joinedRead.status, 0, joinedRead.stderr);
+    assert.match(joinedRead.stdout, /^joined “Family” as a member who reads\n/);
+    assert.deepEqual(JSON.parse(readFileSync(mai.config, 'utf8')), { vault: mai.vault, remote: { type: 'webdav', url: h.dav.url, username: 'reader' }, share: 'Family', sync: { readOnly: true } });
+    const synced = await mai.run(['sync']);
+    assert.equal(synced.status, 0, synced.stderr);
+    assert.match(synced.stdout, /^sent 0, received 1,/);
+    put(mai.vault, 'mai.md', 'mine\n');
+    assert.equal((await mai.run(['sync'])).stderr, 'not sent, this device only receives: mai.md\n');
+    for (const [args, why] of [
+      [['repair'], 'it cannot store data in storage again'],
+      [['clean'], 'it does not clean up storage'],
+      [['restore', 'plan.md', '1'], 'a restored file would never be sent'],
+    ] as const) {
+      const r = await mai.run([...args]);
+      assert.equal(r.status, 1, args.join(' '));
+      assert.equal(r.stderr, `this device only receives changes, so ${why}; run ${args[0]} from a device that sends them\n`);
+    }
+    const passphrase = await mai.run(['change-passphrase']);
+    assert.equal(passphrase.status, 1);
+    assert.equal(passphrase.stderr, 'change-passphrase does not work on a shared folder with members: a device joins it with the keys of an invite and has no passphrase to change\n');
+    assert.equal((await mai.run(['verify'])).status, 0);
+    assert.match((await mai.run(['history', 'plan.md'])).stdout, /3 bytes/);
+    assert.deepEqual(h.dav.seen.filter((r) => r.user === 'reader' && r.method !== 'GET' && r.method !== 'PROPFIND'), [], 'its key was never used to write');
+
+    h.dav.state.publicRead = true;
+    const fan = h.device('fan');
+    const joinedFollow = await fan.join(await h.followLink('Fan'));
+    assert.equal(joinedFollow.status, 0, joinedFollow.stderr);
+    assert.match(joinedFollow.stdout, /^joined “Family” as a follower\n/);
+    assert.deepEqual(JSON.parse(readFileSync(fan.config, 'utf8')), { vault: fan.vault, remote: { type: 'follow', url: h.dav.url }, share: 'Family', sync: { readOnly: true } });
+    assert.deepEqual(JSON.parse(readFileSync(fan.keys, 'utf8')).storage, {});
+    assert.match((await fan.run(['sync'])).stdout, /^sent 0, received 1,/);
+    h.owner.fs.put('news.md', 'new\n');
+    await h.owner.sync();
+    const more = await fan.run(['sync']);
+    assert.match(more.stdout, /^sent 0, received 1,/);
+    assert.equal(readFileSync(join(fan.vault, 'news.md'), 'utf8'), 'new\n');
+    assert.match((await fan.run(['history', 'news.md'])).stdout, /4 bytes/);
+    assert.equal((await fan.run(['log'])).status, 0);
+    for (const command of ['check', 'verify'] as const) {
+      const r = await fan.run([command]);
+      assert.equal(r.status, 1, command);
+      assert.match(r.stderr, new RegExp(`^${command} does not work on a followed folder: it is read over its public address, which cannot be listed`));
+    }
+    assert.match((await fan.run(['clean'])).stderr, /^this device only receives changes/);
+    const asked = h.dav.seen.filter((r) => r.user === '');
+    assert.ok(asked.length > 0);
+    assert.deepEqual([...new Set(asked.map((r) => r.method))], ['GET'], 'a follower only ever reads, by name, with no key');
+  } finally {
+    h.done();
+  }
+});
+
+test('cli: a device removed from a shared folder says so and stops, and watch stops by itself', async () => {
+  const h = await memberHarness();
+  try {
+    const lan = h.device('lan');
+    assert.equal((await lan.join(await h.link('Lan', 'write'))).status, 0);
+    await h.owner.engine.confirmJoins();
+    put(lan.vault, 'lan.md', 'by lan\n');
+    assert.match((await lan.run(['sync'])).stdout, /^sent 1,/);
+    await h.owner.engine.removeMember(JSON.parse(readFileSync(lan.keys, 'utf8')).member.id);
+
+    const r = await lan.run(['sync']);
+    assert.equal(r.status, 1);
+    assert.equal(r.stdout, '');
+    assert.equal(
+      r.stderr,
+      `This device was removed from the shared folder, so it no longer syncs it\n“Family” is not synced here any more; to join it again, ask its owner for a new invite, delete ${lan.config} and ${join(lan.vault, '.coffer')} (the files in the folder stay) and run join with it\n`,
+    );
+    const w = lan.watch('--poll=0.2', '--interval=60');
+    try {
+      assert.equal(await w.exited, 1);
+      assert.match(w.out(), /^\S+Z watching .*lan against WebDAV http:\/\/127\.0\.0\.1:\d+\/dav; checking for changes every 0\.2s and syncing everything every 60s\n$/);
+      assert.match(w.err(), /\S+Z This device was removed from the shared folder, so it no longer syncs it\. Not watching any more\.\n\S+Z “Family” is not synced here any more/);
+      assert.doesNotMatch(w.err(), /retrying/);
+    } finally {
+      w.child.kill('SIGKILL');
+    }
+  } finally {
+    h.done();
+  }
+});
+
+test('cli: verify finds a removed member’s earlier changes valid, on a device that joined after the removal and on the removed one', async () => {
+  const h = await memberHarness();
+  try {
+    const lan = h.device('lan');
+    assert.equal((await lan.join(await h.link('Lan', 'write'))).status, 0);
+    await h.owner.engine.confirmJoins();
+    put(lan.vault, 'lan.md', 'by lan\n');
+    assert.match((await lan.run(['sync'])).stdout, /^sent 1,/);
+    await h.owner.engine.removeMember(JSON.parse(readFileSync(lan.keys, 'utf8')).member.id);
+    assert.equal((await lan.run(['sync'])).status, 1);
+    const ann = h.device('ann');
+    assert.equal((await ann.join(await h.link('Ann', 'write'))).status, 0);
+    await h.owner.engine.confirmJoins();
+    assert.equal((await ann.run(['sync'])).status, 0);
+    for (const d of [ann, lan]) {
+      for (const deep of [[], ['--deep']]) {
+        const r = await d.run(['verify', ...deep]);
+        assert.equal(r.status, 0, r.stdout + r.stderr);
+        assert.match(r.stdout, /^checked \d+ commits, 1 file, 1 pack.*: no problems\n$/);
+      }
+    }
+    const repaired = await ann.run(['repair', '--deep']);
+    assert.equal(repaired.status, 0, repaired.stderr);
+    assert.match(repaired.stdout, /^nothing to repair/);
+  } finally {
+    h.done();
+  }
+});
+
+test('cli: a removed device joins its folder again with a new invite only once it deletes the sync record it was told about, and keeps its files', async () => {
+  const h = await memberHarness();
+  try {
+    const lan = h.device('lan');
+    assert.equal((await lan.join(await h.link('Lan', 'write'))).status, 0);
+    await h.owner.engine.confirmJoins();
+    put(lan.vault, 'lan.md', 'by lan\n');
+    assert.match((await lan.run(['sync'])).stdout, /^sent 1,/);
+    await h.owner.engine.removeMember(JSON.parse(readFileSync(lan.keys, 'utf8')).member.id);
+    assert.equal((await lan.run(['sync'])).status, 1);
+    put(lan.vault, 'after.md', 'written after the removal\n');
+
+    // Joined over the old sync record, the new member would read as removed for good: it is refused, whatever else was deleted.
+    const again = await h.link('Lan', 'write');
+    const record = join(lan.vault, '.coffer');
+    rmSync(lan.config);
+    rmSync(lan.keys);
+    const refused = await lan.join(again);
+    assert.equal(refused.status, 1);
+    assert.equal(
+      refused.stderr,
+      `${lan.vault} holds the sync record of an earlier sync or join (${record}); to join into this folder again, delete ${record} first (the files stay, and any that differ from the shared folder's are kept as conflict copies), or pass --vault=<folder> to join into another folder\n`,
+    );
+    assert.equal(existsSync(lan.config), false, 'nothing was written');
+
+    rmSync(record, { recursive: true });
+    assert.equal((await lan.join(again)).status, 0);
+    assert.equal(existsSync(join(lan.vault, 'after.md')), true, 'the files stay');
+    await h.owner.engine.confirmJoins();
+    const first = await lan.run(['sync']);
+    assert.equal(first.status, 0, first.stderr);
+    assert.match(first.stdout, /^sent 1, received 0,/);
+    assert.equal(first.stderr, '');
+    await h.owner.sync();
+    assert.equal(h.owner.fs.text('after.md'), 'written after the removal\n');
+    assert.equal((await lan.run(['sync'])).status, 0, 'it syncs like any member now');
+  } finally {
+    h.done();
+  }
+});
+
+test('cli: a writing device that is not confirmed, or was removed, refuses what writes or would never be sent, as one set to only receive does', async () => {
+  const h = await memberHarness();
+  try {
+    h.owner.fs.put('plan.md', 'v1\n');
+    await h.owner.sync();
+    const lan = h.device('lan');
+    assert.equal((await lan.join(await h.link('Lan', 'write'))).status, 0);
+    assert.match((await lan.run(['sync'])).stdout, /^sent 0, received 1,/);
+    const seq = /^\s*(\d+)\s/.exec((await lan.run(['history', 'plan.md'])).stdout)![1];
+    writeFileSync(join(lan.vault, 'plan.md'), 'kept as it is\n');
+
+    for (const [args, why] of [
+      [['clean'], 'it does not clean up storage'],
+      [['repair'], 'it cannot store data in storage again'],
+      [['restore', 'plan.md', seq], 'a restored file would never be sent'],
+      [['restore-at', seq], 'a restore would never be sent'],
+    ] as const) {
+      const r = await lan.run([...args]);
+      assert.equal(r.status, 1, args.join(' '));
+      assert.equal(r.stdout, '', args.join(' '));
+      assert.equal(r.stderr, `this device only receives until Vu's device confirms it, so ${why}; run ${args[0]} once it may send them\n`);
+    }
+    assert.equal(readFileSync(join(lan.vault, 'plan.md'), 'utf8'), 'kept as it is\n', 'a refused restore wrote nothing');
+    const dry = await lan.run(['restore-at', seq, '--dry-run']);
+    assert.equal(dry.status, 0, dry.stderr);
+
+    assert.deepEqual(await h.owner.engine.confirmJoins(), [JSON.parse(readFileSync(lan.keys, 'utf8')).member.id]);
+    assert.equal((await lan.run(['sync'])).status, 0);
+    assert.equal((await lan.run(['clean'])).status, 0, 'confirmed, it may');
+
+    await h.owner.engine.removeMember(JSON.parse(readFileSync(lan.keys, 'utf8')).member.id);
+    assert.equal((await lan.run(['sync'])).status, 1);
+    const gone = await lan.run(['clean']);
+    assert.equal(gone.status, 1);
+    assert.equal(gone.stdout, '');
+    assert.match(gone.stderr, /^This device was removed from the shared folder, so it no longer syncs it\n“Family” is not synced here any more; to join it again, ask its owner for a new invite, delete /);
+  } finally {
+    h.done();
+  }
+});
+
+test('cli: storage keys that storage no longer accepts say, for a shared folder, that the owner may have given everyone new ones', async () => {
+  const h = await memberHarness();
+  try {
+    h.owner.fs.put('plan.md', 'v1\n');
+    await h.owner.sync();
+    const lan = h.device('lan');
+    assert.equal((await lan.join(await h.link('Lan', 'write'))).status, 0);
+    assert.equal((await lan.run(['sync'])).status, 0);
+    h.dav.accounts.delete('writer');
+    const r = await lan.run(['sync']);
+    assert.equal(r.status, 1);
+    assert.equal(
+      r.stderr,
+      `WebDAV refused the login or the folder (HTTP 401)\nthe storage refused the keys this device holds for “Family”; if the owner gave everyone new storage keys since this device last synced, those no longer work, so ask for a new invite, delete ${lan.config} and ${join(lan.vault, '.coffer')} (the files in the folder stay) and run join with it\n`,
+    );
+  } finally {
+    h.done();
+  }
+});
+
+test('cli: a change in a shared folder that no member made stops the sync with the reason, and syncing carries on once the owner removes it', async () => {
+  const h = await memberHarness();
+  try {
+    const lan = h.device('lan');
+    assert.equal((await lan.join(await h.link('Lan', 'write'))).status, 0);
+    await h.owner.engine.confirmJoins();
+    h.owner.fs.put('a.md', 'a\n');
+    await h.owner.sync();
+    assert.match((await lan.run(['sync'])).stdout, /^sent 0, received 1,/);
+
+    const raw = await rawRepo(h.store, h.keys);
+    const last = (await raw.commitSeqsAfter(0)).at(-1)!;
+    writeFileSync(join(h.remote, seqKey('log', last + 1)), randomBytes(300));
+    put(lan.vault, 'lan.md', 'by lan\n');
+    const stuck = await lan.run(['sync']);
+    assert.equal(stuck.status, 1);
+    assert.equal(stuck.stdout, '');
+    assert.match(stuck.stderr, new RegExp(`^Commit ${last + 1} in storage was not made by a member who may write to this shared folder: .*\\n“Family” stays as it was here: this device applies nothing from that change on, and syncs again once the owner has removed it from storage\\n$`));
+
+    // A watch says so each time it tries again, with the reason, and carries on trying.
+    const w = lan.watch('--poll=0.2', '--interval=60');
+    try {
+      await eventually(() => /retrying in 5s\n\S+Z “Family” stays as it was here/.test(w.err()));
+      assert.match(w.err(), new RegExp(`\\S+Z sync failed: Commit ${last + 1} in storage was not made by a member who may write to this shared folder: .*; retrying in 5s\\n`));
+      assert.equal(w.child.exitCode, null);
+    } finally {
+      w.child.kill('SIGKILL');
+    }
+    await assert.rejects(h.owner.sync());
+    assert.deepEqual(await h.owner.engine.removeUnverifiable(), [last + 1]);
+    const again = await lan.run(['sync']);
+    assert.equal(again.status, 0, again.stderr);
+    assert.match(again.stdout, /^sent 1,/);
+    await h.owner.sync();
+    assert.equal(h.owner.fs.text('lan.md'), 'by lan\n');
+  } finally {
+    h.done();
+  }
+});
+
+test('cli: new storage keys from the owner are used once they are shown to work, and until then the old ones stay', async () => {
+  const h = await memberHarness();
+  try {
+    const lan = h.device('lan');
+    assert.equal((await lan.join(await h.link('Lan', 'write'))).status, 0);
+    await h.owner.engine.confirmJoins();
+    const keysNow = () => JSON.parse(readFileSync(lan.keys, 'utf8')) as { storage: object };
+    const configBefore = readFileSync(lan.config, 'utf8');
+
+    // Keys the provider does not know (yet): said once, and nothing changes.
+    await h.owner.engine.writeRekey({ write: { webdavUser: 'writer2', webdavPassword: 'w2-pw' } });
+    const refused = await lan.run(['sync']);
+    assert.equal(refused.status, 0, refused.stderr);
+    assert.match(refused.stderr, /^the owner sent new storage keys, but they do not work here \(WebDAV refused the login or the folder \(HTTP 401\)\); this device keeps the ones it has\n$/);
+    assert.deepEqual(keysNow().storage, { webdavPassword: 'w-pw' });
+    assert.equal((await lan.run(['sync'])).stderr, refused.stderr, 'each run that cannot use them says so, and tries them again');
+    const w = lan.watch('--poll=0.2', '--interval=60');
+    try {
+      await eventually(() => w.err().includes('keeps the ones it has'));
+      for (const [i, name] of ['one.md', 'two.md'].entries()) {
+        put(lan.vault, name, `${name}\n`);
+        await eventually(() => w.out().split('\n').filter((l) => / sent 1,/.test(l)).length === i + 1);
+      }
+      assert.equal(w.err().split('keeps the ones it has').length - 1, 1, 'a watch says so once, not at every sync');
+    } finally {
+      w.child.kill('SIGKILL');
+    }
+
+    h.dav.accounts.set('writer2', { password: 'w2-pw', write: true });
+    const switched = await lan.run(['sync']);
+    assert.equal(switched.status, 0, switched.stderr);
+    assert.equal(switched.stderr, 'the owner sent new storage keys, and this device now uses them\n');
+    assert.deepEqual(keysNow().storage, { webdavUser: 'writer2', webdavPassword: 'w2-pw' });
+    assert.equal(readFileSync(lan.config, 'utf8'), configBefore, 'the config file is not touched');
+    if (process.platform !== 'win32') assert.equal(statSync(lan.keys).mode & 0o777, 0o600);
+
+    // The old keys are gone at the provider, and nothing notices.
+    h.dav.accounts.delete('writer');
+    h.owner.fs.put('after.md', 'after\n');
+    await h.owner.sync();
+    const after = await lan.run(['sync']);
+    assert.equal(after.status, 0, after.stderr);
+    assert.match(after.stdout, /^sent 0, received 1,/);
+    assert.equal(after.stderr, '');
+    assert.ok(h.dav.seen.some((r) => r.user === 'writer2' && r.method === 'GET'));
+    assert.equal((await lan.run(['sync'])).stderr, '', 'the offer taken is not offered again');
+  } finally {
+    h.done();
+  }
+});
+
+test('cli join: what it refuses leaves the invite unused and nothing behind', async () => {
+  const h = await memberHarness();
+  try {
+    const none = await bareAsync(['join', `--config=${join(h.dir, 'x.json')}`], MEMBER_ENV);
+    assert.equal(none.status, 2);
+    assert.equal(none.stderr, 'join takes the link to join with on standard input: join - [--vault=<folder>], or in COFFER_LINK\n');
+    const lan = h.device('lan');
+    for (const [text, why] of [
+      ['coffershare2.abcdefgh', /^join takes an invite to a shared folder with members \(it starts with coffershare3\.\) or a follow link \(cofferfollow1\.\); a link that starts with coffershare2\. is for the Obsidian plugin\n$/],
+      ['hello', /^That is not a link join can use: it starts with coffershare3\. for an invite and cofferfollow1\. for a follow link\n$/],
+      ['coffershare3.bm90LWpzb24', /^That is not an invite link to a shared folder, or it was cut short when it was copied\n$/],
+    ] as const) {
+      const r = await lan.join(text);
+      assert.equal(r.status, 1, text);
+      assert.match(r.stderr, why);
+    }
+    const named = async (storage: Record<string, unknown>) =>
+      encodeInvite({ ...(await h.owner.engine.invite({ name: 'Ned', role: 'read', expires: h.clock.now + DAY })), storage, share: 'Family', folder: 'Family' });
+    for (const [storage, why] of [
+      [{}, /^That invite does not say where the shared folder is stored in a way this version can read\n$/],
+      [{ storageType: 'webdav', webdavUrl: 'ftp://example.com/x', webdavPassword: 'p' }, /^That invite does not say where/],
+      [{ storageType: 's3', endpoint: 'https://s3.example.com', bucket: 'b' }, /^That invite carries no keys for the storage it names\n$/],
+    ] as const) {
+      const r = await lan.join(await named(storage));
+      assert.equal(r.status, 1, JSON.stringify(storage));
+      assert.match(r.stderr, why);
+    }
+    assert.deepEqual(readdirSync(h.dir).sort(), ['remote']);
+
+    // A config that exists, or keys already in the folder, are refused before the invite is touched: it still joins.
+    const invite = await h.link('Lan', 'write');
+    writeFileSync(lan.config, '{}');
+    const clash = await lan.join(invite);
+    assert.equal(clash.status, 1);
+    assert.equal(clash.stderr, `config file ${lan.config} exists already; pass --config=<file> to write another\n`);
+    assert.equal(readFileSync(lan.config, 'utf8'), '{}');
+    assert.equal(existsSync(lan.vault), false);
+    rmSync(lan.config);
+    assert.equal((await lan.join(invite)).status, 0);
+    const twice = await bareAsync(['join', invite, `--vault=${lan.vault}`, `--config=${join(h.dir, 'again.json')}`], MEMBER_ENV);
+    assert.equal(twice.status, 1);
+    assert.equal(twice.stderr, `${lan.vault} already holds the keys of a shared folder; pass --vault=<folder> to join into another folder\n`);
+    assert.equal(existsSync(join(h.dir, 'again.json')), false);
+
+    // One invite adds one device.
+    const other = h.device('other');
+    const used = await other.join(invite);
+    assert.equal(used.status, 1);
+    assert.match(used.stderr, /^This invite was already used on another device\. Ask for a new one/);
+    assert.equal(existsSync(other.config) || existsSync(other.vault), false);
+
+    const old = await h.link('Old', 'read', { expires: Date.now() + 1 });
+    await sleep(20);
+    const expired = await h.device('old').join(old);
+    assert.equal(expired.status, 1);
+    assert.match(expired.stderr, /^This invite has expired\. Ask for a new one\./);
+  } finally {
+    h.done();
+  }
+});
+
+test('cli join: takes the link from standard input or COFFER_LINK, bare or in the obsidian:// link the plugin copies', async () => {
+  const h = await memberHarness();
+  try {
+    const wrapped = (code: string) => `obsidian://coffer?share=${encodeURIComponent(code)}`;
+    const lan = h.device('lan');
+    const r = await bareAsync(['join', '-', `--vault=${lan.vault}`, `--config=${lan.config}`], MEMBER_ENV, undefined, `${wrapped(await h.link('Lan', 'write'))}\n`);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /^joined “Family” as a member who writes\n/);
+    h.dav.state.publicRead = true;
+    const mai = h.device('mai');
+    const m = await bareAsync(['join', `--vault=${mai.vault}`, `--config=${mai.config}`], { ...MEMBER_ENV, COFFER_LINK: wrapped(await h.followLink('Readers')) });
+    assert.equal(m.status, 0, m.stderr);
+    assert.match(m.stdout, /^joined “Family” as a follower\n/);
+    const empty = await bareAsync(['join', '-', `--config=${join(h.dir, 'x.json')}`], MEMBER_ENV, undefined, '');
+    assert.equal(empty.status, 2);
+  } finally {
+    h.done();
+  }
+});
+
+test('cli join: a WebDAV address and password are taken as the plugin takes them, spaces and all', () => {
+  const at = placeOf({ storageType: 'webdav', webdavUrl: ' https://cloud.example/remote.php/dav/files/me/My Notes/coffer ', webdavUser: ' me ', webdavPassword: ' pa ss ' });
+  assert.deepEqual(at, {
+    remote: { type: 'webdav', url: 'https://cloud.example/remote.php/dav/files/me/My Notes/coffer', username: 'me' },
+    creds: { webdavPassword: ' pa ss ' },
+  });
+  assert.throws(() => placeOf({ storageType: 'webdav', webdavUrl: 'https:// x', webdavPassword: 'p' }), /does not say where/);
+  assert.throws(() => placeOf({ storageType: 'webdav', webdavUrl: 'https://x', webdavPassword: '' }), /carries no keys/);
+});
+
+test('cli join: the folder is the name the link suggests, here, and a name from a link never leads out of the folder it is run in', async () => {
+  const h = await memberHarness();
+  const cwd = join(h.dir, 'here');
+  mkdirSync(cwd);
+  // The CLI sees the folder it runs in by its real path.
+  const real = realpathSync(cwd);
+  try {
+    h.owner.fs.put('plan.md', 'v1\n');
+    await h.owner.sync();
+    const r = await bareAsync(['join', await h.link('Mai', 'read')], MEMBER_ENV, cwd);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, new RegExp(`^joined “Family” as a member who reads\\n  folder  ${escaped(join(real, 'Family'))}\\n  config  ${escaped(join(real, 'coffer.json'))}\\n`));
+    assert.match(r.stdout, new RegExp(`next: sync --config=${escaped(join(real, 'coffer.json'))}\\n$`));
+    const sync = await bareAsync(['sync'], MEMBER_ENV, cwd);
+    assert.equal(sync.status, 0, sync.stderr);
+    assert.equal(readFileSync(join(cwd, 'Family', 'plan.md'), 'utf8'), 'v1\n');
+
+    const hostile = await bareAsync(['join', await h.link('Fay', 'read', { folder: '../../etc' }), `--config=${join(cwd, 'fay.json')}`], MEMBER_ENV, cwd);
+    assert.equal(hostile.status, 0, hostile.stderr);
+    assert.equal(JSON.parse(readFileSync(join(cwd, 'fay.json'), 'utf8')).vault, join(real, 'etc'));
+    rmSync(join(cwd, 'Family'), { recursive: true });
+    const nameless = await bareAsync(['join', await h.link('Jo', 'read', { folder: 'a:b' }), `--config=${join(cwd, 'jo.json')}`], MEMBER_ENV, cwd);
+    assert.equal(nameless.status, 0, 'the share name is used when the folder name will not do');
+    assert.equal(JSON.parse(readFileSync(join(cwd, 'jo.json'), 'utf8')).vault, join(real, 'Family'));
+  } finally {
+    h.done();
+  }
+});
+
+test('cli watch: a member waiting for the owner says so once, and sends what it held back once the owner confirms it', async () => {
+  const h = await memberHarness();
+  try {
+    h.owner.fs.put('plan.md', 'v1\n');
+    await h.owner.sync();
+    const lan = h.device('lan');
+    assert.equal((await lan.join(await h.link('Lan', 'write'))).status, 0);
+    const w = lan.watch('--poll=0.2', '--interval=60');
+    try {
+      await eventually(() => w.out().includes('received 1'));
+      put(lan.vault, 'lan.md', 'by lan\n');
+      await eventually(() => w.err().includes('not sent, this device only receives: lan.md'));
+      await sleep(600);
+      assert.equal(w.err().split(WAITING).length - 1, 1, 'said once, not at every sync');
+
+      await h.owner.engine.confirmJoins();
+      await eventually(() => w.out().split('\n').some((l) => / sent 1, received 0,/.test(l)));
+      await h.owner.sync();
+      assert.equal(h.owner.fs.text('lan.md'), 'by lan\n');
+      w.child.kill('SIGTERM');
+      assert.equal(await w.exited, 0);
+      assert.equal(w.err().split(WAITING).length - 1, 1);
+    } finally {
+      w.child.kill('SIGKILL');
+    }
+  } finally {
+    h.done();
+  }
+});
+
+test('cli: a shared folder whose keys file is gone or damaged says so instead of asking for a passphrase', async () => {
+  const h = await memberHarness();
+  try {
+    const mai = h.device('mai');
+    assert.equal((await mai.join(await h.link('Mai', 'read'))).status, 0);
+    const kept = readFileSync(mai.keys, 'utf8');
+    rmSync(mai.keys);
+    const gone = await mai.run(['sync']);
+    assert.equal(gone.status, 1);
+    assert.equal(gone.stderr, `the keys of this shared folder are not here: ${mai.keys} is missing. Join it again with a new invite\n`);
+    writeFileSync(mai.keys, '{"member":{"repo":"x"}}');
+    assert.equal((await mai.run(['sync'])).stderr, `the keys file ${mai.keys} is damaged. Join the shared folder again with a new invite\n`);
+    writeFileSync(mai.keys, kept);
+    assert.equal((await mai.run(['sync'])).status, 0);
+    const config = { ...JSON.parse(readFileSync(mai.config, 'utf8')), share: 5 };
+    writeFileSync(mai.config, JSON.stringify(config));
+    assert.equal((await mai.run(['sync'])).stderr, `config file ${mai.config} needs "share" to be the name of the shared folder, as join writes it\n`);
+  } finally {
+    h.done();
   }
 });

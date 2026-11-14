@@ -1,20 +1,41 @@
-import { Notice, Platform, Plugin, TFile, TFolder, TextFileView, debounce, setIcon } from 'obsidian';
+import { Notice, Platform, Plugin, TFile, TFolder, TextFileView, debounce, setIcon, type SecretStorage } from 'obsidian';
 import { pool } from '../core/bytes.ts';
-import type { SyncConfig } from '../core/config.ts';
+import { DEFAULT_CONFIG, compileExcludes, type SyncConfig } from '../core/config.ts';
 import { forgetDevice, heartbeatDue, writeHeartbeat } from '../core/devices.ts';
-import { SafetyError, type GcResult, type RepairOptions, type RepairReport, type SyncEngine, type SyncResult } from '../core/engine.ts';
+import {
+  RemovedError,
+  UnverifiedError,
+  type Arrival,
+  type GcResult,
+  type MemberStanding,
+  type MemberStatus,
+  type RepairOptions,
+  type RepairReport,
+  type RepoView,
+  type SuggestOutcome,
+  type SyncEngine,
+  type SyncResult,
+  type WaitingSuggestions,
+} from '../core/engine.ts';
+import { encodeFollow, encodeInvite, ownerLinkFields, type FollowInvite, type MemberChange, type MemberInvite, type MemberKeys } from '../core/members.ts';
+import { createMemberShare, joinShare } from '../core/membership.ts';
 import { fileName, vaultKey } from '../core/paths.ts';
 import type { Repo } from '../core/repo.ts';
-import type { ScopedFS } from '../core/scopedfs.ts';
+import { LocalState } from '../core/state.ts';
 import { errorText, firstSentence, plural } from '../core/text.ts';
 import { planRestore, type DeletedFile } from '../core/timeline.ts';
 import type { Entry, Version } from '../core/types.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
+import { arrivalLine, type Self } from './activity.ts';
 import { ChangeLog, fromEvents, type Why } from './changes.ts';
 import { chooseDeferred } from './deferred.ts';
-import { ObsidianFS, PluginState, lookup, obsidianHttp } from './obsidianfs.ts';
-import { Pauses, Retries, nextPollDelay, pollPlaces, receivedChanges } from './polling.ts';
+import { checkFollowAddress, expiresIn, followRekey, isUsedError, joinWithInvite, keysOf, mustNotWrite, rekey, rekeySkip, rekeyTest, standingHere, testKeys, withKeys, type KeySet, type RekeyFailure } from './members.ts';
+import { forgetGone, isOffered, lookForOffers, offerKey, offersDue, offersHere, offersIn, offersOf, publishOffer, withdrawOffers, type Offer, type OfferCache } from './offers.ts';
+import { OtherSenderError, PropertyFS, isAttachment, isNote, inviteProblem, joinProblem, keptText, noteInShare, onlyShownBy, newEmbeds, otherSender, propertyProblems, sendProblem, sentNotesText, settleChoices, startProblem, unmarkedText, unusedText, withShare, withoutShare, writeProblem, type Survey } from './byproperty.ts';
+import { RemoveModal, WhatsSharedModal } from './byproperty-ui.ts';
+import { ObsidianCatalog, ObsidianFS, PluginState, lookup, obsidianHttp } from './obsidianfs.ts';
+import { Pauses, Retries, nextPollDelay, pausesOn, pollPlaces, receivedChanges } from './polling.ts';
 import {
   cleanupDue,
   codeIterations,
@@ -22,31 +43,40 @@ import {
   defaultSettings,
   encodeSetupCode,
   folderProblem,
+  folderShares,
   hasStorageAddress,
   isConfigured,
+  labelOf,
   loadSettings,
+  positionPath,
+  propertyConfig,
   remoteSpec,
   secretName,
   setupLink,
   shareConfig,
   shareSecretName,
   statePath,
+  storagePayload,
   storageProblem,
   syncConfig,
   type Settings,
   type Share,
 } from './settings.ts';
-import { SetupModal, type Keys } from './setup.ts';
+import { IDS, SetupModal, type Keys } from './setup.ts';
 import {
   followRename,
   freeTaken,
   goneWith,
+  hasMembers,
   inVault,
   locationClash,
   makeEngine,
+  memberKeysIn,
   placeOf,
+  propertyPlaces,
   readOnlyInviteCode,
   rejoin,
+  SHARES_AT_ONCE,
   syncAll,
   syncable,
   takeVaultCopies,
@@ -55,11 +85,14 @@ import {
   type EngineHost,
   type Outcome,
   type Place,
+  type ShareFS,
 } from './shares.ts';
 import { ShareModal, pickTarget } from './sharing.ts';
 import { resolveFirstConflict } from './resolve.ts';
 import { applyRestore, deleteLimitCrossed, describeCleanup, keepDeferred, keepOut, momentLabel, placeRestored, restoreSteps, sameSteps, sentNote, type Failed, type Step } from './restore.ts';
+import { canSuggest, forgetSent, recordSent, sentBefore } from './suggestions.ts';
 import {
+  MAX_COMPARE_BYTES,
   connectError,
   describeFailure,
   inShare,
@@ -67,17 +100,24 @@ import {
   keysMissingProblem,
   missingProblem,
   resultProblems,
+  RunProgress,
+  shareLine,
   statusText,
   summarize,
   targetProblems,
+  type MemberContext,
   type Problem,
+  type RunPlace,
+  type Snapshot,
   type Tone,
+  unchangedSince,
 } from './status.ts';
-import { DeletedModal, RepairModal, RestoreEarlierModal, VerifyModal, VersionsModal } from './timemachine.ts';
+import { ActivityModal, DeletedModal, RepairModal, RestoreEarlierModal, VerifyModal, VersionsModal } from './timemachine.ts';
 import { ProblemsModal, SettingsTab } from './views.ts';
 
 type SecretKey = 'accessKeySecret' | 'secretKeySecret' | 'passphraseSecret' | 'webdavPasswordSecret';
-const SECRET_KEYS: SecretKey[] = ['accessKeySecret', 'secretKeySecret', 'passphraseSecret', 'webdavPasswordSecret'];
+/** Every setting of a share that names a secret, so that stopping it forgets them all. */
+const SHARE_SECRETS = ['accessKeySecret', 'secretKeySecret', 'passphraseSecret', 'webdavPasswordSecret', 'memberKeysSecret'] as const;
 
 /** What a sync run ended with, for screens that show it inline. */
 export interface SyncOutcome {
@@ -94,6 +134,8 @@ export interface Look {
   lastSeq: number;
   cfg: SyncConfig;
   now: number;
+  /** In a shared folder with members, every member change this device holds, oldest first; otherwise none. */
+  members: MemberChange[];
 }
 
 export type { Failed };
@@ -125,22 +167,38 @@ interface Tracked {
   deferred?: string[];
   /** Files a restore removed, which the next sync to finish deletes from storage as confirmed (`allowDeletes`). */
   restored?: Set<string>;
+  /** A shared folder with members: what this device is in it, as of its last sync that got as far as the member list. */
+  standing?: MemberStanding;
+  /** A shared folder with members: the re-key found not to work on this device, tried again only after a while (`rekeySkip`). */
+  rekeyFailed?: RekeyFailure;
+  /** The owner's devices: how many suggestions wait in storage, and when that was last looked at. */
+  suggestions?: number;
+  inboxLooked?: number;
 }
 
 /** `true` lets the vault's sync delete many files; a share's id lets that shared folder's. */
 type Force = boolean | string;
 
 const keyOf = (share?: Share) => share?.id ?? '';
+/** How long the notice of other people's changes shows. */
+const ARRIVALS_SHOWN = 15_000;
+/** How often a sync of a shared folder looks for suggestions on the owner's devices; a sync asked for always looks. */
+const INBOX_EVERY = 60_000;
+const placeOfRun = (share?: Share): RunPlace => share ?? { id: '' };
 
 export default class CofferPlugin extends Plugin {
   settings: Settings = defaultSettings(Platform.isMobile);
-  /** "Receiving 40 of 249" while a sync moves files, otherwise empty. */
+  /** One line for the whole run, such as "Receiving 40 of 249", while a sync moves files; otherwise empty. */
   progress = '';
   running = false;
   private files?: ObsidianFS;
+  /** What Obsidian has read of the vault's notes, for notes shared by a property. */
+  catalog!: ObsidianCatalog;
   /** The vault's engine under '', each share's under its id. */
-  private engines = new Map<string, { engine: SyncEngine; fs: ScopedFS }>();
+  private engines = new Map<string, { engine: SyncEngine; fs: ShareFS }>();
   private tracking = new Map<string, Tracked>();
+  /** Where each place of the running sync is, since shared folders sync side by side. */
+  private run = new RunProgress();
   private changes = new ChangeLog(() => this.settings.shares);
   private pauses = new Pauses();
   private retries = new Retries();
@@ -164,12 +222,28 @@ export default class CofferPlugin extends Plugin {
   /** When something last suggested another device may be involved; see nextPollDelay. */
   private lastActivity = Date.now();
   private dirty = false;
+  /** Shared folders the vault's other devices offer (offers.ts), as of the last look, and when that was. */
+  private offers: OfferCache = new Map();
+  private offersLooked = 0;
+  private offersLooking?: Promise<void>;
+  /** The notice of other people's changes on show, with when it went up and what it tells, by share id (`tellArrivals`). */
+  private arrivals?: { notice: Notice; at: number; byShare: Map<string, Arrival[]> };
   private progressNotice?: Notice;
+  /** Notes shared by a property: what this session already told, so a notice is not repeated at every sync. */
+  private told = new Set<string>();
+  /** Notes shared by a property: what the last sync of each found, by share id (`PropertyFS.survey`). */
+  private surveys = new Map<string, Survey>();
+  /** The vault's notes and attachments as Obsidian's index has them, without the settings folder. */
+  private notes?: ObsidianFS;
   private schedule = debounce(() => void this.auto('edit'), 10_000, true);
   private lookup = (name: string) => this.secret(name);
 
   async onload(): Promise<void> {
+    const loadedLate = this.app.workspace.layoutReady;
     this.settings = loadSettings((await this.loadData()) as Partial<Settings> | null, Platform.isMobile);
+    // Registered before the layout is ready, so that the first time Obsidian has read the whole vault is not missed.
+    this.catalog = new ObsidianCatalog(this.app);
+    this.registerEvent(this.app.metadataCache.on('resolved', () => this.catalogReady()));
     if (!this.settings.deviceName) {
       this.settings.deviceName = `${Platform.isMobile ? 'mobile' : 'desktop'}-${Math.random().toString(16).slice(2, 6)}`;
       await this.saveData(this.settings);
@@ -218,6 +292,15 @@ export default class CofferPlugin extends Plugin {
         return true;
       },
     });
+    this.addCommand({
+      id: 'activity',
+      name: 'Show recent changes in a shared folder',
+      checkCallback: (checking) => {
+        if (!this.configured() || !this.targets().some((share) => share)) return false;
+        if (!checking) pickTarget(this, 'Show recent changes in', (share) => share && new ActivityModal(this.app, this, share).open(), (share) => !!share);
+        return true;
+      },
+    });
     const whenConfigured = (open: () => void) => (checking: boolean) => {
       if (!this.configured()) return false;
       if (!checking) open();
@@ -226,7 +309,8 @@ export default class CofferPlugin extends Plugin {
     this.addCommand({
       id: 'restore-deleted',
       name: 'Restore deleted files',
-      checkCallback: whenConfigured(() => pickTarget(this, 'Restore deleted files from', (share) => new DeletedModal(this.app, this, share).open())),
+      // Notes shared by a property keep every version in the vault's history: restoring goes through the vault.
+      checkCallback: whenConfigured(() => pickTarget(this, 'Restore deleted files from', (share) => new DeletedModal(this.app, this, share).open(), (share) => !share?.property)),
     });
     this.addCommand({
       id: 'restore-earlier',
@@ -236,7 +320,8 @@ export default class CofferPlugin extends Plugin {
     this.addCommand({
       id: 'verify',
       name: 'Check synced data for damage',
-      checkCallback: whenConfigured(() => pickTarget(this, 'Check the synced data of', (share) => new VerifyModal(this.app, this, share).open())),
+      // A followed folder is read from an address that can not be listed, which checking needs.
+      checkCallback: whenConfigured(() => pickTarget(this, 'Check the synced data of', (share) => new VerifyModal(this.app, this, share).open(), (share) => !share?.followUrl)),
     });
     this.addCommand({
       id: 'repair',
@@ -247,6 +332,48 @@ export default class CofferPlugin extends Plugin {
         return true;
       },
     });
+    const noteCommand = (act: (share: Share, file: TFile) => void, offered: (share: Share, path: string) => boolean) => (checking: boolean) => {
+      const share = this.propertyShare();
+      const file = this.app.workspace.getActiveFile();
+      if (!share || !file || !isNote(file.path) || !syncable(share, this.lookup) || !offered(share, file.path)) return false;
+      if (!checking) act(share, file);
+      return true;
+    };
+    this.addCommand({
+      id: 'share-note',
+      name: 'Add the current note to the notes shared by property',
+      checkCallback: noteCommand((share, file) => void this.shareNoteSaying(share, file), (share, path) => !this.noteIn(share, path) && !this.joinProblemOf(share, path)),
+    });
+    this.addCommand({
+      id: 'unshare-note',
+      name: 'Remove the current note from the notes shared by property…',
+      checkCallback: noteCommand((share, file) => new RemoveModal(this.app, this, share, [file.path]).open(), (share, path) => this.noteIn(share, path, true)),
+    });
+    this.addCommand({
+      id: 'whats-shared',
+      name: "Show what's shared by property",
+      checkCallback: (checking) => {
+        const share = this.propertyShare();
+        if (!share) return false;
+        if (!checking) new WhatsSharedModal(this.app, this, share).open();
+        return true;
+      },
+    });
+    this.registerEvent(
+      this.app.workspace.on('file-menu', (menu, file) => {
+        const share = this.propertyShare();
+        if (!(file instanceof TFile) || !share || !isNote(file.path) || !syncable(share, this.lookup)) return;
+        const held = this.surveys.get(share.id)?.shared.has(vaultKey(file.path));
+        // A note in a shared folder or a left-out one can not be in the share, whatever its properties say.
+        if (!held && this.joinProblemOf(share, file.path)) return;
+        const shared = this.noteIn(share, file.path);
+        menu.addItem((item) =>
+          shared
+            ? item.setTitle(`Remove from “${share.property}”…`).setIcon('user-minus').onClick(() => new RemoveModal(this.app, this, share, [file.path]).open())
+            : item.setTitle(`Add to “${share.property}”`).setIcon('user-plus').onClick(() => void this.shareNoteSaying(share, file)),
+        );
+      }),
+    );
     this.registerEvent(
       this.app.workspace.on('file-menu', (menu, file) => {
         if (!(file instanceof TFolder) || !this.configured()) return;
@@ -263,6 +390,8 @@ export default class CofferPlugin extends Plugin {
 
     this.register(() => this.stopPoll());
     this.register(() => window.clearTimeout(this.retryTimer));
+    // A sync an edit scheduled must not run once the plugin is disabled, or beside the next copy of it after an update.
+    this.register(() => this.schedule.cancel());
     this.app.workspace.onLayoutReady(() => {
       // `places` are the ids of the places the change is in: a place paused before a mass delete may sync again.
       const changed = (...places: (string | string[])[]) => {
@@ -275,12 +404,20 @@ export default class CofferPlugin extends Plugin {
       this.registerEvent(
         this.app.vault.on('create', (file) => {
           // A new folder holds nothing yet: files put in it come with events of their own.
-          changed(file instanceof TFile ? this.changes.file(file.path) : []);
+          changed(file instanceof TFile ? [this.changes.file(file.path), ...this.propertyOf(file.path)] : []);
         }),
       );
       this.registerEvent(
         this.app.vault.on('modify', (file) => {
-          changed(this.changes.file(file.path));
+          changed(this.changes.file(file.path), this.propertyOf(file.path));
+        }),
+      );
+      // Obsidian reads a note's properties a moment after it changes: a sync that ran before it did may not have added it.
+      this.registerEvent(
+        this.app.metadataCache.on('changed', (file) => {
+          const share = this.propertyShare();
+          if (!share || !this.catalog.ready() || !isNote(file.path)) return;
+          if (this.surveys.get(share.id)?.shared.has(vaultKey(file.path)) || this.catalog.says(file.path, share.property)) changed(share.id);
         }),
       );
       this.registerEvent(
@@ -291,8 +428,8 @@ export default class CofferPlugin extends Plugin {
             const gone = goneWith(this.settings.shares, file.path).filter((s) => !s.missing);
             for (const s of gone) s.missing = true;
             if (gone.length) void this.saveSettings().then(() => this.report());
-            changed(places);
-          } else changed(this.changes.file(file.path));
+            changed(places, this.propertyIds());
+          } else changed(this.changes.file(file.path), this.propertyOf(file.path));
         }),
       );
       this.registerEvent(
@@ -301,8 +438,8 @@ export default class CofferPlugin extends Plugin {
             const places = this.changes.folder(oldPath, file.path);
             // A shared folder renamed or moved in Obsidian takes its share along.
             if (followRename(this.settings.shares, oldPath, file.path).length) void this.saveSettings();
-            changed(places);
-          } else changed(this.changes.file(oldPath), this.changes.file(file.path));
+            changed(places, this.propertyIds());
+          } else changed(this.changes.file(oldPath), this.changes.file(file.path), this.propertyOf(oldPath), this.propertyOf(file.path));
         }),
       );
       // Phones suspend the app in the background; catch up the moment it is opened again.
@@ -315,6 +452,10 @@ export default class CofferPlugin extends Plugin {
           void this.auto(visible ? 'resume' : 'edit');
         }
       });
+      if (this.catalog.readAlready(loadedLate)) this.catalog.markReady();
+      // Should Obsidian never say it has read the vault, files may still join a minute on: until then only joining waits.
+      const fallback = window.setTimeout(() => this.catalogReady(), 60_000);
+      this.register(() => window.clearTimeout(fallback));
       this.applySchedule();
       this.updateStatus();
       if (!this.configured()) {
@@ -383,7 +524,7 @@ export default class CofferPlugin extends Plugin {
     this.polling = true;
     try {
       const places = new Map(this.targets().map((share) => [keyOf(share), share]));
-      if (!(await pollPlaces([...places.keys()], this.gate, (id) => this.getEngine(places.get(id)).remoteChanged()))) return;
+      if (!(await pollPlaces([...places.keys()], this.gate, (id) => this.getEngine(places.get(id)).remoteChanged(), SHARES_AT_ONCE))) return;
       await this.auto('poll');
     } finally {
       this.polling = false;
@@ -406,9 +547,14 @@ export default class CofferPlugin extends Plugin {
     return `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
   }
 
-  /** Whether this device never writes to the storage of `share` (the vault's when none). */
+  /**
+   * Whether this device never writes to the storage of `share` (the vault's when none): it is set to only receive, or
+   * in a shared folder with members, its member may not write, or not yet.
+   */
   receivesOnly(share?: Share): boolean {
-    return (share ?? this.settings).readOnly;
+    if ((share ?? this.settings).readOnly) return true;
+    const standing = share && this.tracked(share).standing;
+    return !!standing && !standing.mayWrite;
   }
 
   /** The vault, then every shared folder that can sync here. */
@@ -422,7 +568,8 @@ export default class CofferPlugin extends Plugin {
   }
 
   private host(): EngineHost {
-    this.files ??= new ObsidianFS(this.app, this.settings.syncConfigDir, () => this.settings.shares.map((s) => s.folder));
+    this.files ??= new ObsidianFS(this.app, this.settings.syncConfigDir, () => folderShares(this.settings.shares).map((s) => s.folder));
+    this.notes ??= new ObsidianFS(this.app, false, () => []);
     return {
       settings: this.settings,
       configDir: this.app.vault.configDir,
@@ -431,15 +578,15 @@ export default class CofferPlugin extends Plugin {
       secret: this.lookup,
       openStore: (spec) => openRemote(spec, obsidianHttp),
       stateStore: (path) => new PluginState(this.app, path),
+      notes: { files: this.notes, catalog: this.catalog },
     };
   }
 
-  private scope(share?: Share): { engine: SyncEngine; fs: ScopedFS } {
+  private scope(share?: Share): { engine: SyncEngine; fs: ShareFS } {
     let e = this.engines.get(keyOf(share));
     if (!e) {
       e = makeEngine(this.host(), share, {
-        onProgress: (p) =>
-          this.showProgress(`${share ? `“${share.folder}”: ` : ''}${p.phase === 'upload' ? 'Sending' : 'Receiving'} ${p.done.toLocaleString()} of ${p.total.toLocaleString()}`, p.total),
+        onProgress: (p) => this.showProgress(placeOfRun(share), `${p.phase === 'upload' ? 'Sending' : 'Receiving'} ${p.done.toLocaleString()} of ${p.total.toLocaleString()}`, p.total),
       });
       this.engines.set(keyOf(share), e);
     }
@@ -463,14 +610,22 @@ export default class CofferPlugin extends Plugin {
     return () => this.listeners.delete(listener);
   }
 
-  private showProgress(text: string, total: number): void {
-    this.progress = text;
-    this.updateStatus();
+  /** `place` says what it is doing. An engine still working after its sync ended says nothing that shows. */
+  private showProgress(place: RunPlace, text: string, total: number): void {
+    if (!this.running) return;
+    this.run.say(place, text);
+    this.showRun();
     // Phones have no status bar; a long first sync should not look like nothing is happening.
     // A screen that shows progress itself (setup, settings) is listening and makes this unnecessary.
     if (!Platform.isMobile || total < 50 || this.listeners.size) return;
-    if (this.progressNotice) this.progressNotice.setMessage(`Sync: ${text}`);
-    else this.progressNotice = new Notice(`Sync: ${text}`, 0);
+    if (this.progressNotice) this.progressNotice.setMessage(`Sync: ${this.progress}`);
+    else this.progressNotice = new Notice(`Sync: ${this.progress}`, 0);
+  }
+
+  /** Shows the run as it stands: its one line, and each place's state. */
+  private showRun(): void {
+    this.progress = this.run.line();
+    this.updateStatus();
   }
 
   /** Conflict copies of the vault, or of a shared folder, as vault paths. */
@@ -494,10 +649,10 @@ export default class CofferPlugin extends Plugin {
   /** The problems of the vault, or of one shared folder, in its own words. */
   problemsOf(share?: Share): Problem[] {
     if (share?.missing) return [missingProblem(share.folder)];
-    if (share && !isConfigured(share, this.lookup)) return [keysMissingProblem()];
+    if (share && !isConfigured(share, this.lookup)) return [keysMissingProblem(share)];
     const t = this.tracked(share);
     const rec = share ?? this.settings;
-    return targetProblems({ failure: t.failure, found: t.found, conflictCopies: this.conflictCopies(share), lastSuccess: rec.lastSuccess, readOnly: rec.readOnly }, Date.now());
+    return targetProblems({ failure: t.failure, found: t.found, conflictCopies: this.conflictCopies(share), lastSuccess: rec.lastSuccess, readOnly: this.receivesOnly(share) }, Date.now());
   }
 
   /** Whether the last sync of any place could not reach its storage. */
@@ -524,9 +679,12 @@ export default class CofferPlugin extends Plugin {
     return statusText(this.problems(), this.settings.lastSuccess, this.tracked().failure?.id === 'offline');
   }
 
-  /** One line for a shared folder in settings. */
+  /** One line for a shared folder in settings: where the running sync is with it, or how its last one went. */
   shareStatus(share: Share): { text: string; tone: Tone } {
-    return statusText(this.problemsOf(share), share.lastSuccess, this.tracked(share).failure?.id === 'offline');
+    const state = this.running ? this.run.stateOf(share.id) : undefined;
+    if (state) return { text: state === 'syncing' ? 'Syncing…' : 'Waiting to sync', tone: 'busy' };
+    const t = this.tracked(share);
+    return shareLine(this.problemsOf(share), t.standing, share.lastSuccess, t.failure?.id === 'offline');
   }
 
   private updateStatus(): void {
@@ -618,7 +776,7 @@ export default class CofferPlugin extends Plugin {
    * Tells the vault's other devices where this one is: once per session, then every 30 minutes. Runs under the sync
    * lock. Never in a shared folder, whose storage other people may read.
    */
-  private async heartbeat(): Promise<void> {
+  private async heartbeat(look: () => Promise<RepoView>): Promise<void> {
     if (this.settings.readOnly) return;
     const name = this.settings.deviceName;
     // Renamed since the last one: the record goes under the new name now, and the one under the old name goes.
@@ -627,13 +785,118 @@ export default class CofferPlugin extends Plugin {
     this.lastHeartbeat = Date.now();
     try {
       const platform = Platform.isIosApp ? 'iOS' : Platform.isAndroidApp ? 'Android' : Platform.isMacOS ? 'macOS' : Platform.isWin ? 'Windows' : Platform.isLinux ? 'Linux' : 'Unknown';
-      const view = await this.getEngine().view();
+      const view = await look();
       await writeHeartbeat(view, { platform, version: this.manifest.version });
       this.heartbeatName = name;
       if (renamed) await forgetDevice(view, renamed);
     } catch {
       // Storage may be down or refuse the write; the next try is in 30 minutes.
     }
+  }
+
+  /** After the vault's sync: its heartbeat, and the offers of shared folders between this vault's devices, on one look at storage. */
+  private async vaultChores(): Promise<void> {
+    let view: Promise<RepoView> | undefined;
+    const look = () => (view ??= this.getEngine().view());
+    await this.heartbeat(look);
+    await this.offerChores(look);
+  }
+
+  /**
+   * Offers this device owes the vault's storage are written; then, when due, the offers of the vault's other devices
+   * are looked for, and each new one is announced once. Best effort: what fails is tried at the next sync.
+   */
+  private async offerChores(look: () => Promise<RepoView>): Promise<void> {
+    const s = this.settings;
+    // A device that only receives the vault's changes never writes to its storage, offers included.
+    if (!s.readOnly) {
+      for (const share of s.shares.filter((x) => x.offerPending && syncable(x, this.lookup))) {
+        try {
+          const offer = await publishOffer((await look()).repo, share, this.lookup, s.deviceName, Date.now());
+          // Known as offered before the next look: stopping it asks whether to withdraw it.
+          if (offer) this.offers.set(offerKey(share.id), { modified: Number.NaN, offer });
+          share.offerPending = '';
+        } catch {
+          // Storage may be down; the next sync writes it.
+        }
+      }
+    }
+    if (!offersDue(this.offersLooked, Date.now())) return;
+    try {
+      await this.readOffers(look, true);
+    } catch {
+      // The next sync looks again.
+    }
+  }
+
+  /**
+   * Reads the offers in the vault's storage. With `tell`, each one shown here for the first time is announced; without,
+   * as when the settings that list them are open, they count as told.
+   */
+  private readOffers(look: () => Promise<RepoView>, tell: boolean): Promise<void> {
+    this.offersLooking ??= (async () => {
+      try {
+        await lookForOffers((await look()).repo, this.offers);
+        this.offersLooked = Date.now();
+        forgetGone(this.settings, this.offers);
+        const fresh = this.offersHere().filter((o) => !this.settings.offersTold.includes(o.id));
+        for (const o of fresh) {
+          this.settings.offersTold.push(o.id);
+          if (tell) this.announceOffer(o);
+        }
+        this.updateStatus();
+      } finally {
+        this.offersLooking = undefined;
+      }
+    })();
+    return this.offersLooking;
+  }
+
+  private announceOffer(o: Offer): void {
+    const n = new Notice(this.fragment(`Add “${o.folder}” here too?`, `It is shared on ${o.by}, another device of this vault. Tap to add it here.`), 30_000);
+    n.containerEl.addClass('coffer-notice');
+    n.containerEl.addEventListener('click', () => new ShareModal(this.app, this, 'offer', '', o).open());
+  }
+
+  /** The shared folders the vault's other devices offer that this device has not added, as of the last look. */
+  offersHere(): Offer[] {
+    return offersHere(offersIn(this.offers), this.settings);
+  }
+
+  /**
+   * Looks for offers now, as the settings that list them open, unless that was done moments ago. They count as told:
+   * the screen shows them.
+   */
+  async refreshOffers(): Promise<void> {
+    if (!this.configured() || Date.now() - this.offersLooked < 15_000) return;
+    const kept = () => JSON.stringify([this.settings.offersTold, this.settings.offersHidden]);
+    const before = kept();
+    try {
+      await this.readOffers(() => this.getEngine().view(), false);
+    } catch {
+      return;
+    }
+    if (kept() !== before) await this.saveData(this.settings);
+  }
+
+  /** Stops showing an offer on this device. Nothing lists hidden offers, so a tap on the notice it leaves brings it back. */
+  async hideOffer(o: Offer): Promise<void> {
+    const hidden = this.settings.offersHidden;
+    if (!hidden.includes(o.id)) hidden.push(o.id);
+    await this.saveData(this.settings);
+    this.updateStatus();
+    const n = new Notice(this.fragment(`“${o.folder}” is no longer offered here`, 'Tap to undo.'), 10_000);
+    n.containerEl.addClass('coffer-notice');
+    n.containerEl.addEventListener('click', () => {
+      n.hide();
+      this.settings.offersHidden = this.settings.offersHidden.filter((id) => id !== o.id);
+      void this.saveData(this.settings).then(() => this.updateStatus());
+    });
+  }
+
+  /** Whether the vault's other devices are offered `share`, as of the last look. */
+  isOffered(share: Share): boolean {
+    return isOffered(share, this.offers);
   }
 
   /** Runs `task` once no sync is running, keeping syncs off until it ends. `label` is the status meanwhile. */
@@ -652,6 +915,7 @@ export default class CofferPlugin extends Plugin {
   private release(): void {
     this.running = false;
     this.progress = '';
+    this.run.clear();
     this.updateStatus();
     if (this.changedWhileRunning) this.schedule();
   }
@@ -664,12 +928,27 @@ export default class CofferPlugin extends Plugin {
     const t = this.tracked(share);
     const rec = share ?? this.settings;
     const engine = this.getEngine(share);
-    const changed = this.changes.take(
-      share,
-      why,
-      share ? { folderMissing: !(lookup(this.app, share.folder) instanceof TFolder) } : { settingsDue: this.files?.configListingDue() ?? true },
-    );
-    const r = await engine.sync({ force, changed, allowDeletes: t.restored, fetch });
+    if (share?.property) {
+      const cannot = sendProblem(this.settings);
+      if (cannot) throw cannot;
+    }
+    // Notes shared by a property are anywhere in the vault: their sync always lists it.
+    const changed = share?.property
+      ? undefined
+      : this.changes.take(share, why, share ? { folderMissing: !(lookup(this.app, share.folder) instanceof TFolder) } : { settingsDue: this.files?.configListingDue() ?? true });
+    // What the sharer removed goes for everyone as a deletion they confirmed, whatever else changed.
+    const allowDeletes = share?.property ? [...(t.restored ?? []), ...share.removed] : t.restored;
+    let r: SyncResult;
+    let shared: Problem[] = [];
+    try {
+      r = await engine.sync({ force, changed, allowDeletes, fetch, ...(share && canSuggest(share) && { suggested: sentBefore(share) }) });
+      if (share?.property) shared = await this.afterProperty(share, engine, r);
+    } catch (e) {
+      // These come after the member list was read, so what it says of this device is known.
+      if (hasMembers(share) && (e instanceof RemovedError || e instanceof UnverifiedError)) t.standing = standingHere(share, await engine.memberStanding().catch(() => undefined)) ?? t.standing;
+      throw e;
+    }
+    if (hasMembers(share)) t.standing = standingHere(share, await engine.memberStanding());
     this.pauses.lift(keyOf(share));
     this.retries.reset(keyOf(share));
     t.restored = undefined;
@@ -680,21 +959,88 @@ export default class CofferPlugin extends Plugin {
     rec.lastSuccess = Date.now();
     rec.conflictCopies = [...new Set([...rec.conflictCopies, ...r.conflictCopies])];
     this.pruneConflictCopies(share);
-    t.found = resultProblems(share ? inVault(share, r) : r, this.conflictCopies(share), this.settings.maxFileSizeMB);
+    t.found = resultProblems(
+      share ? inVault(share, r) : r,
+      this.conflictCopies(share),
+      this.settings.maxFileSizeMB,
+      t.standing?.waiting ? t.standing.owner : undefined,
+      share && canSuggest(share) ? (t.standing?.owner ?? '') : undefined,
+    );
+    t.found.push(...shared);
     // Only a device that just committed asks for an early cleanup, so the one whose commit tipped the count does it.
     if (!r.errors.length && cleanupDue({ autoCleanDays: this.settings.autoCleanDays, lastCleanup: rec.lastCleanup }, Date.now(), r.commits > 0 && (await engine.compactionDue()))) {
       await engine.gc();
       rec.lastCleanup = Date.now();
     }
-    if (!share) await this.heartbeat();
+    if (!share) await this.vaultChores();
+    // A followed folder has no storage keys to change.
+    if (hasMembers(share) && !share.followUrl) await this.takeRekey(share, engine);
+    if (share && canSuggest(share)) forgetSent(share, r.unsent);
+    if (share?.role === 'owner' && (why === 'manual' || Date.now() - (t.inboxLooked ?? 0) >= INBOX_EVERY)) await this.lookInbox(share);
     return r;
+  }
+
+  /** Owner: counts the suggestions waiting for `share`, for its row. One listing; best effort. */
+  private async lookInbox(share: Share): Promise<void> {
+    const t = this.tracked(share);
+    t.inboxLooked = Date.now();
+    try {
+      const n = (await this.getEngine(share).inbox()).length;
+      if (n === t.suggestions) return;
+      t.suggestions = n;
+      this.updateStatus();
+    } catch {
+      // The next sync looks again.
+    }
+  }
+
+  /**
+   * New storage keys the owner of `share` handed this device: kept once they work for it, here, and the engine made
+   * again with them; otherwise this device carries on with its own, and says so once. Best effort: the next sync asks again.
+   */
+  private async takeRekey(share: Share, engine: SyncEngine): Promise<void> {
+    const t = this.tracked(share);
+    try {
+      const repo = this.memberKeysOf(share).repo;
+      const out = await followRekey(engine, {
+        type: share.storageType,
+        kept: keysOf(share, this.lookup),
+        skip: rekeySkip(t.rekeyFailed, Date.now()),
+        test: (keys) => testKeys(this.storeWith(share, keys), { repo, write: !share.readOnly, storageType: share.storageType }),
+        keep: async (keys) => {
+          this.keepKeys(share, keys);
+          this.engines.delete(share.id);
+        },
+      });
+      if (!out) return;
+      const owner = t.standing?.owner || 'the owner';
+      if (out.switched) {
+        new Notice(`“${labelOf(share)}”: this device now uses the new storage keys from ${owner}.`, 10_000);
+        return;
+      }
+      if (out.transient) return;
+      const told = t.rekeyFailed?.n === out.n;
+      t.rekeyFailed = { n: out.n, at: Date.now() };
+      if (told) return;
+      new Notice(
+        this.fragment(`“${labelOf(share)}”: new storage keys did not work here`, `${owner} sent new storage keys, but they do not work on this device, so it keeps using its own. ${out.problem ?? ''}`),
+        20_000,
+      );
+    } catch {
+      // Storage may be down; the next sync asks again.
+    }
+  }
+
+  /** What a shared folder with members tells about its failures; undefined for any other place. */
+  private memberContext(share?: Share): MemberContext | undefined {
+    return hasMembers(share) ? { owner: share.role === 'owner', ownerName: this.tracked(share).standing?.owner ?? '' } : undefined;
   }
 
   private failed(share: Share | undefined, e: unknown): Problem {
     const t = this.tracked(share);
-    t.failure = describeFailure(e);
+    t.failure = describeFailure(e, this.memberContext(share));
     this.changes.failed(share);
-    if (e instanceof SafetyError) {
+    if (pausesOn(e)) {
       this.pauses.pause(keyOf(share));
       this.retries.reset(keyOf(share));
     } else {
@@ -716,7 +1062,10 @@ export default class CofferPlugin extends Plugin {
     }, due - Date.now());
   }
 
-  /** A sync of the vault and then of each shared folder, while the caller holds `running`. One failing does not stop the rest. */
+  /**
+   * A sync of the vault and then of the shared folders, while the caller holds `running`. The vault goes first and
+   * alone, the shared folders after it a few at a time (see `syncAll`). One failing does not stop the rest.
+   */
   private async syncHeld(manual: boolean, force: Force, inline: boolean, why: Why): Promise<SyncOutcome> {
     this.changedWhileRunning = false;
     this.dirty = false;
@@ -732,22 +1081,38 @@ export default class CofferPlugin extends Plugin {
       } catch {
         // The paths stay left out, which is safe; the next sync tries again.
       }
+      // A place's failure is taken in as it ends, so its row says so while the others still sync.
+      const failures = new Map<string, Problem>();
       const outcomes = await syncAll(
         this.settings,
         this.lookup,
         (share) => this.syncOne(share, share ? force === share.id : force === true, why),
         (share) => this.gate.includes(keyOf(share), why),
+        {
+          planned: (targets) => this.run.plan(targets.map(placeOfRun)),
+          started: (share) => {
+            this.run.start(placeOfRun(share));
+            this.showRun();
+          },
+          ended: (share, error) => {
+            if (error !== undefined) failures.set(keyOf(share), this.failed(share, error));
+            this.run.end(placeOfRun(share));
+            this.showRun();
+          },
+        },
       );
       const out: SyncOutcome = { shares: new Map() };
       for (const o of outcomes) {
-        const one: SyncOutcome = 'error' in o ? { problem: this.failed(o.target, o.error) } : { result: o.result };
+        const one: SyncOutcome = 'error' in o ? { problem: failures.get(keyOf(o.target)) ?? this.failed(o.target, o.error) } : { result: o.result };
         if (o.target) out.shares!.set(o.target.id, one);
         else Object.assign(out, one);
       }
       if (manual && !inline) this.announce(outcomes, out.problem);
+      this.tellArrivals(outcomes);
       await this.saveData(this.settings);
       return out;
     } finally {
+      this.run.clear();
       this.progress = '';
       this.progressNotice?.hide();
       this.progressNotice = undefined;
@@ -763,10 +1128,51 @@ export default class CofferPlugin extends Plugin {
       if ('error' in o) continue;
       const r = o.result;
       if (!o.target) lines.push(summarize(r));
-      else if (r.pushed || r.pulled || r.deletedLocal || r.deletedRemote || r.merged || r.conflictCopies.length || r.errors.length) lines.push(`“${o.target.folder}”: ${summarize(r)}`);
+      else if (r.pushed || r.pulled || r.deletedLocal || r.deletedRemote || r.merged || r.conflictCopies.length || r.errors.length) lines.push(`“${labelOf(o.target)}”: ${summarize(r)}`);
     }
     if (lines.length) new Notice(`Sync: ${lines.join('\n')}`);
     if (vaultProblem?.id === 'offline') new Notice(this.fragment(vaultProblem.title, vaultProblem.detail), 10_000);
+  }
+
+  /**
+   * After a sync that brought in other people's changes to shared folders: one notice, a line per folder, like "Lan
+   * changed 3 notes in “Family”". Changes that come in while it shows join it, so someone typing away makes one notice,
+   * not one per sync. Tapping it shows that folder's activity.
+   */
+  private tellArrivals(outcomes: Outcome<Share | undefined, SyncResult>[]): void {
+    const now = Date.now();
+    const recent = this.arrivals && now - this.arrivals.at < ARRIVALS_SHOWN ? this.arrivals : undefined;
+    const all = new Map(recent?.byShare);
+    let fresh = false;
+    for (const o of outcomes) {
+      if (!o.target || 'error' in o || !arrivalLine(labelOf(o.target), o.result.arrived, this.selfIn(o.target))) continue;
+      all.set(o.target.id, [...(all.get(o.target.id) ?? []), ...o.result.arrived]);
+      fresh = true;
+    }
+    if (!fresh) return;
+    const told = this.settings.shares.filter((x) => all.has(x.id)).map((share) => ({ share, line: arrivalLine(labelOf(share), all.get(share.id)!, this.selfIn(share)) }));
+    if (!told.length) return;
+    recent?.notice.hide();
+    const n = new Notice(this.fragment(told[0].line, [...told.slice(1).map((x) => x.line), 'Tap to see what changed.'].join('\n')), ARRIVALS_SHOWN);
+    n.containerEl.addClass('coffer-notice');
+    n.containerEl.addEventListener('click', () => {
+      this.arrivals = undefined;
+      const shares = told.map((x) => x.share);
+      if (shares.length === 1) new ActivityModal(this.app, this, shares[0]).open();
+      else pickTarget(this, 'Show recent changes in', (share) => share && new ActivityModal(this.app, this, share).open(), (share) => !!share && shares.includes(share));
+    });
+    this.arrivals = { notice: n, at: now, byShare: all };
+  }
+
+  /** What tells this device's own changes to `share` from others': its member, its name, and the member changes it holds (`changes`). */
+  selfIn(share: Share, changes: MemberChange[] = []): Self {
+    let member: string | undefined;
+    try {
+      member = share.memberKeysSecret ? this.memberKeysOf(share).id : undefined;
+    } catch {
+      // Keys missing here: nothing is this device's member's.
+    }
+    return { member, device: this.settings.deviceName, changes };
   }
 
   /** The part of a sync's outcome about `share`, or about the vault. A share that did not sync says why. */
@@ -779,13 +1185,14 @@ export default class CofferPlugin extends Plugin {
 
   /** The safe answer to a paused mass delete: copy every file back to the side that lost it. */
   async keepAllFiles(share?: Share): Promise<void> {
-    const { kept, left } = await this.exclusive('Keeping all files…', async () => {
+    const { kept, left } = await this.exclusive(share?.property ? 'Keeping the files…' : 'Keeping all files…', async () => {
       const engine = this.getEngine(share);
       const before = new Set((await engine.deferred()).map((f) => f.path));
       const kept = await engine.keepAllFiles();
       return { kept, left: (await engine.deferred()).filter((f) => !before.has(f.path)).length };
     });
-    new Notice(`Keeping all files${share ? ` in “${share.folder}”` : ''}: ${keptNote(kept, left)}`);
+    // Notes shared by a property put nothing back in the vault: the files stay in the share.
+    new Notice(share?.property ? keptText(share.property, kept) : `Keeping all files${share ? ` in “${labelOf(share)}”` : ''}: ${keptNote(kept, left)}`);
     await this.sync(true);
   }
 
@@ -795,7 +1202,11 @@ export default class CofferPlugin extends Plugin {
    */
   async acceptStorage(share?: Share): Promise<void> {
     await this.exclusive('Carrying on from storage…', () => this.getEngine(share).acceptStorage());
-    new Notice(`Carrying on from storage as it is now${share ? ` in “${share.folder}”` : ''}. Nothing is deleted; where files differ, both versions are kept.`);
+    new Notice(
+      share?.property
+        ? `Carrying on from storage as it is now in “${share.property}”. Nothing is deleted; where files differ, your notes are sent again.`
+        : `Carrying on from storage as it is now${share ? ` in “${share.folder}”` : ''}. Nothing is deleted; where files differ, both versions are kept.`,
+    );
     await this.sync(true);
   }
 
@@ -860,25 +1271,66 @@ export default class CofferPlugin extends Plugin {
     return folder.path;
   }
 
-  private async removeState(share: Share): Promise<void> {
+  /** Forgets a share's sync state. Its member list, if it has one, stays: see `positionPath`. */
+  private removeState(share: Share): Promise<void> {
+    return this.removeFile(statePath(this.pluginDir(), share.id));
+  }
+
+  private async removeFile(path: string): Promise<void> {
     const adapter = this.app.vault.adapter;
-    const path = statePath(this.pluginDir(), share.id);
     if (await adapter.exists(path)) await adapter.remove(path);
+  }
+
+  /** Every secret a setting of the vault or of a share names. */
+  private secretsInUse(): Set<string> {
+    const s = this.settings;
+    const names: string[] = [s.accessKeySecret, s.secretKeySecret, s.passphraseSecret, s.webdavPasswordSecret];
+    for (const x of s.shares) for (const k of SHARE_SECRETS) names.push(x[k]);
+    return new Set(names.filter(Boolean));
+  }
+
+  /**
+   * Empties a secret no setting names any more, and takes it off the keychain's list where this version of Obsidian
+   * can (`deleteSecret` is not in its published API, so it may be missing).
+   */
+  private forgetSecret(name: string): void {
+    const store = this.app.secretStorage as SecretStorage & { deleteSecret?: (id: string) => unknown };
+    try {
+      store.setSecret(name, '');
+      if (typeof store.deleteSecret === 'function') store.deleteSecret(name);
+    } catch {
+      // The setting no longer points at it, which is what matters.
+    }
   }
 
   /**
    * Adds a shared folder, creating its folder when missing, and stores its secrets. Waits for any sync to finish
-   * first: a sync of the vault that began before must not see the folder taken away from it halfway.
+   * first: a sync of the vault that began before must not see the folder taken away from it halfway. The vault's next
+   * sync offers it to the vault's other devices (offers.ts), unless it came from such an offer (`offered`) or this
+   * device never writes to the vault's storage.
    */
-  async addShare(share: Share, secrets: [string, string][]): Promise<void> {
+  async addShare(share: Share, secrets: [string, string][], offered = false): Promise<void> {
     await this.exclusive('Adding the shared folder…', async () => {
       const s = this.settings;
-      const problem = folderProblem(s, share.folder, this.app.vault.configDir, this.pluginDir()) || storageProblem(s, share);
+      if (share.property) {
+        // Its notes stay where they are: no folder to make, nothing to take out of the vault, and offered to no other
+        // device, since only this one sends it.
+        const problem = startProblem(s, share.property) || storageProblem(s, share);
+        if (problem) throw new Error(problem);
+        this.engines.clear();
+        for (const [id, value] of secrets) this.app.secretStorage.setSecret(id, value);
+        share.offerPending = '';
+        s.shares.push(share);
+        await this.saveSettings();
+        return;
+      }
+      const problem = folderProblem(s, share.folder, this.app.vault.configDir, this.pluginDir(), '', await this.propertyHeld()) || storageProblem(s, share);
       if (problem) throw new Error(problem);
       share.folder = await this.ensureFolder(share.folder);
       this.engines.clear();
       await takeVaultCopies(this.host(), share);
       for (const [id, value] of secrets) this.app.secretStorage.setSecret(id, value);
+      share.offerPending = offered || s.readOnly ? '' : 'add';
       s.shares.push(share);
       await this.saveSettings();
     });
@@ -893,41 +1345,54 @@ export default class CofferPlugin extends Plugin {
   /**
    * Stops syncing `share` on this device. Its files stay where they are and from then on sync with the vault, with
    * nothing deleted on either side (see `rejoin`). Its secrets and sync state are forgotten here; nothing is deleted
-   * from its storage.
+   * from its storage. With `withdraw`, the vault's other devices are no longer offered it (offers.ts); returns why
+   * that could not be done, if it could not.
    */
-  async stopSharing(share: Share): Promise<void> {
+  async stopSharing(share: Share, withdraw = false): Promise<string | undefined> {
+    let notWithdrawn: string | undefined;
     await this.exclusive('Stopping…', async () => {
       const s = this.settings;
       let remote: Set<string> | undefined;
+      let view: RepoView | undefined;
       try {
-        remote = new Set((await this.getEngine().view()).st.remote.keys());
+        view = await this.getEngine().view();
+        remote = new Set(view.st.remote.keys());
       } catch {
         // Offline: what the vault's state last saw of storage stands in.
       }
+      if (withdraw) {
+        try {
+          if (!view) throw new Error('Could not reach this vault’s storage');
+          await withdrawOffers(view.repo, share, this.offers);
+        } catch (e) {
+          notWithdrawn = errorText(e);
+        }
+      }
+      // Still offered to the other devices, it is not offered back to this one, which just stopped it.
+      for (const id of withdraw && notWithdrawn === undefined ? [] : [share.id, ...offersOf(share, this.offers)]) if (!s.offersHidden.includes(id)) s.offersHidden.push(id);
       // No vault engine may save its own copy of the state over what `rejoin` writes.
       this.engines.clear();
-      await rejoin(this.host(), share, this.localKeys(), remote);
+      // Notes shared by a property never left the vault's sync: nothing to take back.
+      if (!share.property) await rejoin(this.host(), share, this.localKeys(), remote);
+      this.surveys.delete(share.id);
       s.shares = s.shares.filter((x) => x.id !== share.id);
-      const inUse = new Set([s, ...s.shares].flatMap((x) => SECRET_KEYS.map((k) => x[k])));
-      for (const k of SECRET_KEYS) {
+      const inUse = this.secretsInUse();
+      for (const k of SHARE_SECRETS) {
         const name = share[k];
-        if (!name || inUse.has(name)) continue;
-        try {
-          this.app.secretStorage.setSecret(name, '');
-        } catch {
-          // The setting no longer points at it, which is what matters.
-        }
+        if (name && !inUse.has(name)) this.forgetSecret(name);
       }
       this.tracking.delete(share.id);
       this.pauses.lift(share.id);
       this.retries.reset(share.id);
       await this.removeState(share);
+      await this.removeFile(positionPath(this.pluginDir(), share.id));
       await this.saveSettings();
     });
     this.report();
     // Its files are the vault's to sync now, and no vault event says so.
     this.dirty = true;
     this.schedule();
+    return notWithdrawn;
   }
 
   /**
@@ -954,6 +1419,285 @@ export default class CofferPlugin extends Plugin {
   async readOnlyInviteLink(share: Share, keys: Keys & { user: string }): Promise<string> {
     const iterations = codeIterations(await this.getEngine(share).kdfIterations().catch(() => undefined));
     return setupLink(await readOnlyInviteCode(share, keys, this.lookup, fileName(share.folder), iterations));
+  }
+
+  // Shared folders with members (`members.ts`, and `membership.ts` in core).
+
+  /** This device's keys to `share`, a shared folder with members. */
+  memberKeysOf(share: Share): MemberKeys {
+    return memberKeysIn(share, this.lookup);
+  }
+
+  /** What this device is in `share`, as of its last sync; undefined before one, or for a share without members. */
+  standingOf(share: Share): MemberStanding | undefined {
+    return this.tracked(share).standing;
+  }
+
+  /** A store that reaches `share`'s storage with `keys` instead of the ones kept, for trying them. */
+  private storeWith(share: Share, keys: KeySet) {
+    const { storage, secret } = withKeys(share, keys);
+    return openRemote(remoteSpec(storage, secret), obsidianHttp);
+  }
+
+  /**
+   * Keeps `keys` as the ones this device reaches `share`'s storage with. A secret that the vault or another share also
+   * names is left to them, and the share gets one of its own.
+   */
+  private keepKeys(share: Share, keys: KeySet): void {
+    const vault = this.app.vault.getName();
+    const others = new Set([this.settings, ...this.settings.shares.filter((x) => x.id !== share.id)].flatMap((x) => [x.accessKeySecret, x.secretKeySecret, x.webdavPasswordSecret]));
+    const put = (key: 'accessKeySecret' | 'secretKeySecret' | 'webdavPasswordSecret', base: string, value: string) => {
+      const name = share[key] && !others.has(share[key]) ? share[key] : shareSecretName(base, vault, share.id);
+      this.app.secretStorage.setSecret(name, value);
+      share[key] = name;
+    };
+    if (share.storageType === 'webdav') {
+      share.webdavUser = keys.user.trim() || share.webdavUser;
+      put('webdavPasswordSecret', IDS.password, keys.password);
+    } else {
+      put('accessKeySecret', IDS.access, keys.access.trim());
+      put('secretKeySecret', IDS.secret, keys.secret.trim());
+    }
+    // An offer of it kept in the vault's storage carries the old keys.
+    if (!share.offerPending && !this.settings.readOnly && !share.property) share.offerPending = 'update';
+  }
+
+  /** The id of the vault or shared folder `share`'s storage should hold: from its keys, or as its last sync saw it; undefined before one. */
+  private async knownRepo(share: Share): Promise<string | undefined> {
+    if (share.memberKeysSecret) return this.memberKeysOf(share).repo;
+    const st = LocalState.parse(await new PluginState(this.app, statePath(this.pluginDir(), share.id)).load());
+    return st.vaultId || undefined;
+  }
+
+  /**
+   * Starts a shared folder with members in `share`'s storage, which must be empty, with this device as its owner,
+   * `owner` being the name members see. Returns the keys to keep; adding the share is `addShare`'s.
+   */
+  async newMemberShare(share: Share, secrets: [string, string][], owner: string, passphrase: string): Promise<MemberKeys> {
+    const problem =
+      (share.property ? startProblem(this.settings, share.property) : folderProblem(this.settings, share.folder, this.app.vault.configDir, this.pluginDir(), '', this.propertyFiles())) ||
+      storageProblem(this.settings, share);
+    if (problem) throw new Error(problem);
+    const values = new Map(secrets);
+    const store = openRemote(remoteSpec(share, (n) => values.get(n) ?? ''), obsidianHttp);
+    return createMemberShare(store, { owner, device: this.settings.deviceName, passphrase, kdfIterations: DEFAULT_CONFIG.kdfIterations, chunk: DEFAULT_CONFIG.chunk });
+  }
+
+  /**
+   * Joins a shared folder with members with a member's invite: its keys are kept and the share added before this
+   * device asks the owner's to confirm it (`joinWithInvite`). When another device used the invite first, the share is
+   * taken off again and the error thrown. Returns whether the request to confirm went out; the next sync sends it if not.
+   */
+  async joinMember(share: Share, secrets: [string, string][], invite: MemberInvite): Promise<boolean> {
+    const values = new Map(secrets);
+    const store = openRemote(remoteSpec(share, (n) => values.get(n) ?? ''), obsidianHttp);
+    let added = false;
+    try {
+      const { sent } = await joinWithInvite(store, invite, async (keys) => {
+        await this.addShare(share, [...secrets, [share.memberKeysSecret, JSON.stringify(keys)]]);
+        added = true;
+      });
+      return sent;
+    } catch (e) {
+      if (added && isUsedError(e)) await this.stopSharing(share);
+      throw e;
+    }
+  }
+
+  /** Every member of `share` and how each stands, as its owner's device sees it, with storage brought up to date. */
+  async members(share: Share): Promise<MemberStatus[]> {
+    return this.getEngine(share).members();
+  }
+
+  /**
+   * Owner: invites `name` to `share` for `days`. A read invite carries `read`, keys made to read only (`suggest`: and
+   * to add suggestions, which marks the member as one who sends them), tested first; a write invite carries this
+   * device's own. Returns the link, ready to copy.
+   */
+  async invite(share: Share, o: { name: string; role: 'write' | 'read'; days: number; read?: KeySet; suggest?: boolean }): Promise<{ link: string; expires: number }> {
+    const refused = inviteProblem(share, o.role);
+    if (refused) throw new Error(refused);
+    const keys = this.memberKeysOf(share);
+    const reach = o.role === 'read' ? withKeys(share, o.read!) : { storage: share, secret: this.lookup };
+    if (o.role === 'read') await testKeys(this.storeWith(share, o.read!), { repo: keys.repo, write: false, onlyRead: mustNotWrite(share, !!o.suggest), storageType: share.storageType });
+    const expires = expiresIn(o.days, Date.now());
+    const suggest = o.role === 'read' && !!o.suggest;
+    const grant = await this.exclusive('Making an invite…', () => this.getEngine(share).invite({ name: o.name, role: o.role, expires, suggest }));
+    const name = share.property || fileName(share.folder);
+    const invite: MemberInvite = { ...grant, storage: storagePayload(reach.storage, reach.secret), share: name, folder: name };
+    return { link: setupLink(encodeInvite(invite)), expires };
+  }
+
+  /**
+   * Owner: a link that sets up another of the owner's devices for `share`, sealed with its passphrase. It carries the
+   * owner's keys. Slow, so it is made before the tap that copies it.
+   */
+  async ownerLink(share: Share): Promise<string> {
+    if (share.property) throw new Error('Notes shared by a property are sent from this device only, so there is no link for your other devices.');
+    const keys = this.memberKeysOf(share);
+    const iterations = codeIterations(await this.getEngine(share).kdfIterations().catch(() => undefined));
+    return setupLink(await encodeSetupCode({ ...share, readOnly: false }, this.lookup, fileName(share.folder), iterations, ownerLinkFields(keys)));
+  }
+
+  /**
+   * Owner: a follow link to `share`, read from public address `url`, which is checked to serve this folder first. Its
+   * member, named `name`, reads with no storage keys, and its link never expires.
+   */
+  async followLink(share: Share, o: { name: string; url: string }): Promise<string> {
+    const keys = this.memberKeysOf(share);
+    const url = o.url.trim();
+    await checkFollowAddress(openRemote({ type: 'follow', url }, obsidianHttp), keys.repo);
+    const grant = await this.exclusive('Making a follow link…', () => this.getEngine(share).invite({ name: o.name, role: 'read', expires: 0, follow: true }));
+    const name = share.property || fileName(share.folder);
+    return setupLink(encodeFollow({ repo: grant.repo, member: grant.member, secret: grant.secret, owner: grant.owner, since: grant.since, url, share: name, folder: name }));
+  }
+
+  /** Follows a shared folder with a follow link: opens it at its public address for its keys, kept with the share as it is added. */
+  async joinFollow(share: Share, invite: FollowInvite): Promise<void> {
+    const keys = await joinShare(openRemote({ type: 'follow', url: invite.url }, obsidianHttp), invite);
+    await this.addShare(share, [[share.memberKeysSecret, JSON.stringify(keys)]]);
+  }
+
+  /** Owner: confirms the devices that joined `share` to write, so they may send changes. Returns how many. */
+  async confirmJoins(share: Share): Promise<number> {
+    return (await this.exclusive('Confirming…', () => this.getEngine(share).confirmJoins())).length;
+  }
+
+  /** Owner: removes member `id` from `share`. */
+  async removeMember(share: Share, id: string): Promise<void> {
+    await this.exclusive('Removing a member…', () => this.getEngine(share).removeMember(id));
+  }
+
+  /**
+   * Owner: takes out of `share`'s storage the changes at the end of its log that no member who may write made, so that
+   * syncing carries on (`SyncEngine.removeUnverifiable`). Returns how many were removed.
+   */
+  async removeUnverifiable(share: Share): Promise<number> {
+    const removed = await this.exclusive('Removing changes…', () => this.getEngine(share).removeUnverifiable());
+    this.tracked(share).failure = undefined;
+    this.pauses.lift(share.id);
+    this.retries.reset(share.id);
+    this.report();
+    void this.sync(true);
+    return removed.length;
+  }
+
+  /**
+   * Owner: hands `write` (`read` to those who only read, named in `readers`, and `suggest` to those who also send
+   * suggestions, named in `suggesters`) to every device of `share`, each tested against it first, and switches this
+   * device to `write`. Returns when that is done; the others switch at their next sync.
+   */
+  async rekey(share: Share, o: { write: KeySet; read?: KeySet; readers: string[]; suggest?: KeySet; suggesters: string[] }): Promise<void> {
+    if (share.readOnly) throw new Error('This device only receives changes for this folder. Turn that off first: handing out keys writes to its storage.');
+    const repo = this.memberKeysOf(share).repo;
+    await this.exclusive('Handing out new storage keys…', () =>
+      rekey(this.getEngine(share), {
+        type: share.storageType,
+        ...o,
+        current: keysOf(share, this.lookup),
+        test: (keys, use) => testKeys(this.storeWith(share, keys), { repo, ...rekeyTest(share, use), storageType: share.storageType }),
+      }),
+    );
+    this.keepKeys(share, o.write);
+    await this.saveSettings();
+  }
+
+  /**
+   * Replaces the storage keys this device uses for `share`, once they reach the same shared folder and, for a device
+   * that sends changes, may write there.
+   */
+  async changeKeys(share: Share, keys: KeySet): Promise<void> {
+    await this.exclusive('Checking the keys…', async () => {
+      await testKeys(this.storeWith(share, keys), { repo: await this.knownRepo(share), write: !share.readOnly, storageType: share.storageType });
+      this.keepKeys(share, keys);
+      await this.saveSettings();
+    });
+    this.tracked(share).failure = undefined;
+    this.retries.reset(share.id);
+    this.report();
+  }
+
+  // Suggestions (`suggestions.ts`, and `suggest.ts` in core).
+
+  /** Whether this device can send `share`'s owner what it changed, as a suggestion. */
+  canSuggest(share: Share): boolean {
+    return canSuggest(share);
+  }
+
+  /** The files changed here in `share` and not sent, as of its last sync, by their path inside it. */
+  unsentOf(share: Share): string[] {
+    const files = this.tracked(share).found.find((p) => p.id === 'unsent')?.files ?? [];
+    return files.map((path) => this.placeOf(path)).filter((p) => p.share === share).map((p) => p.path);
+  }
+
+  /**
+   * Sends the files at `paths` (inside `share`) to its owner as one suggestion, leaving out what was sent before and is
+   * unchanged since. Throws when storage refuses it (see `isRefused`).
+   */
+  async sendSuggestion(share: Share, paths: string[]): Promise<SuggestOutcome> {
+    const out = await this.getEngine(share).sendSuggestion(paths, sentBefore(share));
+    if (out.sent.length) {
+      recordSent(share, out);
+      await this.saveData(this.settings);
+      this.updateStatus();
+    }
+    return out;
+  }
+
+  /** Owner: how many suggestions wait for `share`, as of the last look; 0 before one. */
+  suggestionCount(share: Share): number {
+    return this.tracked(share).suggestions ?? 0;
+  }
+
+  /** Owner: the newest suggestions waiting for `share`, opened, and how many more wait; the count on its row follows. */
+  async suggestions(share: Share): Promise<WaitingSuggestions> {
+    const found = await this.getEngine(share).suggestions();
+    const t = this.tracked(share);
+    t.inboxLooked = Date.now();
+    const total = found.items.length + found.more;
+    if (t.suggestions !== total) {
+      t.suggestions = total;
+      this.updateStatus();
+    }
+    return found;
+  }
+
+  /**
+   * The file at `path` inside `share` as it is now, any editor of it saved first: its size and time, and its bytes when
+   * small enough to compare; undefined when there is none.
+   */
+  async currentFile(share: Share, path: string): Promise<Snapshot | undefined> {
+    const { fs } = this.scope(share);
+    const at = (await this.localPaths(share)).get(vaultKey(path)) ?? path;
+    await this.saveEditorOf(fs.pathOf(at));
+    const stat = await fs.stat(at);
+    if (!stat) return undefined;
+    return { size: stat.size, mtime: stat.mtime, ...(stat.size <= MAX_COMPARE_BYTES && { data: await fs.read(at) }) };
+  }
+
+  /**
+   * Owner: takes a suggested file in, writing `data` at `path` (inside `share`; where it is now, if it moved since), unless
+   * that file changed since it was `shown`; then the file `suggested` of suggestion `key` counts as dealt with. The next
+   * sync sends it as this device's change. False when the file changed meanwhile, and nothing was written.
+   */
+  async acceptSuggested(share: Share, key: string, suggested: string, path: string, data: Uint8Array, shown: Snapshot | undefined): Promise<boolean> {
+    if (!unchangedSince(shown, await this.currentFile(share, path))) return false;
+    const at = (await this.localPaths(share)).get(vaultKey(path)) ?? path;
+    await this.writeFile(share, at, data);
+    await this.settleSuggested(share, key, suggested);
+    return true;
+  }
+
+  /** Owner: file `path` of suggestion `key` was dealt with, taken in or left out. */
+  async settleSuggested(share: Share, key: string, path: string): Promise<void> {
+    await this.getEngine(share).settleSuggestion(key, path);
+    await this.lookInbox(share);
+  }
+
+  /** Owner: takes suggestion `key` out of storage whole. */
+  async dismissSuggestion(share: Share, key: string): Promise<void> {
+    await this.getEngine(share).dismissSuggestion(key);
+    await this.lookInbox(share);
   }
 
   /** How many files are left in storage until asked for, in the vault and in each shared folder that syncs, as of its last sync; undefined before it has run since the app started. */
@@ -1010,7 +1754,7 @@ export default class CofferPlugin extends Plugin {
           const r = await this.getEngine(share).gc();
           for (const k of Object.keys(total) as (keyof GcResult)[]) total[k] += r[k];
         } catch (e) {
-          failed.push(`${share ? `“${share.folder}”` : 'This vault'}: ${errorText(e)}`);
+          failed.push(`${share ? `“${labelOf(share)}”` : 'This vault'}: ${errorText(e)}`);
         }
       }
     });
@@ -1026,7 +1770,7 @@ export default class CofferPlugin extends Plugin {
   /** The file table is copied before anything else is awaited: a sync waiting on the engine may change it from then on. */
   async look(share?: Share): Promise<Look> {
     const v = await this.getEngine(share).view();
-    return { repo: v.repo, remote: new Map(v.st.remote), lastSeq: v.st.lastSeq, cfg: v.cfg, now: v.now };
+    return { repo: v.repo, remote: new Map(v.st.remote), lastSeq: v.st.lastSeq, cfg: v.cfg, now: v.now, members: [...v.st.members] };
   }
 
   /**
@@ -1035,6 +1779,7 @@ export default class CofferPlugin extends Plugin {
    */
   keptOut(share?: Share): (path: string) => boolean {
     const dir = this.app.vault.configDir;
+    if (share?.property) return keepOut(propertyConfig(this.settings, dir, this.pluginDir()).exclude, []);
     if (share) return keepOut(shareConfig(this.settings, share, dir).exclude, []);
     const own = this.pluginDir();
     return keepOut(syncConfig(this.settings, dir, own).exclude, this.settings.syncConfigDir ? [own] : [own, dir]);
@@ -1047,6 +1792,8 @@ export default class CofferPlugin extends Plugin {
 
   /** The files of the vault, or of a shared folder, by key, with the path each has there. */
   private async localPaths(share?: Share): Promise<Map<string, string>> {
+    // Notes shared by a property are at their vault paths.
+    if (share?.property) return new Map(this.app.vault.getFiles().map((f) => [vaultKey(f.path), f.path]));
     return new Map((await this.scope(share).fs.list()).map((f) => [vaultKey(f.path), f.path]));
   }
 
@@ -1058,6 +1805,7 @@ export default class CofferPlugin extends Plugin {
   private async writeFile(share: Share | undefined, path: string, data: Uint8Array): Promise<void> {
     const vault = this.app.vault;
     const full = this.scope(share).fs.pathOf(path);
+    if (share?.property) data = await this.intoProperty(share, full, data);
     if (full.startsWith(`${vault.configDir}/`)) {
       await this.files!.write(full, data);
       // Settings fire no vault events: the next sync lists them again and finds it.
@@ -1128,7 +1876,7 @@ export default class CofferPlugin extends Plugin {
    * not stop the rest. Ends with the sync that sends the result.
    */
   async restoreTo(target: Map<string, Entry>, folder: string, expected: Step[], share?: Share): Promise<RestoreOutcome> {
-    if ((share ?? this.settings).readOnly) {
+    if (this.receivesOnly(share)) {
       const problem: Problem = {
         id: 'read-only',
         severity: 'critical',
@@ -1192,5 +1940,280 @@ export default class CofferPlugin extends Plugin {
       const sent = this.outcomeOf(await this.syncHeld(true, false, true, 'manual'), share);
       return { done, failed, sent, olderPause: deleteLimitCrossed(done.length - removed.length, removed.length, synced, cfg) !== undefined };
     });
+  }
+
+  // Notes shared by a property (byproperty.ts): one per vault, sent only from this device.
+
+  /** Obsidian has read the vault: new notes may join from now on, and screens waiting for that look again. */
+  private catalogReady(): void {
+    if (this.catalog.ready()) return;
+    this.catalog.markReady();
+    this.updateStatus();
+    if (this.propertyShare()) this.schedule();
+  }
+
+  /** The notes this vault shares by a property, if it does. */
+  propertyShare(): Share | undefined {
+    return this.settings.shares.find((s) => s.property);
+  }
+
+  /** The id of the notes shared by a property that a change at vault path `path` concerns: a file they hold, or a note they show. */
+  private propertyOf(path: string): string[] {
+    return propertyPlaces(this.settings.shares, path).filter((id) => {
+      const survey = this.surveys.get(id);
+      return !survey || survey.held.has(vaultKey(path)) || survey.shared.has(vaultKey(path));
+    });
+  }
+
+  private propertyIds(): string[] {
+    return this.settings.shares.filter((s) => s.property).map((s) => s.id);
+  }
+
+  /** What the last sync of `share`, notes shared by a property, found; undefined before one in this session. */
+  surveyOf(share: Share): Survey | undefined {
+    return this.surveys.get(share.id);
+  }
+
+  /** The files notes shared by a property hold here, as the last sync found them: a shared folder may not take any. */
+  propertyFiles(): string[] {
+    return [...this.surveys.values()].flatMap((v) => [...new Set([...v.held, ...v.shared.keys()])]);
+  }
+
+  /** As `propertyFiles`, also from storage when no sync has looked yet. */
+  private async propertyHeld(): Promise<string[]> {
+    const share = this.propertyShare();
+    if (!share || !syncable(share, this.lookup) || this.surveys.has(share.id)) return this.propertyFiles();
+    try {
+      const { st } = await this.getEngine(share).view();
+      return [...new Set([...st.synced.keys(), ...st.remote.keys()])];
+    } catch {
+      return this.propertyFiles();
+    }
+  }
+
+  /** What `share` holds and would take in now, read without syncing, for "What's shared". */
+  async lookAtShared(share: Share): Promise<Survey> {
+    return (this.scope(share).fs as PropertyFS).peek(await this.getEngine(share).held());
+  }
+
+  /** What starting notes shared by a property named `name` would send now. */
+  previewProperty(name: string): Promise<Survey> {
+    const config = propertyConfig(this.settings, this.app.vault.configDir, this.pluginDir());
+    this.notes ??= new ObsidianFS(this.app, false, () => []);
+    const fs = new PropertyFS({ inner: this.notes, catalog: this.catalog, share: () => ({ property: name.trim(), removed: [], approved: [], ask: [] }), excluded: compileExcludes(config.exclude) });
+    return fs.preview();
+  }
+
+  /**
+   * After a sync of notes shared by a property: stops when another device signed as this one; keeps the sharer's
+   * choices that still matter; tells what changed. Returns what waits for the sharer, as problems.
+   */
+  private async afterProperty(share: Share, engine: SyncEngine, r: SyncResult): Promise<Problem[]> {
+    const other = otherSender(r.arrived, this.memberKeysOf(share).id, this.settings.deviceName);
+    if (other) throw new OtherSenderError(other);
+    const survey = (this.scope(share).fs as PropertyFS).survey();
+    if (!survey) return [];
+    // Listed before the sync, which deleted most of them for everyone: what is left stays in the share.
+    const held = await engine.held();
+    survey.stored = survey.stored.filter((k) => held.get(k));
+    this.surveys.set(share.id, survey);
+    Object.assign(share, settleChoices(share, this.localKeys(), survey.held));
+    this.tellProperty(share, survey, r);
+    return propertyProblems(share.property, survey);
+  }
+
+  /** Notices after a sync of notes shared by a property: new notes sent, notes that stopped saying share, files no note shows. */
+  private tellProperty(share: Share, survey: Survey, r: SyncResult): void {
+    const failed = new Set(r.errors.map((e) => vaultKey(e.path)));
+    const sent = r.commits ? survey.fresh.filter((k) => isNote(k) && !failed.has(k)) : [];
+    const open = () => new WhatsSharedModal(this.app, this, share).open();
+    const notice = (title: string, detail: string) => {
+      const n = new Notice(this.fragment(title, detail), 15_000);
+      n.containerEl.addClass('coffer-notice');
+      n.containerEl.addEventListener('click', open);
+    };
+    if (sent.length) notice(sentNotesText(share.property, sent), 'Tap to see what is shared.');
+    const fresh = (keys: string[], tag: string) => keys.filter((k) => !this.told.has(`${tag}:${k}`));
+    const unmarked = fresh(survey.unmarked, 'unmarked');
+    if (unmarked.length) notice(unmarkedText(share.property, unmarked), 'What you change in it is not sent until you choose. Tap to choose.');
+    const unused = fresh(survey.unused, 'unused');
+    if (unused.length) notice(unusedText(share.property, unused), 'Tap to remove them.');
+    for (const k of unmarked) this.told.add(`unmarked:${k}`);
+    for (const k of unused) this.told.add(`unused:${k}`);
+  }
+
+  /**
+   * The attachments in `share` that the note at `note` shows and no other shared note mentions by name, read from each
+   * note's bytes now. None until Obsidian has read the vault, so that the box to remove them waits until then.
+   */
+  async filesOnlyIn(share: Share, note: string): Promise<string[]> {
+    if (!this.catalog.ready()) return [];
+    const survey = await this.lookAtShared(share);
+    const key = vaultKey(note);
+    const shows = new Set(this.catalog.embeds(note).flatMap((e) => (e.target && survey.shared.has(vaultKey(e.target)) && isAttachment(vaultKey(e.target)) ? [vaultKey(e.target)] : [])));
+    if (!shows.size) return [];
+    const fs = this.scope(share).fs as PropertyFS;
+    const others: { key: string; text: string }[] = [];
+    for (const [k, f] of survey.shared) if (isNote(k) && k !== key) others.push({ key: k, text: new TextDecoder().decode(await fs.read(f.path)) });
+    // A note that no longer says share is still in the share, and may show them too.
+    for (const k of survey.unmarked) if (k !== key) others.push({ key: k, text: new TextDecoder().decode(await fs.read(k)) });
+    return onlyShownBy(key, [...shows], others);
+  }
+
+  /** Shares `file` in `share` (its properties say share: <name> from now on, and nothing keeps it out), saying how it went. */
+  async shareNoteSaying(share: Share, file: TFile): Promise<void> {
+    try {
+      await this.shareNote(share, file);
+      new Notice(`“${file.basename}” is added to “${share.property}” at the next sync.`);
+    } catch (e) {
+      new Notice(errorText(e), 10_000);
+    }
+  }
+
+  /** Writes share: <name> into the properties of `file`, and lets it join again if it was taken out. */
+  async shareNote(share: Share, file: TFile): Promise<void> {
+    const problem = this.joinProblemOf(share, file.path);
+    if (problem) throw new Error(problem);
+    await this.saveEditorOf(file.path);
+    if (!(await this.editProperties(file, (text) => withShare(text, share.property)))) {
+      throw new Error(`The properties of “${file.basename}” could not be read, so share: ${share.property} was not added. Fix them, or add it by hand.`);
+    }
+    await this.shareFiles(share, [file.path]);
+  }
+
+  /** Whether the note at `path` is in `share` or joins it at the next sync; with `unmarked`, also one that no longer says so. */
+  private noteIn(share: Share, path: string, unmarked = false): boolean {
+    return noteInShare(vaultKey(path), share, this.surveys.get(share.id), this.catalog.says(path, share.property), unmarked);
+  }
+
+  /** Why the note at `path` can not join `share` by its property, or '' when it can. */
+  private joinProblemOf(share: Share, path: string): string {
+    return joinProblem(vaultKey(path), share.property, { folder: this.placeOf(path).share?.folder, excluded: this.keptOut(share) });
+  }
+
+  /** Rewrites a note's text with `edit`, unless that leaves it as it is. False when `edit` could not read its properties. */
+  private async editProperties(file: TFile, edit: (text: string) => string | undefined): Promise<boolean> {
+    const text = await this.app.vault.read(file);
+    const now = edit(text);
+    if (now === undefined) return false;
+    // Written by `process`, which reads the note again: nothing typed in between is lost.
+    if (now !== text) await this.app.vault.process(file, (t) => edit(t) ?? t);
+    return true;
+  }
+
+  /** Lets files at `paths` join `share`: not kept out any more, and an attachment said yes to. */
+  async shareFiles(share: Share, paths: string[]): Promise<void> {
+    const keys = new Set(paths.map(vaultKey));
+    share.removed = share.removed.filter((k) => !keys.has(vaultKey(k)));
+    share.ask = share.ask.filter((k) => !keys.has(vaultKey(k)));
+    share.approved = [...new Set([...share.approved, ...[...keys].filter((k) => !isNote(k))])];
+    await this.saveSettings();
+    this.dirty = true;
+    this.schedule();
+  }
+
+  /** Keeps the attachments at `paths` out of `share`, as waiting ones the sharer said no to. */
+  async keepOutOf(share: Share, paths: string[]): Promise<void> {
+    const keys = new Set(paths.map(vaultKey));
+    share.removed = [...new Set([...share.removed, ...keys])];
+    share.ask = share.ask.filter((k) => !keys.has(vaultKey(k)));
+    share.approved = share.approved.filter((k) => !keys.has(vaultKey(k)));
+    await this.saveSettings();
+    this.dirty = true;
+    this.schedule();
+  }
+
+  /**
+   * Takes the files at `paths` out of `share`. They are deleted from it on everyone's devices, as a deletion the sharer
+   * confirmed, and stay in this vault; a note loses share: <name> from its properties, so it is not shared again. The
+   * deletion is sent at once, whatever else changed. Returns what could not be done, which leaves them out all the same,
+   * and whether a deletion is still to be sent (`pending`), with why this sync did not send it, when it says.
+   */
+  async removeFromShare(share: Share, paths: string[]): Promise<{ problems: string[]; pending: boolean; why: string }> {
+    const problems: string[] = [];
+    await this.exclusive(`Removing from “${share.property}”…`, async () => {
+      const keys = new Set(paths.map(vaultKey));
+      share.removed = [...new Set([...share.removed, ...keys])];
+      share.approved = share.approved.filter((k) => !keys.has(vaultKey(k)));
+      share.ask = share.ask.filter((k) => !keys.has(vaultKey(k)));
+      await this.saveSettings();
+      for (const key of [...keys].filter(isNote)) {
+        const file = lookup(this.app, key);
+        if (!(file instanceof TFile)) continue;
+        try {
+          await this.saveEditorOf(file.path);
+          if (!(await this.editProperties(file, (text) => withoutShare(text, share.property)))) {
+            problems.push(`The properties of “${file.basename}” could not be read, so share: ${share.property} is still in them. It stays out of “${share.property}” all the same.`);
+          }
+        } catch (e) {
+          problems.push(`“${file.basename}”: ${errorText(e)}. It stays out of “${share.property}” all the same.`);
+        }
+      }
+    });
+    this.pauses.lift(share.id);
+    this.retries.reset(share.id);
+    // Undefined when this sync did not run, as when another was running: the one after it sends the deletion.
+    const out = (await this.sync(true)).shares?.get(share.id);
+    // What the engine still holds after the sync is what was not deleted for the others, whatever stopped it.
+    let pending = true;
+    try {
+      const held = await this.getEngine(share).held();
+      pending = paths.some((p) => held.get(vaultKey(p)));
+    } catch {
+      // Not known here, as without its keys: said as not sent yet.
+    }
+    return { problems, pending, why: pending ? (out?.problem?.title ?? '') : '' };
+  }
+
+  /**
+   * Owner: why the suggested file at `path` (inside `share`) can not be taken in, or '' when it can. Reads nothing of
+   * the file there, so a suggestion aimed at a note that is not shared shows nothing of it. Into notes shared by a
+   * property, see `writeProblem`; into a shared folder, a file its sync leaves out.
+   */
+  async takeProblem(share: Share, path: string): Promise<string> {
+    if (share.property) return writeProblem(vaultKey(path), share.property, this.writeChecks(await this.lookAtShared(share)));
+    return this.keptOut(share)(path) ? `“${path}” is left out of sync on this device, so it can not be taken in here.` : '';
+  }
+
+  /** What `writeProblem` asks of the vault and of notes shared by a property, as `survey` found them. */
+  private writeChecks(survey: Survey): Parameters<typeof writeProblem>[2] {
+    const byCase = new Map(this.app.vault.getFiles().map((f) => [vaultKey(f.path).toLowerCase(), vaultKey(f.path)]));
+    const config = propertyConfig(this.settings, this.app.vault.configDir, this.pluginDir());
+    return {
+      excluded: compileExcludes(config.exclude),
+      exists: (k) => byCase.get(k.toLowerCase()),
+      shared: (k) => survey.shared.has(k) || survey.unmarked.includes(k),
+    };
+  }
+
+  /**
+   * A suggested note as it goes into notes shared by a property: never over a file of the vault that is not in the
+   * share. A new note gets share: <name>, so it joins; what the note newly shows waits for the sharer, noted before
+   * anything is written.
+   */
+  private async intoProperty(share: Share, path: string, data: Uint8Array): Promise<Uint8Array> {
+    const key = vaultKey(path);
+    const fs = this.scope(share).fs as PropertyFS;
+    const survey = await this.lookAtShared(share);
+    const checks = this.writeChecks(survey);
+    const problem = writeProblem(key, share.property, checks);
+    if (problem) throw new Error(problem);
+    const exists = checks.exists(key) !== undefined;
+    const before = exists ? new TextDecoder().decode(await fs.read(path)) : '';
+    let text = new TextDecoder().decode(data);
+    if (!exists) {
+      const marked = withShare(text, share.property);
+      if (marked === undefined) throw new Error(`Its properties could not be read, so it could not be added to “${share.property}”.`);
+      text = marked;
+    }
+    const asks = newEmbeds(before, text)
+      .map((link) => this.catalog.resolve(link, path))
+      .filter((target): target is string => !!target && isAttachment(vaultKey(target)) && !survey.shared.has(vaultKey(target)))
+      .map(vaultKey);
+    if (asks.length) {
+      share.ask = [...new Set([...share.ask, ...asks])];
+      await this.saveData(this.settings);
+    }
+    return new TextEncoder().encode(text);
   }
 }

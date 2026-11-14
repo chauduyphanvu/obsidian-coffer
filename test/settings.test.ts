@@ -21,6 +21,7 @@ import {
   normalFolder,
   parseNumberSetting,
   passphraseProblem,
+  positionPath,
   providerOf,
   regionFromEndpoint,
   remoteSpec,
@@ -221,13 +222,22 @@ test('settings saved before shared folders load unchanged, and a saved share get
 test('the vault leaves out every shared folder and its state, and a shared folder never holds the settings folder', () => {
   const s = s3({ exclude: 'Private/\n*.tmp\nWork/drafts/\nWork/*.bak\n**/cache/\nOther/x.md', shares: [share({ id: 'w1', folder: 'Work' }), share({ id: 'n2', folder: 'Café/Notes' })] });
   const c = syncConfig(s, '.obsidian', '.obsidian/plugins/coffer');
-  assert.deepEqual(c.exclude.slice(-4), ['Work/', '.obsidian/plugins/coffer/state-w1.json', 'Café/Notes/', '.obsidian/plugins/coffer/state-n2.json']);
+  assert.deepEqual(c.exclude.slice(-6), [
+    'Work/',
+    '.obsidian/plugins/coffer/state-w1.json',
+    '.obsidian/plugins/coffer/members-w1.json',
+    'Café/Notes/',
+    '.obsidian/plugins/coffer/state-n2.json',
+    '.obsidian/plugins/coffer/members-n2.json',
+  ]);
   const vault = compileExcludes(c.exclude);
   assert.ok(vault('Work/a.md') && vault('Work/deep/b.md') && vault('Café/Notes/c.md'));
   assert.ok(!vault('Work notes/a.md') && !vault('Workshop.md') && !vault('Café/other.md'), 'a sibling whose name starts the same still syncs');
   assert.ok(vault('Café/Notes/c.md'.normalize('NFC')));
   assert.equal(statePath('p'), 'p/state.json');
   assert.equal(statePath('p', 'w1'), 'p/state-w1.json');
+  assert.equal(positionPath('p', 'w1'), 'p/members-w1.json');
+  assert.ok(vault('.obsidian/plugins/coffer/members-w1.json'), 'the member list a shared folder accepted stays on this device');
 
   const w = shareConfig(s, s.shares[0], '.obsidian');
   assert.deepEqual(w.exclude, ['.DS_Store', '*.tmp', 'drafts/', '*.bak', '**/cache/', '.*', '**/.*/']);

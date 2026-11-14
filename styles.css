@@ -128,6 +128,8 @@
 }
 .coffer-problem.is-critical { border-inline-start-color: var(--color-red); background: rgba(var(--color-red-rgb), 0.08); }
 .coffer-problem-title { font-weight: var(--font-semibold); }
+/* An action can be long, as one that names what it removes: it wraps on a phone instead of running off the card. */
+.coffer-problem .coffer-buttons > button { white-space: normal; height: auto; min-height: var(--input-height); }
 .coffer-problem-detail {
   color: var(--text-muted);
   margin-top: var(--size-2-2);
@@ -471,6 +473,10 @@ body.is-phone .coffer-share-actions { flex-basis: 100%; }
 .is-mobile .coffer-share-actions > button,
 .is-mobile .coffer-shares .coffer-buttons > button,
 .is-mobile .coffer-share-modal button { min-height: 44px; }
+.is-mobile .coffer-share-modal .coffer-check,
+.is-mobile .coffer-shares .coffer-check { display: flex; align-items: center; gap: var(--size-4-2); min-height: 44px; }
+.is-mobile .coffer-share-modal .coffer-check > input,
+.is-mobile .coffer-shares .coffer-check > input { flex: none; width: 22px; height: 22px; margin: 0; }
 
 /* Which synced place a screen is about, once the vault has shared folders. */
 .coffer-place {
@@ -480,3 +486,48 @@ body.is-phone .coffer-share-actions { flex-basis: 100%; }
   font-weight: var(--font-semibold);
   overflow-wrap: anywhere;
 }
+
+/* Access rules for a storage key, to copy into the provider's console. The rules scroll inside their box, never the page. */
+.coffer-policy {
+  min-width: 0;
+  max-width: 100%;
+  margin: var(--size-4-3) 0;
+  padding: var(--size-4-2) var(--size-4-3);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+}
+.coffer-policy-title { font-weight: var(--font-semibold); overflow-wrap: anywhere; }
+.coffer-policy .coffer-note { margin-top: var(--size-2-2); }
+.coffer-policy-text {
+  max-width: 100%;
+  max-height: 14em;
+  overflow: auto;
+  margin: var(--size-4-2) 0 0;
+  padding: var(--size-4-2);
+  border-radius: var(--radius-s);
+  background: var(--background-secondary);
+  font-size: var(--font-ui-smaller);
+  white-space: pre;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.is-mobile .coffer-policy .coffer-buttons > button { min-height: 44px; }
+
+/* A shared folder another device of this vault offers. */
+.coffer-share.coffer-offer .coffer-share-name { font-weight: var(--font-medium); }
+
+/* Activity in a shared folder: each change and who made it, the files it touched under it, tappable. */
+.coffer-activity-files { padding-inline-start: var(--size-4-4); }
+.coffer-past .coffer-activity-files .coffer-row { font-size: var(--font-ui-small); }
+.coffer-activity-event .coffer-row-title { font-weight: var(--font-normal); color: var(--text-muted); }
+
+/* A suggestion that can not be opened, with its Dismiss button. */
+.coffer-suggestion-bad .coffer-buttons { margin-top: var(--size-4-2); }
+
+/* Notes shared by a property: the parts of "What's shared" and of the preview before starting. */
+.coffer-section-title {
+  margin-top: var(--size-4-4);
+  font-weight: var(--font-semibold);
+  overflow-wrap: anywhere;
+}
+.coffer-file .coffer-hint { margin-top: var(--size-2-1); }

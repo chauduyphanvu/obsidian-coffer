@@ -46,18 +46,21 @@ async function expand(master: Uint8Array): Promise<Keys> {
   };
 }
 
-async function wrap(master: Uint8Array, passphrase: string, iterations: number): Promise<KeyHeader> {
+const gcm = (iv: Uint8Array, aad?: string): AesGcmParams => ({ name: 'AES-GCM', iv: bs(iv), ...(aad !== undefined && { additionalData: bs(utf8.encode(aad)) }) });
+
+/** `aad`, when given, is bound into the wrapping: unwrapping with another one fails like a wrong passphrase. */
+async function wrap(master: Uint8Array, passphrase: string, iterations: number, aad?: string): Promise<KeyHeader> {
   const salt = randomBytes(16);
   const nonce = randomBytes(12);
-  const ct = new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv: bs(nonce) }, await kek(passphrase, salt, iterations), bs(master)));
+  const ct = new Uint8Array(await subtle.encrypt(gcm(nonce, aad), await kek(passphrase, salt, iterations), bs(master)));
   return { iter: iterations, salt: toB64(salt), wrapped: toB64(concat([nonce, ct])) };
 }
 
-async function unwrap(header: KeyHeader, passphrase: string): Promise<Uint8Array> {
+async function unwrap(header: KeyHeader, passphrase: string, aad?: string): Promise<Uint8Array> {
   const wrapped = fromB64(header.wrapped);
   const key = await kek(passphrase, fromB64(header.salt), header.iter);
   try {
-    return new Uint8Array(await subtle.decrypt({ name: 'AES-GCM', iv: bs(wrapped.subarray(0, 12)) }, key, bs(wrapped.subarray(12))));
+    return new Uint8Array(await subtle.decrypt(gcm(wrapped.subarray(0, 12), aad), key, bs(wrapped.subarray(12))));
   } catch {
     throw new WrongPassphraseError();
   }
@@ -71,6 +74,20 @@ export async function createKeys(passphrase: string, iterations: number): Promis
 
 export async function unlockKeys(header: KeyHeader, passphrase: string): Promise<Keys> {
   return expand(await unwrap(header, passphrase));
+}
+
+/** The keys of a master key held as it is, as by a device that joined a shared folder with members. */
+export function keysFromMaster(master: Uint8Array): Promise<Keys> {
+  return expand(master);
+}
+
+/** The master key itself under a passphrase or another secret, for a header or an invite. See `wrap`. */
+export function wrapMaster(master: Uint8Array, secret: string, iterations: number, aad?: string): Promise<KeyHeader> {
+  return wrap(master, secret, iterations, aad);
+}
+
+export function unwrapMaster(header: KeyHeader, secret: string, aad?: string): Promise<Uint8Array> {
+  return unwrap(header, secret, aad);
 }
 
 /** The same master key under a new passphrase: stored data stays valid, only the header changes. It never lowers the cost. */
@@ -163,4 +180,80 @@ export async function digest(data: Uint8Array): Promise<string> {
 export async function chunkId(keys: Keys, data: Uint8Array): Promise<string> {
   const mac = await subtle.sign('HMAC', keys.id, bs(data));
   return toB64(new Uint8Array(mac, 0, 16));
+}
+
+/** 32 bytes derived from `secret` for one purpose, named by `info`. */
+export async function hkdf(secret: Uint8Array, info: string): Promise<Uint8Array> {
+  const base = await subtle.importKey('raw', bs(secret), 'HKDF', false, ['deriveBits']);
+  return new Uint8Array(await subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: bs(utf8.encode(info)) }, base, 256));
+}
+
+/** AES-GCM under a raw 32-byte key. Layout: nonce (12) | ciphertext+tag. */
+export async function sealWithKey(key: Uint8Array, plain: Uint8Array, aad: string): Promise<Uint8Array> {
+  const k = await subtle.importKey('raw', bs(key), 'AES-GCM', false, ['encrypt']);
+  const nonce = randomBytes(12);
+  return concat([nonce, new Uint8Array(await subtle.encrypt(gcm(nonce, aad), k, bs(plain)))]);
+}
+
+export async function openWithKey(key: Uint8Array, sealed: Uint8Array, aad: string): Promise<Uint8Array> {
+  const k = await subtle.importKey('raw', bs(key), 'AES-GCM', false, ['decrypt']);
+  try {
+    return new Uint8Array(await subtle.decrypt(gcm(sealed.subarray(0, 12), aad), k, bs(sealed.subarray(12))));
+  } catch {
+    throw new Error(`Remote data failed authentication (${aad}): corrupted, tampered with, or sealed for someone else`);
+  }
+}
+
+/**
+ * A private ECDSA P-256 key as stored: only these fields, since an import that finds `ext` or `key_ops` disagreeing
+ * with its own arguments throws on some platforms.
+ */
+export interface SigningKey {
+  kty: 'EC';
+  crv: 'P-256';
+  x: string;
+  y: string;
+  d: string;
+}
+
+const ECDSA = { name: 'ECDSA', namedCurve: 'P-256' } as const;
+const ECDSA_SHA256 = { name: 'ECDSA', hash: 'SHA-256' } as const;
+
+/** A new key pair: the private key to keep, and the public key as uncompressed raw bytes (65), base64url. */
+export async function newSigningKey(): Promise<{ key: SigningKey; pub: string }> {
+  const pair = await subtle.generateKey(ECDSA, true, ['sign', 'verify']);
+  const jwk = await subtle.exportKey('jwk', pair.privateKey);
+  const key: SigningKey = { kty: 'EC', crv: 'P-256', x: jwk.x!, y: jwk.y!, d: jwk.d! };
+  return { key, pub: publicKeyOf(key) };
+}
+
+/** The raw public key (0x04 | x | y), base64url, of a private key. */
+export function publicKeyOf(key: SigningKey): string {
+  return toB64(concat([new Uint8Array([4]), fromB64(key.x), fromB64(key.y)]));
+}
+
+export function importSigningKey(key: SigningKey): Promise<CryptoKey> {
+  const { kty, crv, x, y, d } = key;
+  return subtle.importKey('jwk', { kty, crv, x, y, d }, ECDSA, false, ['sign']);
+}
+
+/** Only an uncompressed point: WebKit does not take compressed ones. */
+export function importVerifyKey(pub: string): Promise<CryptoKey> {
+  const raw = fromB64(pub);
+  if (raw.length !== 65 || raw[0] !== 4) return Promise.reject(new Error('Not a public key'));
+  return subtle.importKey('raw', bs(raw), ECDSA, false, ['verify']);
+}
+
+/** A 64-byte signature (r | s), base64url. */
+export async function signWith(key: CryptoKey, data: Uint8Array): Promise<string> {
+  return toB64(new Uint8Array(await subtle.sign(ECDSA_SHA256, key, bs(data))));
+}
+
+/** A signature that cannot even be checked counts as wrong. */
+export async function verifyWith(key: CryptoKey, sig: string, data: Uint8Array): Promise<boolean> {
+  try {
+    return await subtle.verify(ECDSA_SHA256, key, bs(fromB64(sig)), bs(data));
+  } catch {
+    return false;
+  }
 }

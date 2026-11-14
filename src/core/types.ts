@@ -1,3 +1,5 @@
+import type { MemberList } from './members.ts';
+
 export interface ChunkRef {
   id: string;
   pack: string;
@@ -39,12 +41,24 @@ export interface Commit {
    * deletions toward their guard against mass deletion.
    */
   confirmed?: boolean;
+  /** Member shares: the member whose key signed it (`members.ts`), and the signature. */
+  signer?: string;
+  sig?: string;
+  /** Member shares: the member change in force when it was written, 0 before the first. */
+  listSeq?: number;
+  /**
+   * Set on a member change: a commit of the share's owner that changes no file, marked `moved` so history passes
+   * over it, and carries the whole member list from here on.
+   */
+  members?: MemberList;
 }
 
 export interface Version {
   seq: number;
   time: number;
   device: string;
+  /** Member shares: the member who signed the commit that saved it. */
+  signer?: string;
   entry: Entry | null;
 }
 
@@ -64,6 +78,8 @@ export interface RemoteStore {
   delete(key: string, opts?: { once?: boolean }): Promise<void>;
   /** Keys under `prefix`, in ascending key order, strictly after `startAfter` when given. */
   list(prefix: string, startAfter?: string): Promise<ObjectInfo[]>;
+  /** Set on a store that cannot list, only read by name: the repo then finds the log's end by asking for each commit. */
+  readonly noList?: boolean;
 }
 
 /** Thrown by a store made with `readOnlyStore` when something tries to write to it. */
@@ -80,6 +96,7 @@ export function readOnlyStore(store: RemoteStore): RemoteStore {
     list: (prefix, startAfter) => store.list(prefix, startAfter),
     put: () => Promise.reject(new ReadOnlyError()),
     delete: () => Promise.reject(new ReadOnlyError()),
+    ...(store.noList && { noList: true }),
   };
 }
 
@@ -92,8 +109,26 @@ export interface LocalFile extends FileStat {
   path: string;
 }
 
+/**
+ * The files a sync engine holds, as synced or as in storage, by key: the size and time it last saw each have here, or
+ * storage's for one it never synced here.
+ */
+export interface Held {
+  get(key: string): FileStat | undefined;
+  keys(): Iterable<string>;
+  /**
+   * Names content, where the engine can: `of` the content held at a key, `id` that of some bytes. Equal names, equal
+   * content; no storage is asked.
+   */
+  content?: { of(key: string): string | undefined; id(data: Uint8Array): Promise<string> };
+}
+
 export interface LocalFS {
-  list(): Promise<LocalFile[]>;
+  /**
+   * The engine passes what it holds. A file system that chooses which files it shows must show every held file that
+   * exists: one left out reads as deleted here.
+   */
+  list(held?: Held): Promise<LocalFile[]>;
   read(path: string): Promise<Uint8Array>;
   /** Creates parent folders as needed and returns the resulting stat. */
   write(path: string, data: Uint8Array, mtime?: number): Promise<FileStat>;

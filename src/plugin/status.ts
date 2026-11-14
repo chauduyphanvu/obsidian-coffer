@@ -1,12 +1,15 @@
 // What a sync did, what went wrong and what a conflict leaves to choose, in words a user can act on.
 // No Obsidian import, so it runs under plain Node tests.
 import { WrongPassphraseError } from '../core/crypto.ts';
-import { HistoryError, SafetyError, type SyncResult } from '../core/engine.ts';
+import { HistoryError, RemovedError, SafetyError, UnverifiedError, type MemberStanding, type SyncResult } from '../core/engine.ts';
 import { lineDiff, type DiffRegion } from '../core/merge.ts';
 import { ext } from '../core/paths.ts';
 import { DAY } from '../core/retention.ts';
 import { MissingFolderError } from '../core/scopedfs.ts';
 import { errorText, plural } from '../core/text.ts';
+import type { Share } from './settings.ts';
+import { NotSendingError, OtherSenderError, VaultNotListedError } from './byproperty.ts';
+import { rejoinNeeds } from './shares.ts';
 
 export function summarize(r: SyncResult): string {
   const parts = [
@@ -20,7 +23,7 @@ export function summarize(r: SyncResult): string {
   return parts.length ? parts.join(', ') : 'everything is up to date';
 }
 
-export type Action = 'settings' | 'passphrase' | 'resolve-deletes' | 'files' | 'retry' | 'missing-folder' | 'accept-storage';
+export type Action = 'settings' | 'passphrase' | 'resolve-deletes' | 'files' | 'retry' | 'missing-folder' | 'accept-storage' | 'remove-unverified' | 'stop-sharing' | 'whats-shared';
 
 export interface Problem {
   /** A notice is shown once per id, so the same problem does not nag on every sync. */
@@ -48,20 +51,26 @@ export function missingProblem(folder: string): Problem {
   };
 }
 
-/** A shared folder whose storage keys or passphrase this device no longer has, as after its keychain was reset. */
-export function keysMissingProblem(): Problem {
+/**
+ * A shared folder whose storage keys or passphrase (for one with members, this device's keys to it) this device no
+ * longer has, as after its keychain was reset. Notes shared by a property have no link to join again with: only a new share.
+ */
+export function keysMissingProblem(share: Pick<Share, 'role' | 'memberKeysSecret'> & { property?: string }): Problem {
   return {
     id: 'share-keys',
     severity: 'critical',
     title: 'Keys missing on this device',
-    detail: 'This device no longer has the storage keys or the passphrase for this shared folder, so it does not sync here. Stop sharing it on this device, then join again with the invite link.',
+    detail:
+      `This device no longer has the storage keys or ${share.memberKeysSecret ? 'its own keys' : 'the passphrase'} for this shared folder, so it does not sync here. ` +
+      (share.property ? 'Stop sharing it on this device, then start a new share and invite people again.' : `Stop sharing it on this device, then join again with ${rejoinNeeds(share)}.`),
     action: 'settings',
   };
 }
 
-/** A shared folder's problem, told apart from the vault's: its own id, and a title that names the folder. */
-export function inShare(p: Problem, share: { id: string; folder: string }): Problem {
-  return { ...p, id: `share:${share.id}:${p.id}`, title: `Shared folder “${share.folder}”: ${p.title}`, share: share.id };
+/** A shared folder's problem, told apart from the vault's: its own id, and a title that names the folder, or the notes shared by a property. */
+export function inShare(p: Problem, share: { id: string; folder: string; property?: string }): Problem {
+  const what = share.property ? `Shared notes “${share.property}”` : `Shared folder “${share.folder}”`;
+  return { ...p, id: `share:${share.id}:${p.id}`, title: `${what}: ${p.title}`, share: share.id };
 }
 
 /**
@@ -82,6 +91,18 @@ export function targetProblems(t: { failure?: Problem; found: Problem[]; conflic
 
 export type Tone = 'ok' | 'busy' | 'warning' | 'critical' | 'off';
 
+/**
+ * One line for a shared folder: its worst problem; while it waits for the owner's device to let it send changes, that;
+ * otherwise as for any place (`statusText`).
+ */
+export function shareLine(problems: Problem[], standing: Pick<MemberStanding, 'waiting' | 'owner'> | undefined, lastSuccess: number, offline: boolean): { text: string; tone: Tone } {
+  if (standing?.waiting && !problems.some((p) => p.severity === 'critical')) return { text: waitingText(standing.owner), tone: 'warning' };
+  return statusText(problems, lastSuccess, offline);
+}
+
+/** What a write member's device waits for until the owner's device confirms it; `owner` is the owner's name, '' when not known yet. */
+export const waitingText = (owner: string) => `Waiting for ${owner ? `${owner}'s` : "the owner's"} device to confirm`;
+
 /** One line for a synced place: its worst problem, or when it last synced, whether it is offline and how much there is to review. */
 export function statusText(problems: Problem[], lastSuccess: number, offline: boolean): { text: string; tone: Tone } {
   const critical = problems.filter((p) => p.severity === 'critical');
@@ -89,6 +110,74 @@ export function statusText(problems: Problem[], lastSuccess: number, offline: bo
   const when = lastSuccess ? `Synced ${new Date(lastSuccess).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : 'Not synced yet';
   const review = problems.length ? `${plural(problems.length, 'thing', 'things')} to review` : '';
   return { text: [when, offline && 'offline', review].filter(Boolean).join(' · '), tone: problems.length ? 'warning' : 'ok' };
+}
+
+/** A synced place as a run knows it: the vault ('' for its id), or a shared folder, which names its folder as it is now. */
+export interface RunPlace {
+  id: string;
+  folder?: string;
+  /** Notes shared by a property: their name, shown instead of a folder. */
+  property?: string;
+}
+
+/**
+ * Where a sync run is, place by place. The status bar has one line for the whole run, so it must not jump between
+ * places that sync side by side: it follows the vault while that syncs, then says how many shared folders are still to
+ * finish, and follows a shared folder only once it is the last one. Each place's own state is in `stateOf`.
+ */
+export class RunProgress {
+  private places = new Map<string, { place: RunPlace; started: boolean; text: string }>();
+  private ended = new Set<string>();
+
+  /** The run is going to cover these places, none started yet. */
+  plan(places: RunPlace[]): void {
+    this.clear();
+    for (const p of places) this.places.set(p.id, { place: p, started: false, text: '' });
+  }
+
+  start(p: RunPlace): void {
+    this.known(p).started = true;
+  }
+
+  /** `text` is what the place is doing, like "Receiving 4 of 10". Anything a place says after it has ended is ignored. */
+  say(p: RunPlace, text: string): void {
+    if (this.ended.has(p.id)) return;
+    const known = this.known(p);
+    known.started = true;
+    known.text = text;
+  }
+
+  end(p: RunPlace): void {
+    this.places.delete(p.id);
+    this.ended.add(p.id);
+  }
+
+  clear(): void {
+    this.places.clear();
+    this.ended.clear();
+  }
+
+  private known(p: RunPlace) {
+    let known = this.places.get(p.id);
+    if (!known) this.places.set(p.id, (known = { place: p, started: false, text: '' }));
+    return known;
+  }
+
+  /** The line for the whole run. */
+  line(): string {
+    const vault = this.places.get('');
+    if (vault) return vault.text || 'Syncing…';
+    const shares = [...this.places.values()];
+    if (shares.length > 1) return `Syncing ${plural(shares.length, 'shared folder')}…`;
+    const [one] = shares;
+    return one?.text ? `“${one.place.property || one.place.folder}”: ${one.text}` : 'Syncing…';
+  }
+
+  /** What the run is doing with the place, if it has not finished with it: 'syncing', or 'waiting' for its turn. */
+  stateOf(id: string): 'syncing' | 'waiting' | undefined {
+    const known = this.places.get(id);
+    return known && (known.started ? 'syncing' : 'waiting');
+  }
 }
 
 /** What the problems screen says when it lists nothing: all in sync, or what keeps that from being so. */
@@ -115,10 +204,63 @@ export function keptNote(kept: number, left: number): string {
 export const isTransient = (message: string) =>
   /fetch failed|network|offline|timed? ?out|ECONN|ENOTFOUND|EAI_AGAIN|socket|Request failed|net::ERR_|could not connect|could not be found|not connected to the internet|HTTP (5\d\d|429)/i.test(message);
 
-/** A sync that threw, described. */
-export function describeFailure(e: unknown): Problem {
+/** What a shared folder with members tells about a failure: whether this device is the owner's, and the owner's name. */
+export interface MemberContext {
+  owner: boolean;
+  ownerName: string;
+}
+
+/** A sync that threw, described. `member` is set for a shared folder with members. */
+export function describeFailure(e: unknown, member?: MemberContext): Problem {
   const message = errorText(e);
   if (e instanceof MissingFolderError) return missingProblem(e.folder);
+  if (e instanceof RemovedError) {
+    return {
+      id: 'removed',
+      severity: 'critical',
+      title: 'Removed by its owner',
+      detail:
+        'Its owner removed you, so it no longer syncs here. The files in the folder stay on this device. ' +
+        'Stop sharing it on this device to keep them with the rest of this vault, or ask the owner for a new invite.',
+      action: 'stop-sharing',
+    };
+  }
+  if (e instanceof UnverifiedError) {
+    const who = member?.ownerName ? `${member.ownerName}'s` : "The owner's";
+    return {
+      id: 'unverified',
+      severity: 'critical',
+      title: 'A change was not made by a member who may write to it',
+      detail:
+        'Its storage holds a change that no member who may change this folder made: someone who can reach the storage without being such a member wrote it, or it was damaged. ' +
+        'It does not sync until that change is gone, and nothing from that change on was applied here. The files on this device are untouched. ' +
+        (member?.owner
+          ? 'Remove the changes that were not signed by a member, and syncing carries on.'
+          : `${who} device can remove that change; syncing carries on once it has.`),
+      ...(member?.owner && { action: 'remove-unverified' as const }),
+    };
+  }
+  if (e instanceof NotSendingError) {
+    return {
+      id: 'not-sending',
+      severity: 'critical',
+      title: 'This device only receives this vault’s changes',
+      detail: 'Notes shared by a property are sent from a device that sends this vault’s changes, so nothing is sent from here. Turn off Only receive changes for this vault, or stop sharing them.',
+      action: 'settings',
+    };
+  }
+  if (e instanceof OtherSenderError) {
+    return {
+      id: 'other-sender',
+      severity: 'critical',
+      title: `Another of your devices (${e.device}) also sends these notes`,
+      detail: 'Only one device can send notes shared by a property, so this one stopped. Stop sharing them on one of the two. If you renamed this device, sync now and it carries on.',
+      action: 'retry',
+    };
+  }
+  if (e instanceof VaultNotListedError) {
+    return { id: 'not-listed', severity: 'critical', title: 'The vault looks empty', detail: `${e.message} Sync tries again once Obsidian lists the vault's files.`, action: 'retry' };
+  }
   if (e instanceof SafetyError) {
     return {
       id: `deletes:${e.localDeletes}:${e.remoteDeletes}`,
@@ -152,16 +294,41 @@ export function describeFailure(e: unknown): Problem {
     };
   }
   if (/HTTP 40[13]\b|AccessDenied|SignatureDoesNotMatch|InvalidAccessKeyId|refused the login/i.test(message)) {
+    // A member did not choose its keys: they came with the invite, or with the owner's new keys since.
+    const owner = member?.ownerName || 'the owner';
     return {
       id: 'access',
       severity: 'critical',
       title: 'The storage refused the access keys',
-      detail: `Sync is stopped. Check the keys, and that they may read and write this bucket or folder. If these keys may only read, turn on Only receive changes. (${message})`,
+      detail:
+        member && !member.owner
+          ? `Sync is stopped. The storage keys this device has for this folder no longer work: ${owner} may have replaced them while this device was not syncing. Ask ${owner} for a new invite, or enter new keys under More… → Change storage keys on this device. (${message})`
+          : `Sync is stopped. Check the keys, and that they may read and write this bucket or folder. If these keys may only read, turn on Only receive changes. (${message})`,
       action: 'settings',
     };
   }
   if (/NoSuchBucket/i.test(message)) {
     return { id: 'bucket', severity: 'critical', title: 'Bucket not found', detail: 'Sync is stopped. Check the bucket name and region.', action: 'settings' };
+  }
+  if (/holds a shared folder with members/i.test(message)) {
+    return {
+      id: 'members-format',
+      severity: 'critical',
+      title: 'Storage holds a shared folder with members',
+      detail:
+        'Sync is stopped. The storage set here now holds a shared folder whose members each join with an invite link of their own, not with a passphrase. ' +
+        'To use it on this device, stop syncing it here and join again with an invite from its owner.',
+      action: 'stop-sharing',
+    };
+  }
+  if (/holds another shared folder than/i.test(message)) {
+    return {
+      id: 'other-share',
+      severity: 'critical',
+      title: 'Storage holds another shared folder',
+      detail: `Sync is stopped. The storage this device reaches now holds another shared folder than the one it joined, so nothing was synced. Check its storage keys, or stop sharing it on this device. (${message})`,
+      action: 'settings',
+    };
   }
   if (/vault uses format/i.test(message)) {
     return { id: 'format', severity: 'critical', title: 'Update Coffer on this device', detail: `Another device uses a newer version. (${message})` };
@@ -180,8 +347,18 @@ export function describeFailure(e: unknown): Problem {
   return { id: `failed:${message}`, severity: 'critical', title: 'Sync failed', detail: message, action: 'retry' };
 }
 
-/** Files a finished sync could not handle, and conflict copies still waiting for the user. */
-export function resultProblems(r: Pick<SyncResult, 'errors' | 'tooLarge' | 'unsent'>, conflictCopies: string[], maxFileSizeMB: number): Problem[] {
+/**
+ * Files a finished sync could not handle, and conflict copies still waiting for the user. `waitingFor`, the owner's
+ * name, says the place may not send yet: a member's device the owner's has not confirmed. `suggestTo`, the owner's
+ * name, says it is a member's that may only read, which can send what it changed as a suggestion.
+ */
+export function resultProblems(
+  r: Pick<SyncResult, 'errors' | 'tooLarge' | 'unsent'>,
+  conflictCopies: string[],
+  maxFileSizeMB: number,
+  waitingFor?: string,
+  suggestTo?: string,
+): Problem[] {
   const out: Problem[] = [];
   if (r.errors.length) {
     out.push({
@@ -209,14 +386,19 @@ export function resultProblems(r: Pick<SyncResult, 'errors' | 'tooLarge' | 'unse
     });
   }
   if (r.unsent.length) {
+    const merged = "A file changed in storage as well is merged with the change made here; where that cannot be done, storage's version takes the name and this device's is kept beside it.";
+    const owner = suggestTo || 'the owner';
     out.push({
       // One id however many files, so a device that is meant to keep local changes is told once.
       id: 'unsent',
       severity: 'warning',
       title: `${plural(r.unsent.length, 'file')} changed here, not sent`,
       detail:
-        'This device only receives changes, so what is changed here stays here. A file changed in storage as well is merged with the change made here; where that cannot be done, ' +
-        'storage\'s version takes the name and this device\'s is kept beside it. Turn off Only receive changes in settings to send them.',
+        suggestTo !== undefined
+          ? `You may only read this shared folder, so what is changed here stays here. Notes and canvases can be sent to ${owner} as a suggestion, for ${owner} to take in. ${merged}`
+          : waitingFor !== undefined
+            ? `This device sends changes once ${waitingFor ? `${waitingFor}'s` : "the owner's"} device confirms it; until then what is changed here stays here, and is sent then. ${merged}`
+            : `This device only receives changes, so what is changed here stays here. ${merged} Turn off Only receive changes in settings to send them.`,
       files: r.unsent,
       action: 'files',
     });
@@ -239,13 +421,17 @@ function conflictProblem(conflictCopies: string[]): Problem | undefined {
 /** The vault's conflict copies, or a shared folder's (whose id `inShare` prefixes): the list offers to resolve each. */
 export const isConflictProblem = (p: Problem) => /^(share:[^:]*:)?conflicts:/.test(p.id);
 
+/** Files changed here and not sent, the vault's or a shared folder's. */
+export const isUnsentProblem = (p: Problem) => /^(share:[^:]*:)?unsent$/.test(p.id);
+
 /** Why a storage check failed: what to check, in the words of that kind of storage, then the storage's own words. */
-export function connectError(cause: string, storageType: 's3' | 'webdav'): string {
+export function connectError(cause: string, storageType: 's3' | 'webdav', write = true): string {
+  const may = write ? 'read and write' : 'read';
   const advice: Record<string, string> = {
     access:
       storageType === 'webdav'
-        ? 'The server refused this user name and password. Check them, and that they may read and write this folder.'
-        : 'The storage refused these keys. Check them, and that they may read and write this bucket.',
+        ? `The server refused this user name and password. Check them, and that they may ${may} this folder.`
+        : `The storage refused these keys. Check them, and that they may ${may} this bucket.`,
     bucket: 'Bucket not found. Check its name and the region.',
     offline: "Can't reach the storage. Check the address and the connection.",
   };

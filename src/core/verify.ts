@@ -69,6 +69,10 @@ export async function verifyRepo(repo: Repo, o: Context): Promise<VerifyReport> 
   };
   const [seqs, snaps, packs] = await Promise.all([repo.commitSeqsAfter(0), repo.snapshots(), repo.listPacks()]);
   const { files, movedBy } = await replayLog(repo, o, seqs, snaps.at(-1)?.seq ?? 0, report, problem);
+  // Left out of the listing once found (`Repo.forged`), and still in storage.
+  for (const seq of [...repo.forged].sort((a, b) => a - b)) {
+    problem(`Snapshot ${seq} in storage was not written by a member who may write to this shared folder`, seqKey('snap', seq));
+  }
   report.files = files.size;
   const bad = checkPacks(files, movedBy, packs, report, problem);
   const damaged = chunksIn(files, bad);
@@ -173,7 +177,8 @@ type Problem = (message: string, object?: string, paths?: Iterable<string>) => v
 
 /**
  * Replays the log, checking that it is contiguous and chained, that commits marked as moves change no
- * content, and compares the newest snapshot with the table at its commit. Returns the current table:
+ * content, and in a shared folder with members that each was made by a member who may write (and the snapshot too),
+ * and compares the newest snapshot with the table at its commit. Returns the current table:
  * the log's, or where the log cannot be replayed, the snapshot's with the commits after it, as a new
  * device would see it; and for files whose current entry a move wrote, that move's commit.
  */
@@ -194,11 +199,13 @@ async function replayLog(
     problem(`This device has seen commit ${o.seen.seq}, but the log ends at ${last}: newer commits are missing`, seqKey('log', o.seen.seq));
   }
 
+  const members = await repo.memberReplay();
   const snapKey = seqKey('snap', snapSeq);
   let snap: Awaited<ReturnType<Repo['readSnapshotWithHead']>> = null;
   if (snapSeq) {
     try {
-      snap = await repo.readSnapshotWithHead(snapSeq);
+      // Checked below, once the member changes before it are known.
+      snap = await repo.readSnapshotWithHead(snapSeq, { unchecked: true });
       if (!snap) problem(`Snapshot ${snapSeq} is listed but cannot be read`, snapKey);
     } catch (e) {
       problem(`Snapshot ${snapSeq} cannot be read: ${errorText(e)}`, snapKey);
@@ -230,8 +237,11 @@ async function replayLog(
         else if (listed.has(seq)) problem(`Commit ${seq} is listed but cannot be read`, key);
         intact = false;
         prev = undefined;
+        members?.skip(seq);
       } else {
         report.commits++;
+        const unverified = await members?.commit(c);
+        if (unverified) problem(unverified, key);
         if (c.prev !== undefined && prev !== undefined && c.prev !== prev) {
           problem(`Commit ${seq} does not follow commit ${seq - 1}: the log was tampered with or forked`, key);
         }
@@ -250,7 +260,9 @@ async function replayLog(
         if (changed.length) problem(`Commit ${seq} is marked as only moving data but changes what files contain`, key, changed);
         prev = c.hash;
       }
-      if (seq === snapSeq && snap) {
+      const forged = seq === snapSeq && snap && members ? await members.snapshot(seq, snap) : undefined;
+      if (forged) problem(forged, snapKey);
+      else if (seq === snapSeq && snap) {
         if (c && !(c instanceof Error) && snap.head !== undefined && snap.head !== c.hash) {
           problem(`Snapshot ${seq} was taken at a different commit ${seq} than the log holds: tampered with or forked`, snapKey);
         }
@@ -266,7 +278,8 @@ async function replayLog(
       o.onProgress?.({ phase: 'log', done: seq, total: last });
     }
   }
-  return snap && snapSeq > last ? { files: snap.files, movedBy: new Map() } : { files: table, movedBy };
+  // A member share's snapshot past the log's end cannot be checked, so it is not taken for the files.
+  return snap && snapSeq > last && !members ? { files: snap.files, movedBy: new Map() } : { files: table, movedBy };
 }
 
 function sameEntry(a: Entry, b: Entry): boolean {

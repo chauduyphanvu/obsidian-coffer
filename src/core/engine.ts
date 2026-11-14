@@ -1,4 +1,5 @@
-import { pool } from './bytes.ts';
+import { fromB64, pool, toB64 } from './bytes.ts';
+import { digest } from './crypto.ts';
 import { worthCompressing } from './compress.ts';
 import { copyChunks, fragmented, placeKey, planCompaction } from './compact.ts';
 import { compileExcludes, type SyncConfig } from './config.ts';
@@ -6,23 +7,55 @@ import { merge3, mergeCanvas, mergeJson, mergeNote } from './merge.ts';
 import { Packer, packRanges } from './packer.ts';
 import { conflictCopyName, ext, vaultKey } from './paths.ts';
 import { nothingToDo, planChanges, type Local, type Plan } from './plan.ts';
+import {
+  MemberBook, RemovedError, UnverifiedError, changeOf, deleteJoin, deleteRekey, deleteSlot, isMemberId, memberSecret, newMemberId, parsePosition,
+  readJoin, readRekey, serializePosition, slotExpiry, writeJoin, writeRekey, writeSlot, type Member, type MemberChange, type MemberGrant, type MemberKeys,
+  type RekeyOffer, type Role,
+} from './members.ts';
 import { findDamage, repairReport, storeAgain, type RepairOptions, type RepairReport } from './repair.ts';
 import { Repo } from './repo.ts';
+import { INBOX, INBOX_OPENED, MAX_SEALED, SUGGEST_MAX_FILE, SUGGEST_MAX_TOTAL, inboxKey, openSuggestion, parseInboxKey, sealSuggestion, suggestKind, type SuggestedFile, type Suggestion } from './suggest.ts';
 import { collectGarbage, listVersions, type CleanupResult } from './retention.ts';
 import { LocalState } from './state.ts';
 import { errorText } from './text.ts';
-import { ReadOnlyError, hasChunks, readOnlyStore, sameContent, type Change, type ChunkRef, type Commit, type Entry, type FileStat, type LocalFS, type RemoteStore, type StateStore, type Version } from './types.ts';
+import { ReadOnlyError, hasChunks, readOnlyStore, sameContent, type Change, type ChunkRef, type Commit, type Entry, type FileStat, type Held, type LocalFS, type RemoteStore, type StateStore, type Version } from './types.ts';
 import { affectedBy, verifyRepo, type VerifyOptions, type VerifyReport } from './verify.ts';
 
 export type { VerifyOptions, VerifyProblem, VerifyReport } from './verify.ts';
 export type { RepairOptions, RepairReport } from './repair.ts';
+export { RemovedError, UnverifiedError } from './members.ts';
+
+/** What a device of a shared folder with members holds (`members.ts`). */
+export interface MemberOptions {
+  /** From `createMemberShare`, `joinShare` or an owner link, kept in secret storage. */
+  keys: MemberKeys;
+  /**
+   * Where this device keeps the newest member list it accepted. Apart from `stateStore`, because that state is reset
+   * when storage is accepted as it is, and this must not be: storage that shows an older list must not win.
+   */
+  position: StateStore;
+}
 
 export interface EngineOptions {
   fs: LocalFS;
   store: RemoteStore;
   stateStore: StateStore;
+  /** Unused for a shared folder with members, which `member` opens. */
   passphrase: string;
   config: SyncConfig;
+  /** Set for a shared folder with members: then every change is signed and checked. Without it, nothing changes. */
+  member?: MemberOptions;
+  /**
+   * Only the keys it accepts sync, asked anew at every plan: any other is left alone as an excluded one is, neither
+   * sent, deleted, downloaded nor removed here, whatever it was before.
+   */
+  only?: (key: string) => boolean;
+  /**
+   * The files here are the only source of what storage holds, and nothing is ever written to or removed from `fs`.
+   * Where storage differs from a file here, the file here is sent again, also over a deletion in storage; what only
+   * storage has stays there; a file deleted here that storage changed since is deleted there.
+   */
+  sendOnly?: boolean;
   now?: () => number;
   log?: (message: string) => void;
   onProgress?: (progress: { phase: 'upload' | 'download'; done: number; total: number }) => void;
@@ -70,6 +103,12 @@ export interface SyncOptions {
    * other file. A path that is not such a file is ignored, and a file over the size limit stays out.
    */
   fetch?: Iterable<string>;
+  /**
+   * A member's device that sends suggestions (`sendSuggestion`): what it sent, as fingerprints by path (`SuggestOutcome.sent`).
+   * A file here that still holds what was sent takes the version the owner's device commits for it, with no conflict
+   * copy: what it held reached the owner. A file changed since is kept as any change here is.
+   */
+  suggested?: ReadonlyMap<string, string>;
 }
 
 export interface SyncResult {
@@ -86,9 +125,56 @@ export interface SyncResult {
   deferred: string[];
   /** Files changed on a device that only reads, and not sent. Empty for a device that writes. */
   unsent: string[];
+  /**
+   * Changes other devices made that came in since the last sync that finished, oldest first: by any read of the remote,
+   * this sync's or one before it. Never those a first download brings in.
+   */
+  arrived: Arrival[];
   errors: { path: string; message: string }[];
   commits: number;
   rounds: number;
+}
+
+/** A commit another device made, as it came in: who made it and which files it changed. */
+export interface Arrival {
+  seq: number;
+  time: number;
+  device: string;
+  /** In a shared folder with members: the member who signed it, and that member's name in the list then in force. */
+  signer?: string;
+  name?: string;
+  paths: string[];
+}
+
+/** What sending a suggestion (`SyncEngine.sendSuggestion`) did with each file it was asked to send. */
+export interface SuggestOutcome {
+  /** Where it was kept in storage; undefined when nothing was sent. */
+  key?: string;
+  /** The files sent, each with a fingerprint of the text sent, which tells later whether a file changed since. */
+  sent: { path: string; sum: string }[];
+  /**
+   * The files not sent, and why: not a note or canvas, over the size limit for one file, not text, the same as this
+   * device last synced, the same as already sent (by `sum`), gone, or past what one suggestion holds.
+   */
+  skipped: { path: string; why: 'kind' | 'large' | 'binary' | 'same' | 'sent' | 'gone' | 'full' }[];
+}
+
+/** A suggestion waiting in storage, as the owner's device finds it. */
+export interface WaitingSuggestion {
+  key: string;
+  /** Who it names and when it was sent, from its key; undefined for a key that names nobody. */
+  member?: string;
+  time?: number;
+  /** That member's name, while it is on the member list. */
+  name?: string;
+  /** Opened with the secret of the member it names, who is on the member list now; undefined when it could not be. */
+  suggestion?: Suggestion;
+}
+
+/** The suggestions the owner's device opened, and how many more wait behind them. */
+export interface WaitingSuggestions {
+  items: WaitingSuggestion[];
+  more: number;
 }
 
 /** The repo with the remote file table brought up to date, for features that only read. */
@@ -102,6 +188,43 @@ export interface RepoView {
   st: LocalState;
   cfg: SyncConfig;
   now: number;
+}
+
+/** What this device is in a shared folder with members. */
+export interface MemberStanding {
+  /** Its member's role; undefined once removed, or before any member list is known. */
+  role?: Role;
+  /** It may send changes: its member writes and the key on the list is this device's. */
+  mayWrite: boolean;
+  /** A write member whose join the owner's device has not confirmed yet: it only receives until then. */
+  waiting: boolean;
+  /** The owner removed its member: it no longer syncs. */
+  removed: boolean;
+  /** The owner's name, as members see it. */
+  owner: string;
+}
+
+/**
+ * One member as the owner's device sees it. `waiting`: a write member's invite still opens and no device has used it; a
+ * read member's invite still opens (read members never report back, so some may have joined). `confirming`: a device
+ * joined and waits for the owner's device. `joined`: the owner, or a write member whose device is confirmed.
+ * `expired`: the invite no longer opens (devices of a read member that joined before keep receiving).
+ */
+export interface MemberStatus {
+  id: string;
+  name: string;
+  role: Role;
+  state: 'joined' | 'waiting' | 'confirming' | 'expired';
+  /** When the invite stops opening, if it does. */
+  expires?: number;
+  /** When this member's newest change this device has seen was made. */
+  lastChange?: number;
+  /** This device's own member. */
+  self: boolean;
+  /** A read member made for a follow link. */
+  follow?: true;
+  /** A read member invited to send suggestions too. */
+  suggest?: true;
 }
 
 export interface GcResult extends CleanupResult {
@@ -159,6 +282,16 @@ interface Prepared {
 }
 
 const MAX_ROUNDS = 5;
+/** Arrivals kept for the next sync to report, at most. */
+const MAX_ARRIVALS = 1000;
+/** Snapshots a member share's new device tries, newest first, before it reads the log from its start. */
+const SNAPSHOT_TRIES = 4;
+/** How often the owner's devices look for joins and expired invites, and other writing devices for expired invites. */
+const OWNER_CHORES_EVERY = 60_000;
+const CHORES_EVERY = 3_600_000;
+const ORPHAN_SLOT_AGE = 3_600_000;
+/** For reads checked otherwise: in order (`Repo.checkInOrder`), or only by their digest. */
+const UNCHECKED = { unchecked: true };
 const PULL_BATCH = 32 << 20;
 const MAX_RANGE = 8 << 20;
 const MOVE_CACHE = 64 << 20;
@@ -169,8 +302,35 @@ const HEAD_CHECK_EVERY = 3_600_000;
 const MAX_LOOKED_UP = 256;
 
 const contentKey = (e: Entry) => e.chunks.map((c) => c.id).join(',');
+/** An object directly in `inbox/`: what the owner's device lists and may delete there, whatever it holds. */
+const inInbox = (key: string) => key.startsWith(INBOX) && !/[/\\]/.test(key.slice(INBOX.length)) && !['', '.', '..'].includes(key.slice(INBOX.length));
 
 /** The file still has the size and time the scan saw, or is still absent. */
+/** What `st` holds, as a listing is given it (`LocalFS.list`): synced files with their size and time here, files only storage has with theirs there. */
+function heldIn(st: LocalState, repo?: Repo): Held {
+  return {
+    get: (key) => {
+      const s = st.synced.get(key);
+      if (s) return { size: s.lsize, mtime: s.lmtime };
+      const r = st.remote.get(key);
+      return r && { size: r.size, mtime: r.mtime };
+    },
+    *keys() {
+      yield* st.synced.keys();
+      for (const key of st.remote.keys()) if (!st.synced.has(key)) yield key;
+    },
+    ...(repo && {
+      content: {
+        of: (key: string) => {
+          const e = st.synced.get(key)?.entry ?? st.remote.get(key);
+          return e && contentKey(e);
+        },
+        id: async (data: Uint8Array) => (await repo.split(data)).ids.join(','),
+      },
+    }),
+  };
+}
+
 const unchanged = (cur: FileStat | null, l: Local | undefined) => (l ? !!cur && cur.size === l.size && cur.mtime === l.mtime : !cur);
 
 const recordError = (res: SyncResult, path: string, e: unknown) => {
@@ -200,6 +360,8 @@ interface Run {
   known: Known;
   /** Paths the next sync must look at although nothing may name them: changed while this one worked on them, or written by it and not yet synced. */
   unsettled: Set<string>;
+  /** See `SyncOptions.suggested`, by key. */
+  suggested?: Map<string, string>;
 }
 
 /** The local files a pass works with. */
@@ -250,11 +412,31 @@ export class SyncEngine {
   private syncing = false;
   /** The state has changes not yet saved. */
   private unsaved = false;
+  /** A shared folder with members: its checks and signatures. */
+  private book?: MemberBook;
+  /** Member shares: storage holds a change no member who may write made, so syncing stops until that changes. */
+  private stuck = false;
+  /** When this device last looked for joins and expired invites. */
+  private choresDone = -Infinity;
+  /** The state for which storage was asked whether it still holds the member change this device accepted. */
+  private floorAskedFor?: LocalState;
+  /**
+   * Member shares: a snapshot taken into `st` before the list in force now was known, whose signer is checked against
+   * that list once the commits after it are in (`MemberBook.checkSnapshot`), with what `st` held before it. Until then
+   * `st` is not saved.
+   */
+  private adopted?: { st: LocalState; seq: number; signer: string; prior: Pick<LocalState, 'remote' | 'lastSeq' | 'head' | 'members' | 'confirmed' | 'lastBy'> };
+  /** A write member's device waiting to be confirmed has made sure its join is in storage (`publishJoin`). */
+  private joinSent = false;
+  /** Commits of other devices read since the last sync that finished: `SyncResult.arrived`. */
+  private arrived: Arrival[] = [];
 
   constructor(options: EngineOptions) {
     this.o = options;
     this.cfg = options.config;
-    this.excluded = compileExcludes(this.cfg.exclude);
+    const excluded = compileExcludes(this.cfg.exclude);
+    const only = options.only;
+    this.excluded = only ? (key) => excluded(key) || !only(key) : excluded;
     this.now = options.now ?? Date.now;
   }
 
@@ -279,17 +461,37 @@ export class SyncEngine {
       this.opening ??= this.load().finally(() => (this.opening = undefined));
       await this.opening;
     }
-    return { repo: this.repo!, st: this.st! };
+    const repo = this.repo!;
+    const st = this.st!;
+    await this.askFloor(repo, st);
+    return { repo, st };
+  }
+
+  /**
+   * A member share whose state is behind the member change this device accepted, as after a restart when the last sync
+   * brought in only member changes (which save the list at once, not the state), or after accepting storage: whether
+   * storage still holds that change says whether older lists may grant more than it does (`MemberBook.floorGone`).
+   * Asked once for each state, before anything reads the log by it: until then every older list is capped, and a
+   * removed member's own earlier commits read as not allowed.
+   */
+  private async askFloor(repo: Repo, st: LocalState): Promise<void> {
+    const book = this.book;
+    if (!book || st.lastSeq >= book.floor.seq || this.floorAskedFor === st) return;
+    book.floorGone = (await repo.storedHash(book.floor.seq)) !== book.floor.hash;
+    this.floorAskedFor = st;
   }
 
   private async load(): Promise<void> {
     if (!this.repo) {
       const { readOnly, kdfIterations, chunk } = this.cfg;
-      // A device that only reads never creates the vault: the key it would make is not worth deriving.
-      this.repo = await Repo.open(readOnly ? readOnlyStore(this.o.store) : this.o.store, this.o.passphrase, { kdfIterations: readOnly ? 1 : kdfIterations, chunk }).catch((e: unknown) => {
-        // Only creating vault.json writes while opening.
-        throw e instanceof ReadOnlyError ? new Error('Storage holds no synced vault yet, and this device only reads from it') : e;
-      });
+      if (this.o.member) this.repo = await this.openMember();
+      else {
+        // A device that only reads never creates the vault: the key it would make is not worth deriving.
+        this.repo = await Repo.open(readOnly ? readOnlyStore(this.o.store) : this.o.store, this.o.passphrase, { kdfIterations: readOnly ? 1 : kdfIterations, chunk }).catch((e: unknown) => {
+          // Only creating vault.json writes while opening.
+          throw e instanceof ReadOnlyError ? new Error('Storage holds no synced vault yet, and this device only reads from it') : e;
+        });
+      }
     }
     if (!this.st) {
       const st = LocalState.parse(await this.o.stateStore.load());
@@ -299,14 +501,59 @@ export class SyncEngine {
         this.st = new LocalState();
         this.st.vaultId = this.repo.id;
       } else this.st = st;
+      this.book?.accept(this.st.members.at(-1));
     }
   }
 
-  /** Saves the state if it changed since it was last saved. */
+  /**
+   * A member share opens with the master key this device holds, never creates anything, and starts from the member
+   * list it accepted last, or on its first open from the one its link was made at.
+   */
+  private async openMember(): Promise<Repo> {
+    const { keys, position } = this.o.member!;
+    const store = this.cfg.readOnly ? readOnlyStore(this.o.store) : this.o.store;
+    const repo = await Repo.openMember(store, { repo: keys.repo, master: fromB64(keys.master) });
+    const book = (this.book = new MemberBook(repo.id, keys, parsePosition(await position.load(), repo.id)));
+    if (!book.floor.gen && keys.since) {
+      const c = await repo.readCommit(keys.since, UNCHECKED);
+      if (!c) throw new Error(`Storage is missing commit ${keys.since}, the member list this device was invited with`);
+      await this.accepted(await book.checkChange(c));
+    }
+    repo.useMembers(book, () => ({ changes: this.st?.members ?? [], through: this.st?.lastSeq ?? 0 }));
+    return repo;
+  }
+
+  /** Saves the state if it changed since it was last saved, and a member list newer than the one saved. */
   private async save(): Promise<void> {
-    if (!this.unsaved) return;
+    if (this.book?.dirty) await this.savePosition();
+    if (!this.unsaved || this.adopted?.st === this.st) return;
     await this.o.stateStore.save(this.st!.serialize());
     this.unsaved = false;
+  }
+
+  /**
+   * Takes `ch` as the newest member list this device accepted, if it is newer, and saves that at once, before the state
+   * it belongs to: a sync that brings in nothing else saves no state, and a restart must not forget a removal.
+   */
+  private async accepted(ch: MemberChange | undefined): Promise<void> {
+    this.book!.accept(ch);
+    if (this.book!.dirty) await this.savePosition();
+  }
+
+  private async savePosition(): Promise<void> {
+    const book = this.book!;
+    book.dirty = false;
+    try {
+      await this.o.member!.position.save(serializePosition(book.repo, book.floor));
+    } catch (e) {
+      book.dirty = true;
+      throw e;
+    }
+  }
+
+  /** True when this device sends nothing: it is set to only receive, or its member may not write to a member share. */
+  private readOnly(): boolean {
+    return this.cfg.readOnly || (!!this.book && !this.book.mayWrite(this.st?.members ?? []));
   }
 
   /**
@@ -315,6 +562,9 @@ export class SyncEngine {
    */
   private async fetchRemote(): Promise<Set<string>> {
     const { repo, st } = await this.open();
+    const book = this.book;
+    // A first download brings in what others made long ago, not news.
+    const fresh = st.lastSeq > 0;
     const touched = new Set<string>();
     const touch = (p: string) => {
       touched.add(p);
@@ -325,11 +575,15 @@ export class SyncEngine {
       // A commit without `prev` comes from a version that did not chain the log. It is taken as it
       // is, and the chain restarts from it: the next chained commit names its digest like any other.
       if (c.prev !== undefined && st.head !== undefined && c.prev !== st.head) {
+        // In a member share, a commit no member who may write made is garbage the owner can remove, wherever it points.
+        await repo.checkInOrder(c);
         const message = `Remote commit ${c.seq} does not follow the commit before it as this device saw it: the log was tampered with or forked`;
         // Only on this path: storage's own commit before it says whether storage holds another one than this
         // device saw, or the link between two stored commits is broken.
-        throw (await repo.readCommit(c.seq - 1))?.hash === c.prev ? new HistoryError(message) : new Error(message);
+        throw (await repo.readCommit(c.seq - 1, UNCHECKED))?.hash === c.prev ? new HistoryError(message) : new Error(message);
       }
+      // Nothing from a commit that does not verify is applied, nor anything after it.
+      await repo.checkInOrder(c);
       // A move changes no content, so work prepared against the file before it is still valid. It
       // moves this device's merge base too, whose old place goes once no kept version records it.
       for (const { path, entry } of c.changes) {
@@ -338,28 +592,66 @@ export class SyncEngine {
         const s = c.moved && entry && st.synced.get(path);
         if (s && sameContent(s.entry, entry)) s.entry = entry;
       }
+      if (fresh && !c.moved && c.changes.length) this.arrive(c, st);
       st.apply(c);
+      if (c.members) await this.accepted(changeOf(c));
       this.headSeen = this.now();
     };
     const loadSnapshot = async () => {
-      const snaps = await repo.snapshots();
-      const latest = snaps[snaps.length - 1];
-      if (!latest || latest.seq <= st.lastSeq) return;
-      // The chain goes on from the commit the snapshot was taken at, read in the same round trip.
-      const [snap, at] = await Promise.all([repo.readSnapshotWithHead(latest.seq), repo.readCommit(latest.seq)]);
-      if (!snap) return;
-      if (!at) throw new Error(`Remote commit ${latest.seq} is missing, though a snapshot was taken at it`);
-      if (snap.head !== undefined && snap.head !== at.hash) {
-        throw new Error(`Remote snapshot ${latest.seq} was taken at a different commit ${latest.seq} than storage holds: the log was tampered with or forked`);
+      let found: { seq: number; files: Map<string, Entry>; head?: string; changes?: MemberChange[]; signer?: string } | undefined;
+      if (this.book) found = await this.memberSnapshot(repo, st.lastSeq);
+      else {
+        const snaps = await repo.snapshots();
+        const latest = snaps[snaps.length - 1];
+        if (!latest || latest.seq <= st.lastSeq) return;
+        // The chain goes on from the commit the snapshot was taken at, read in the same round trip.
+        const [snap, at] = await Promise.all([repo.readSnapshotWithHead(latest.seq), repo.readCommit(latest.seq)]);
+        if (!snap) return;
+        if (!at) throw new Error(`Remote commit ${latest.seq} is missing, though a snapshot was taken at it`);
+        if (snap.head !== undefined && snap.head !== at.hash) {
+          throw new Error(`Remote snapshot ${latest.seq} was taken at a different commit ${latest.seq} than storage holds: the log was tampered with or forked`);
+        }
+        found = { seq: latest.seq, files: snap.files, head: at.hash };
+      }
+      if (!found) return;
+      if (found.signer) {
+        const prior = { remote: st.remote, lastSeq: st.lastSeq, head: st.head, members: st.members, confirmed: new Set(st.confirmed), lastBy: new Map(st.lastBy) };
+        this.adopted = { st, seq: found.seq, signer: found.signer, prior };
       }
       for (const p of st.remote.keys()) touch(p);
-      for (const p of snap.files.keys()) touch(p);
-      st.remote = snap.files;
-      st.lastSeq = latest.seq;
-      st.head = at.hash;
+      for (const p of found.files.keys()) touch(p);
+      st.remote = found.files;
+      st.lastSeq = found.seq;
+      st.head = found.head;
+      if (found.changes) {
+        st.members = found.changes;
+        await this.accepted(found.changes.at(-1));
+      }
       // Which deletions in the skipped commits were confirmed is not known: they all count.
       st.confirmed.clear();
       this.headSeen = this.now();
+    };
+    /**
+     * Once the commits storage holds are in (as far as a gap, past which lies garbage), the signer of a snapshot taken
+     * meanwhile is checked against the newest list. False when it is not on it: `st` is then as before the snapshot.
+     */
+    const settle = (complete: boolean): boolean => {
+      const a = this.adopted;
+      if (!book || a?.st !== st) return true;
+      if (book.writesNow(st.members, a.signer)) {
+        if (complete) this.adopted = undefined;
+        return true;
+      }
+      // Removed since: the snapshot may have been written after that, with any files in it.
+      this.log(`Skipped snapshot ${a.seq}: it was written by a member who may no longer write`);
+      this.adopted = undefined;
+      Object.assign(st, a.prior);
+      repo.forged.add(a.seq);
+      return false;
+    };
+    const again = async () => {
+      for (const p of await this.fetchRemote()) touched.add(p);
+      return touched;
     };
 
     if (st.lastSeq === 0) await loadSnapshot();
@@ -370,14 +662,14 @@ export class SyncEngine {
       // hourly a third read in the same round trip checks that this device's newest commit is still there.
       const checkHead = this.headDue(st);
       const [first, second, head] = await Promise.all([
-        repo.readCommit(st.lastSeq + 1),
-        repo.readCommit(st.lastSeq + 2),
-        checkHead ? repo.readCommit(st.lastSeq) : undefined,
+        repo.readCommit(st.lastSeq + 1, UNCHECKED),
+        repo.readCommit(st.lastSeq + 2, UNCHECKED),
+        checkHead ? repo.readCommit(st.lastSeq, UNCHECKED) : undefined,
       ]);
       if (head !== undefined) this.checkHead(st, head, first ?? second);
-      if (!first) return touched;
+      if (!first) return settle(true) ? touched : again();
       await add(first);
-      if (!second) return touched;
+      if (!second) return settle(true) ? touched : again();
       await add(second);
     }
     let seqs = await repo.commitSeqsAfter(st.lastSeq);
@@ -385,9 +677,14 @@ export class SyncEngine {
       await loadSnapshot();
       seqs = seqs.filter((s) => s > st.lastSeq);
     }
+    // In a member share, what lies past a gap is garbage the owner can remove (`removeUnverifiable`): it is not even
+    // read, and the commits before it are taken.
+    const gap = this.book ? seqs.findIndex((s, i) => s !== st.lastSeq + 1 + i) : -1;
+    const past = gap < 0 ? undefined : seqs[gap];
+    if (gap >= 0) seqs = seqs.slice(0, gap);
     const commits: Commit[] = new Array<Commit>(seqs.length);
     await pool(seqs, this.cfg.concurrency, async (seq, i) => {
-      const c = await repo.readCommit(seq);
+      const c = await repo.readCommit(seq, UNCHECKED);
       if (!c) throw new Error(`Commit ${seq} is listed but cannot be read`);
       commits[i] = c;
     });
@@ -395,8 +692,83 @@ export class SyncEngine {
       if (c.seq !== st.lastSeq + 1) throw new Error(`Remote log has a gap before commit ${c.seq}`);
       await add(c);
     }
+    if (!settle(past === undefined)) return again();
+    if (past !== undefined) throw new UnverifiedError(past, `there is a gap before it, after commit ${st.lastSeq}`);
     this.headSeen = this.now();
     return touched;
+  }
+
+  private arrive(c: Commit, st: LocalState): void {
+    const name = c.signer ? MemberBook.before(st.members, c.seq)?.members.find((m) => m.id === c.signer)?.name : undefined;
+    this.arrived.push({ seq: c.seq, time: c.time, device: c.device, ...(c.signer && { signer: c.signer }), ...(name !== undefined && { name }), paths: c.changes.map((ch) => ch.path) });
+    if (this.arrived.length > MAX_ARRIVALS) this.arrived.splice(0, this.arrived.length - MAX_ARRIVALS);
+  }
+
+  /** The arrivals since the last sync that finished, each commit once: one taken back and read again (`settle`) counts once. */
+  private takeArrived(): Arrival[] {
+    const bySeq = new Map(this.arrived.map((a) => [a.seq, a]));
+    this.arrived = [];
+    return [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+  }
+
+  /**
+   * A member share's newest snapshot after `after` that verifies, with the member changes up to it: tried newest first,
+   * since storage may hold ones that do not (squatted far ahead, or written by someone who may not write). Undefined
+   * when none does, and the log is then read from its start. A snapshot is taken only when it was signed by a member
+   * who may write under the list in force at its commit, names that list, and its commit verifies and names it too;
+   * whether its signer still may write is known once the commits after it are in (`fetchRemote`). Only a snapshot found
+   * not to verify is remembered as forged, not one passed over because a request failed.
+   */
+  private async memberSnapshot(repo: Repo, after: number): Promise<{ seq: number; files: Map<string, Entry>; head: string; changes: MemberChange[]; signer: string } | undefined> {
+    const book = this.book!;
+    const snaps = (await repo.snapshots()).filter((s) => s.seq > after);
+    for (const { seq } of snaps.slice(-SNAPSHOT_TRIES).reverse()) {
+      const skip = (e: unknown, forged: boolean) => {
+        if (forged) repo.forged.add(seq);
+        this.log(`Skipped snapshot ${seq}: ${errorText(e)}`);
+      };
+      let snap, at;
+      try {
+        [snap, at] = await Promise.all([repo.readSnapshotWithHead(seq, UNCHECKED), repo.readCommit(seq, UNCHECKED)]);
+      } catch (e) {
+        skip(e, false);
+        continue;
+      }
+      // No commit: a snapshot squatted past the log's end.
+      if (!snap || !at) continue;
+      const listSeq = snap.listSeq ?? 0;
+      if (!snap.head || snap.head !== at.hash) {
+        skip(new Error('it was taken at another commit than storage holds'), true);
+        continue;
+      }
+      if (at.members ? listSeq !== seq : at.listSeq !== listSeq) {
+        skip(new Error('it names another member list than its commit'), true);
+        continue;
+      }
+      let chain: (Commit | null)[];
+      try {
+        const head = at.members ? at : await repo.readCommit(listSeq, UNCHECKED);
+        if (!head?.members) throw new Error(`commit ${listSeq} is not a member change`);
+        chain = [...(await Promise.all(head.members.earlier.map((s) => repo.readCommit(s, UNCHECKED)))), head];
+      } catch (e) {
+        skip(e, false);
+        continue;
+      }
+      if (chain.includes(null)) {
+        skip(new Error('a member change it leads back to is missing'), false);
+        continue;
+      }
+      try {
+        const changes: MemberChange[] = [];
+        for (const c of chain) changes.push(await book.checkChange(c!, changes));
+        await book.checkCommit(at, changes, seq - 1, { cache: false });
+        await book.checkSnapshot(seq, snap, changes);
+        return { seq, files: snap.files, head: at.hash, changes, signer: snap.signer! };
+      } catch (e) {
+        skip(e, true);
+      }
+    }
+    return undefined;
   }
 
   private headDue(st: LocalState): boolean {
@@ -444,12 +816,12 @@ export class SyncEngine {
     };
   }
 
-  private async scan(run: Run): Promise<LocalView> {
+  private async scan(run: Run, st: LocalState): Promise<LocalView> {
     const maxSize = this.maxSize();
     const local = new Map<string, Local>();
     const tooLarge = new Set<string>();
     const paths = new Map<string, string>();
-    for (const f of await this.o.fs.list()) {
+    for (const f of await this.o.fs.list(heldIn(st, this.repo))) {
       const key = vaultKey(f.path);
       if (this.excluded(key) || local.has(key)) continue;
       if (f.path !== key) paths.set(key, f.path);
@@ -499,7 +871,7 @@ export class SyncEngine {
       }
       run.hint = undefined;
     }
-    return this.scan(run);
+    return this.scan(run, st);
   }
 
   /**
@@ -574,13 +946,14 @@ export class SyncEngine {
   private async syncHeld(opts: SyncOptions): Promise<SyncResult> {
     const res: SyncResult = {
       pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0,
-      conflictCopies: [], skipped: 0, tooLarge: [], deferred: [], unsent: [], errors: [], commits: 0, rounds: 0,
+      conflictCopies: [], skipped: 0, tooLarge: [], deferred: [], unsent: [], arrived: [], errors: [], commits: 0, rounds: 0,
     };
     const { st } = await this.open();
     const allow = new Set([...(opts.allowDeletes ?? [])].map(vaultKey));
     const known = this.known;
     const fetch = new Set([...(opts.fetch ?? [])].map(vaultKey));
-    const run: Run = { force: !!opts.force, allow, fetch, known: known ?? { tooLarge: new Set(), paths: new Map() }, unsettled: new Set() };
+    const suggested = opts.suggested && new Map([...opts.suggested].map(([path, sum]) => [vaultKey(path), sum]));
+    const run: Run = { force: !!opts.force, allow, fetch, known: known ?? { tooLarge: new Set(), paths: new Map() }, unsettled: new Set(), suggested };
     if (opts.changed && known) {
       run.hint = new Map();
       for (const p of opts.changed) run.hint.set(vaultKey(p), p);
@@ -597,11 +970,20 @@ export class SyncEngine {
         again = await this.round(res, run, round === 0);
       }
       for (const p of st.confirmed) if (!st.synced.has(p) || st.remote.has(p)) st.confirmed.delete(p);
+      res.arrived = this.takeArrived();
       if (!again) {
         this.known = run.known;
         this.recheck = new Set([...res.errors.map((e) => e.path), ...run.unsettled]);
         this.unplanned = false;
       }
+      this.stuck = false;
+      if (this.book) {
+        await this.sendJoin();
+        await this.chores();
+      }
+    } catch (e) {
+      if (e instanceof UnverifiedError) this.stuck = true;
+      throw e;
     } finally {
       this.syncing = false;
       this.dedup = new Map();
@@ -613,6 +995,7 @@ export class SyncEngine {
   /** One pass of scan, plan, apply. Returns true when another pass is needed. */
   private async round(res: SyncResult, run: Run, first: boolean): Promise<boolean> {
     const { repo, st } = await this.open();
+    if (this.book?.removed(st.members)) throw new RemovedError();
     const maxSize = this.maxSize();
     const defer = this.deferral(st, run);
     let v = await this.look(run, st);
@@ -621,17 +1004,19 @@ export class SyncEngine {
     // itself fails if it did, and the next pass sorts it out. Saves a round trip on the common case.
     // The commit also checks that storage still holds the commit before it (`put`), so it need not wait for the hourly check.
     const optimistic =
-      first && st.lastSeq > 0 && st.head !== undefined &&
+      first && st.lastSeq > 0 && st.head !== undefined && this.adopted?.st !== st &&
       p.pushes.length + p.pushDeletes.length > 0 && !p.pulls.length && !p.pullDeletes.length && !p.conflicts.length &&
-      p.pushes.reduce((n, f) => n + f.size, 0) <= OPTIMISTIC_BYTES && !this.cfg.readOnly;
+      p.pushes.reduce((n, f) => n + f.size, 0) <= OPTIMISTIC_BYTES && !this.readOnly();
     if (!optimistic && (await this.fetchRemote()).size) {
       if (v.keys) v = await this.look(run, st, v);
       p = planChanges(v.local, st, this.excluded, maxSize, v.tooLarge, v.keys, defer);
     }
+    if (this.book?.removed(st.members)) throw new RemovedError();
     res.tooLarge = this.tooLarge(st, v.tooLarge);
     res.deferred = this.deferredKeys(st, v, defer);
 
     if (nothingToDo(p)) return false;
+    if (this.o.sendOnly) this.sendAgain(p, v.local, st, run);
     this.checkDeletes(p, st, run);
     const unsent = await this.keepLocal(p, run, res);
 
@@ -662,13 +1047,32 @@ export class SyncEngine {
     return again || (optimistic && res.commits === commitsBefore);
   }
 
+  /**
+   * A place that only sends (`EngineOptions.sendOnly`) writes and removes nothing here. What storage changed or deleted
+   * is sent again from here; a file deleted here is deleted there, however storage changed it; and a file this device
+   * never synced that only storage has stays there, unless its deletion was confirmed (`allowDeletes`).
+   */
+  private sendAgain(p: Plan, local: Map<string, Local>, st: LocalState, run: Run): void {
+    for (const key of [...p.pulls, ...p.pullDeletes]) {
+      const l = local.get(key);
+      if (l) {
+        // Unchanged since the version both last agreed on, which storage no longer has: sent as new.
+        st.synced.delete(key);
+        this.unsaved = true;
+        p.pushes.push(l);
+      } else if (st.synced.has(key) || run.allow.has(key)) p.pushDeletes.push(key);
+    }
+    p.pulls = [];
+    p.pullDeletes = [];
+  }
+
   /** Moves delete and re-create, so net shrinkage is what counts. See `deleteLimit`. */
   private checkDeletes(p: Plan, st: LocalState, run: Run): void {
     if (run.force) return;
     const limit = deleteLimit(st.synced.size, this.cfg);
     const here = p.pullDeletes.filter((k) => !st.confirmed.has(k)).length;
     // A device that only reads never deletes in storage: what it deleted comes back (see `keepLocal`).
-    const there = this.cfg.readOnly ? 0 : p.pushDeletes.filter((k) => !run.allow.has(k)).length;
+    const there = this.readOnly() ? 0 : p.pushDeletes.filter((k) => !run.allow.has(k)).length;
     if (here - p.pulls.length > limit || there - p.pushes.length > limit) throw new SafetyError(here, there);
   }
 
@@ -679,7 +1083,7 @@ export class SyncEngine {
    * pushes and returns the files left unsent; for any other device, does nothing.
    */
   private async keepLocal(p: Plan, run: Run, res: SyncResult): Promise<string[]> {
-    if (!this.cfg.readOnly) return [];
+    if (!this.readOnly()) return [];
     const { repo, st } = await this.open();
     const fs = this.o.fs;
     const unsent: string[] = [];
@@ -870,6 +1274,18 @@ export class SyncEngine {
       this.unsaved = true;
       return;
     }
+    // Sent to the owner as a suggestion and unchanged since: the owner's version stands for it (`SyncOptions.suggested`).
+    const sent = run.suggested?.get(key);
+    if (sent && sent === (await digest(mine))) {
+      await this.writeRemote(pass, key, r, await this.readVersion(r));
+      return;
+    }
+    // Only this side's version is kept, sent as new: see `sendAgain`.
+    if (this.o.sendOnly) {
+      st.synced.delete(key);
+      this.unsaved = true;
+      return l;
+    }
 
     // A copy in the settings folder would never be read or shown, so settings are always combined.
     const settings = key.startsWith(`${this.cfg.configDir}/`);
@@ -893,7 +1309,7 @@ export class SyncEngine {
     }
     if (settings) {
       // A device that only reads keeps its own file, listed as unsent: a copy here would never be seen.
-      if (this.cfg.readOnly) return l;
+      if (this.readOnly()) return l;
       // Not mergeable (plugin code, a theme, unreadable JSON): the version synced first stays, like any setting both changed.
       await this.writeRemote(pass, key, r, await this.readVersion(r));
       return;
@@ -962,7 +1378,10 @@ export class SyncEngine {
       await pool(range.refs, OPEN_PARALLEL, async (ref) => {
         const at = ref.off - range.start;
         try {
-          sink(ref, await repo.openChunk(ref.id, data.subarray(at, at + ref.len)));
+          const plain = await repo.openChunk(ref.id, data.subarray(at, at + ref.len));
+          // Whoever holds the vault key can seal other content under a chunk's id: only its content proves it.
+          if ((await repo.chunkId(plain)) !== ref.id) throw new Error(`Remote chunk ${ref.id} in pack ${range.pack} does not match its id: corrupted or tampered with`);
+          sink(ref, plain);
         } catch (e) {
           if (!failed) throw e;
           failed(ref, e);
@@ -1076,7 +1495,7 @@ export class SyncEngine {
     const { repo, st } = await this.open();
     const [hash, before] = await Promise.all([
       repo.writeCommit(c),
-      c.seq > 1 ? repo.readCommit(c.seq - 1).catch(() => undefined) : undefined,
+      c.seq > 1 ? repo.readCommit(c.seq - 1, UNCHECKED).catch(() => undefined) : undefined,
     ]);
     if (!hash || before === undefined) return hash;
     try {
@@ -1093,6 +1512,11 @@ export class SyncEngine {
     const { repo, st } = await this.open();
     let contended = false;
     while (prepared.length || deletes.length) {
+      if (this.book && !this.book.mayWrite(st.members)) {
+        if (this.book.removed(st.members)) throw new RemovedError();
+        // No longer allowed to write, as learned from the commit that won: the next pass keeps these changes here.
+        return true;
+      }
       const changes: Change[] = [
         ...prepared.map((p) => ({ path: p.file.key, entry: p.entry })),
         ...deletes.map((path) => ({ path, entry: null })),
@@ -1100,7 +1524,7 @@ export class SyncEngine {
       const c: Commit = { seq: st.lastSeq + 1, device: this.cfg.deviceName, time: this.now(), changes, prev: st.head, ...(confirmed && { confirmed }) };
       const hash = await this.put(c);
       if (hash) {
-        st.apply({ ...c, time: 0, hash });
+        st.apply({ ...c, hash });
         for (const p of prepared) st.synced.set(p.file.key, { entry: p.entry, lsize: p.file.size, lmtime: p.file.mtime });
         for (const path of deletes) st.synced.delete(path);
         res.pushed += prepared.length;
@@ -1158,7 +1582,7 @@ export class SyncEngine {
       const { st } = await this.open();
       await this.fetchRemote();
       const run: Run = { force: false, allow: new Set(), fetch: new Set(), known: { tooLarge: new Set(), paths: new Map() }, unsettled: new Set() };
-      const { local, tooLarge } = await this.scan(run);
+      const { local, tooLarge } = await this.scan(run, st);
       let kept = 0;
       for (const key of [...st.synced.keys()]) {
         if (this.excluded(key) || tooLarge.has(key) || local.has(key) === st.remote.has(key)) continue;
@@ -1199,14 +1623,24 @@ export class SyncEngine {
    */
   async remoteChanged(): Promise<boolean> {
     const { repo, st } = await this.open();
+    // Stuck before a change no member made: asking again would only find it again. A sync still tries.
+    if (this.stuck) return false;
     if (this.unplanned && !this.syncing) return true;
     return repo.hasCommit(st.lastSeq + 1);
   }
 
-  /** Re-encrypts only the key header. Other devices keep working until restarted, then need the new passphrase. */
+  /**
+   * Re-encrypts only the key header. Other devices keep working until restarted, then need the new passphrase. A member
+   * share's storage holds nothing sealed with the owner's passphrase, so there is nothing to change there: owner links
+   * made from now on are sealed with the new one.
+   */
   changePassphrase(newPassphrase: string): Promise<void> {
     return this.exclusive(async () => {
       const { repo } = await this.open();
+      if (this.o.member) {
+        this.ownerKeys();
+        return;
+      }
       await repo.changePassphrase(this.o.passphrase, newPassphrase, this.cfg.kdfIterations);
       this.o.passphrase = newPassphrase;
     });
@@ -1215,6 +1649,11 @@ export class SyncEngine {
   /** The PBKDF2 cost the vault's passphrase is wrapped with, which a setup link made here is sealed with at least. */
   async kdfIterations(): Promise<number> {
     return (await this.open()).repo.kdfIterations;
+  }
+
+  /** What this device holds, as its last sync left it: what a listing is given (`LocalFS.list`). Asks storage nothing. */
+  async held(): Promise<Held> {
+    return this.st ? heldIn(this.st, this.repo) : heldIn(LocalState.parse(await this.o.stateStore.load()));
   }
 
   /** Opens the repo and brings the remote file table up to date, for features that only read. Waits for a sync in progress. */
@@ -1315,8 +1754,10 @@ export class SyncEngine {
    */
   gc(): Promise<GcResult> {
     return this.exclusive(async () => {
-      if (this.cfg.readOnly) return { packsDeleted: 0, bytesFreed: 0, snapshotsDeleted: 0, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0 };
+      const none = { packsDeleted: 0, bytesFreed: 0, snapshotsDeleted: 0, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0 };
+      if (this.cfg.readOnly) return none;
       const { repo, st, cfg, now } = await this.refresh();
+      if (this.readOnly()) return none;
       const { result, packs } = await collectGarbage(repo, st, cfg, now);
       const out: GcResult = { ...result, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0 };
       const plan = planCompaction(packs, st.remote, cfg, now);
@@ -1349,6 +1790,7 @@ export class SyncEngine {
   private async relocate(moved: Map<string, ChunkRef>): Promise<boolean> {
     const { st } = await this.open();
     for (let round = 0; round < MAX_ROUNDS; round++) {
+      if (this.book && !this.book.mayWrite(st.members)) return false;
       const changes: Change[] = [];
       for (const [path, e] of st.remote) {
         let hit = false;
@@ -1393,9 +1835,581 @@ export class SyncEngine {
       this.headSeen = -Infinity;
       this.known = undefined;
       this.recheck = new Set();
+      this.stuck = false;
+      this.arrived = [];
+      // The member list this device accepted stays (`MemberOptions.position`): storage that shows an older one grants no more.
       await this.fetchRemote();
       this.unsaved = true;
       await this.save();
     });
+  }
+
+  // Shared folders with members (`MemberOptions`). Each of these throws for any other storage.
+
+  private memberBook(): MemberBook {
+    if (!this.book) throw new Error('This storage is not a shared folder with members');
+    return this.book;
+  }
+
+  /** What only the owner's devices hold, or an error on any other device. */
+  private ownerKeys(): { book: MemberBook; master: Uint8Array; root: Uint8Array } {
+    const book = this.memberBook();
+    const k = this.o.member!.keys;
+    if (!book.isOwner || !k.root) throw new Error('Only the owner’s devices can do this');
+    return { book, master: fromB64(k.master), root: fromB64(k.root) };
+  }
+
+  /** What this device is in its shared folder with members, as of its last sync; undefined for any other storage. */
+  async memberStanding(): Promise<MemberStanding | undefined> {
+    if (!this.o.member) return undefined;
+    const { st } = await this.open();
+    const book = this.memberBook();
+    const me = book.me(st.members);
+    return {
+      role: me?.role,
+      mayWrite: book.mayWrite(st.members),
+      waiting: me?.role === 'write' && !me.pub,
+      removed: book.removed(st.members),
+      owner: book.current(st.members).find((m) => m.role === 'owner')?.name ?? '',
+    };
+  }
+
+  /**
+   * Brings the remote table up to date as far as it verifies: the owner's devices act on members and storage keys while
+   * the share is stuck too, which is when cutting someone off matters most.
+   */
+  private async fetchVerified(): Promise<void> {
+    try {
+      await this.fetchRemote();
+    } catch (e) {
+      if (!(e instanceof UnverifiedError)) throw e;
+    }
+  }
+
+  /** Every member, with storage brought up to date. Only the owner's devices see how invites stand; others see who has joined. */
+  members(): Promise<MemberStatus[]> {
+    return this.exclusive(async () => {
+      const { repo, st } = await this.open();
+      await this.fetchVerified();
+      const book = this.memberBook();
+      const now = this.now();
+      const list = book.current(st.members);
+      const slots = new Map<string, number>();
+      const joins = new Set<string>();
+      if (book.isOwner) {
+        const [s, j] = await Promise.all([repo.objects.list('slot/'), repo.objects.list('join/')]);
+        for (const o of j) joins.add(o.key.slice(5));
+        const ids = s.map((o) => o.key.slice(5)).filter((id) => list.some((m) => m.id === id));
+        await pool(ids, this.cfg.concurrency, async (id) => {
+          const e = await slotExpiry(repo.objects, id);
+          if (e !== null) slots.set(id, e);
+        });
+      }
+      return list.map((m): MemberStatus => {
+        const expires = m.expires || slots.get(m.id) || undefined;
+        const opens = slots.has(m.id) && !(expires && now > expires);
+        let state: MemberStatus['state'];
+        if (m.role === 'owner' || (m.role === 'write' && m.pub)) state = 'joined';
+        else if (!book.isOwner) state = 'waiting';
+        else if (m.role === 'write' && joins.has(m.id)) state = 'confirming';
+        else state = opens ? 'waiting' : 'expired';
+        const last = st.lastBy.get(m.id);
+        return {
+          id: m.id, name: m.name, role: m.role, state, self: m.id === book.self,
+          ...(expires && state !== 'joined' && { expires }), ...(last && { lastChange: last }), ...(m.follow && { follow: true as const }),
+          ...(m.suggest && { suggest: true as const }),
+        };
+      });
+    });
+  }
+
+  /**
+   * Owner: adds a member and opens an invite for one device of it, which stops opening at `expires` (a time; 0 never, as
+   * for a follow link). A write member's device only receives until the owner's device confirms its join. Returns the
+   * member's part of the link (`MemberInvite`): add the storage keys for the role, the share's name and the folder.
+   * `follow` makes a read member for a follow link (`FollowInvite`), which re-keys hand no storage keys. `suggest`
+   * marks a read member who sends suggestions too, whom re-keys hand keys that may add to the inbox.
+   */
+  invite(o: { name: string; role: 'write' | 'read'; expires: number; follow?: boolean; suggest?: boolean }): Promise<MemberGrant> {
+    return this.exclusive(async () => {
+      const { repo } = await this.open();
+      const { book, master, root } = this.ownerKeys();
+      const name = o.name.trim();
+      if (!name) throw new Error('A member needs a name');
+      if (o.follow && o.role !== 'read') throw new Error('A follow link only reads');
+      if (o.suggest && (o.role !== 'read' || o.follow)) throw new Error('Only a member invited to read sends suggestions');
+      const id = newMemberId();
+      const secret = await memberSecret(root, id);
+      await writeSlot(repo.objects, repo.id, id, master, secret, o.expires);
+      let since: number | undefined;
+      try {
+        since = await this.changeMembers((list) => [
+          ...list,
+          { id, name, role: o.role, ...(o.role === 'write' && o.expires ? { expires: o.expires } : {}), ...(o.follow && { follow: true as const }), ...(o.suggest && { suggest: true as const }) },
+        ]);
+      } catch (e) {
+        await deleteSlot(repo.objects, id).catch(() => undefined);
+        throw e;
+      }
+      return { repo: repo.id, member: id, secret: toB64(secret), role: o.role, owner: book.owner, since: since! };
+    });
+  }
+
+  /** Owner: lets every device that joined with a write invite since write, and closes its invite. Returns their member ids. Syncs do this too. */
+  confirmJoins(): Promise<string[]> {
+    return this.exclusive(() => this.confirmHeld());
+  }
+
+  private async confirmHeld(): Promise<string[]> {
+    const { repo, st } = await this.open();
+    const { root } = this.ownerKeys();
+    const book = this.memberBook();
+    const store = repo.objects;
+    // When each join was made, by storage's clock: whoever holds a leaked link can say any time it likes in the join.
+    const made = new Map((await store.list('join/')).map((o) => [o.key.slice(5), o.modified]));
+    const ids = [...made.keys()].filter(isMemberId);
+    if (!ids.length) return [];
+    await this.fetchRemote();
+    const list = book.current(st.members);
+    const grants = new Map<string, string>();
+    for (const id of ids) {
+      const m = list.find((x) => x.id === id);
+      // Confirmed already, removed, or never a write member: a join replayed or left over.
+      if (!m || m.role !== 'write' || m.pub) {
+        await deleteJoin(store, id);
+        continue;
+      }
+      const j = await readJoin(store, repo.id, id, await memberSecret(root, id));
+      if (j === null) continue;
+      if (j === 'bad' || (m.expires && made.get(id)! > m.expires)) {
+        await deleteJoin(store, id);
+        continue;
+      }
+      grants.set(id, j.pub);
+    }
+    if (!grants.size) return [];
+    await this.changeMembers((cur) => {
+      let any = false;
+      const next = cur.map((m) => {
+        const pub = grants.get(m.id);
+        if (!pub || m.role !== 'write' || m.pub) return m;
+        any = true;
+        return { id: m.id, name: m.name, role: m.role, pub };
+      });
+      return any ? next : null;
+    });
+    for (const id of grants.keys()) {
+      // The invite opens nothing from now on: one invite, one device.
+      await deleteSlot(store, id);
+      await deleteJoin(store, id);
+    }
+    return [...grants.keys()];
+  }
+
+  /**
+   * Owner: removes a member. Its devices stop at their next sync; what it changed before stays. Its invite stops
+   * opening. A member removed already whose invite, join or re-key is still in storage, as when taking those out failed
+   * the first time, has them taken out again.
+   */
+  removeMember(id: string): Promise<void> {
+    return this.exclusive(async () => {
+      const { repo } = await this.open();
+      this.ownerKeys();
+      const seq = await this.changeMembers((list) => (list.some((m) => m.id === id && m.role !== 'owner') ? list.filter((m) => m.id !== id) : null));
+      const store = repo.objects;
+      if (seq === undefined) {
+        const left = isMemberId(id) ? await Promise.all(['slot/', 'join/', 'rekey/'].map((p) => store.get(p + id, { start: 0, end: 1 }))) : [];
+        if (!left.some(Boolean)) throw new Error('There is no such member');
+      }
+      await Promise.all([deleteSlot(store, id), deleteJoin(store, id), deleteRekey(store, id)]);
+    });
+  }
+
+  /**
+   * Owner: commits the list `edit` makes of the current one as a member change, on top of the newest commit. Undefined,
+   * with nothing written, when `edit` returns null.
+   */
+  private async changeMembers(edit: (list: Member[]) => Member[] | null): Promise<number | undefined> {
+    const { st } = await this.open();
+    const { book } = this.ownerKeys();
+    await this.fetchRemote();
+    for (let round = 0; round < MAX_ROUNDS; round++) {
+      const members = edit(book.current(st.members).map((m) => ({ ...m })));
+      if (!members) return undefined;
+      const c: Commit = {
+        seq: st.lastSeq + 1, device: this.cfg.deviceName, time: this.now(), changes: [], prev: st.head, moved: true,
+        members: { gen: Math.max(st.members.at(-1)?.gen ?? 0, book.floor.gen) + 1, members, earlier: st.members.map((x) => x.seq) },
+      };
+      const hash = await this.put(c);
+      if (hash) {
+        st.apply({ ...c, hash });
+        await this.accepted(changeOf({ ...c, hash }));
+        await this.committed(c.seq, hash);
+        return c.seq;
+      }
+      await this.fetchRemote();
+    }
+    throw new Error('Could not change the members: other devices kept committing first. Try again.');
+  }
+
+  /**
+   * Owner: makes storage's log end with what members made, so that syncing goes on. Removes from its end every commit
+   * from the first one no member who may write made (or that cannot be opened), and whatever lies past a gap, with the
+   * snapshots past them. Honest devices never commit past such a commit, so nothing a member made is lost.
+   *
+   * After storage was put back from an older copy (a backup), a commit made before a removal by the member removed
+   * fails too, only because this device holds a newer member list than storage does (`MemberBook`). Such commits that
+   * a member who may still write made a commit after are kept: this device signs them again in place, with the same
+   * changes, and the commits after them too. Such commits with none after them are removed, as a removed member writing
+   * into the old copy makes them. Returns the commits removed; none when the log verifies.
+   */
+  removeUnverifiable(): Promise<number[]> {
+    return this.exclusive(async () => {
+      const { repo, st } = await this.open();
+      const { book } = this.ownerKeys();
+      let failed: UnverifiedError | undefined;
+      let tail: number[] = [];
+      for (let round = 0; round < MAX_ROUNDS; round++) {
+        failed = undefined;
+        try {
+          await this.fetchRemote();
+        } catch (e) {
+          if (!(e instanceof UnverifiedError)) throw e;
+          failed = e;
+        }
+        tail = await repo.commitSeqsAfter(st.lastSeq);
+        // A commit right after the end, after a fetch that went through, was made meanwhile: take it first. Anything
+        // else past the end lies past a gap, which a device that is up to date never lists.
+        if (failed || !tail.length || tail[0] !== st.lastSeq + 1) break;
+      }
+      if (failed && failed.seq <= st.lastSeq) {
+        throw new Error(`Commit ${failed.seq}, which this device already had, has changed in storage or can no longer be read, so nothing was removed. Check storage for damage.`);
+      }
+      if (!tail.length || (!failed && tail[0] === st.lastSeq + 1)) return [];
+
+      // Each commit after this device's end, in order, read afresh: whether it verifies, and whether only with lists
+      // older than the accepted one taken as they are.
+      const walked: { c: Commit; capOnly: boolean }[] = [];
+      const changes = [...st.members];
+      let head = st.head;
+      let stands = st.lastSeq;
+      const judge = async (seq: number) => {
+        const c = await repo.readCommit(seq, UNCHECKED).catch((e: unknown) => {
+          if (e instanceof UnverifiedError) return null;
+          throw e;
+        });
+        if (!c || (c.prev !== undefined && head !== undefined && c.prev !== head)) return undefined;
+        const passes = (uncapped: boolean) => book.checkCommit(c, changes, seq - 1, { cache: false, uncapped }).then(() => true, () => false);
+        if (!(await passes(true))) return undefined;
+        return { c, capOnly: !(await passes(false)) };
+      };
+      for (const seq of tail) {
+        if (seq !== st.lastSeq + 1 + walked.length) break;
+        // Judged twice before it counts as garbage: one read damaged in transit must not remove a good commit.
+        const j = (await judge(seq)) ?? (await judge(seq));
+        if (!j) break;
+        walked.push(j);
+        if (j.c.members) changes.push(changeOf(j.c));
+        head = j.c.hash;
+        if (!j.capOnly) stands = seq;
+      }
+      const removed = tail.filter((s) => s > stands);
+      const kept = walked.filter((w) => w.c.seq <= stands);
+      const from = kept.findIndex((w) => w.capOnly);
+      const again = from < 0 ? [] : kept.slice(from).map((w) => w.c);
+      if (!removed.length && !again.length) return [];
+      const end = again.length ? again[0].seq - 1 : stands;
+      // From the end back, so that an interrupted removal leaves no gap.
+      for (const seq of [...removed, ...again.map((c) => c.seq)].sort((a, b) => b - a)) await repo.removeCommit(seq);
+      const snaps = (await repo.snapshots()).map((s) => s.seq);
+      for (const seq of new Set([...snaps, ...repo.forged])) {
+        if (seq <= end) continue;
+        await repo.deleteSnapshot(seq);
+        repo.forged.delete(seq);
+      }
+      await repo.writeFollowHint(snaps.filter((s) => s <= end).at(-1) ?? 0);
+      this.stuck = false;
+      for (const c of again) {
+        // Another device committed meanwhile: the rest stays removed, and the devices that made it send it again.
+        if (st.lastSeq !== c.seq - 1) break;
+        const n: Commit = {
+          seq: c.seq, device: c.device, time: c.time, changes: c.changes, prev: st.head,
+          ...(c.moved && { moved: true }), ...(c.confirmed && { confirmed: true }), ...(c.members && { members: c.members }),
+        };
+        const hash = await this.put(n);
+        if (!hash) break;
+        for (const { path } of n.changes) this.recheck.add(path);
+        this.unplanned = true;
+        st.apply({ ...n, hash });
+        if (n.members) await this.accepted(changeOf({ ...n, hash }));
+        await this.committed(n.seq, hash);
+      }
+      this.unsaved = true;
+      await this.save();
+      return removed;
+    });
+  }
+
+  /**
+   * Owner: hands new storage keys to every member and to the owner's other devices, each in a document only it can
+   * open, signed and numbered. Test the keys before: a device switches only to keys that work for it. `read` is needed
+   * while some read members only read, and `suggest` while some are marked to send suggestions, who get it instead. A
+   * follow link's member gets none: anyone may hold that link, and it reads the public copy, which new keys do not
+   * change. Nor does a write invite that expired before any device joined with it: its link, which may have leaked,
+   * would read them with the old keys it carries. Returns the document's number.
+   */
+  writeRekey(storage: { write: Record<string, unknown>; read?: Record<string, unknown>; suggest?: Record<string, unknown> }): Promise<number> {
+    return this.exclusive(async () => {
+      const { repo, st } = await this.open();
+      const { book, root } = this.ownerKeys();
+      await this.fetchVerified();
+      const store = repo.objects;
+      const now = this.now();
+      const all = book.current(st.members).filter((m) => m.role !== 'owner' && !m.follow);
+      const lapsed = all.filter((m) => m.role === 'write' && !m.pub && !!m.expires && m.expires <= now);
+      // A join made before the invite expired is still confirmed at the owner's next sync (`confirmHeld`), by storage's clock.
+      const made = lapsed.length ? new Map((await store.list('join/')).map((o) => [o.key.slice(5), o.modified])) : new Map<string, number>();
+      const unused = new Set(lapsed.filter((m) => !(made.has(m.id) && made.get(m.id)! <= m.expires!)).map((m) => m.id));
+      const list = all.filter((m) => !unused.has(m.id));
+      const readers = list.filter((m) => m.role === 'read' && !m.suggest);
+      const suggesters = list.filter((m) => m.role === 'read' && m.suggest);
+      const names = (ms: Member[]) => ms.map((m) => m.name).join(', ');
+      if (readers.length && !storage.read) throw new Error(`A read-only key is needed too: ${names(readers)} only receive changes`);
+      if (suggesters.length && !storage.suggest) throw new Error(`A key that can read and add suggestions is needed too: ${names(suggesters)} send suggestions`);
+      const n = Math.max(this.now(), ((await readRekey(store, book, 'owner', root))?.n ?? 0) + 1);
+      for (const m of list) {
+        const keys = m.role === 'write' ? storage.write : m.suggest ? storage.suggest! : storage.read!;
+        await writeRekey(store, book, m.id, await memberSecret(root, m.id), { n, storage: keys });
+      }
+      await writeRekey(store, book, 'owner', root, { n, storage: storage.write });
+      book.floor = { ...book.floor, rekey: n };
+      await this.savePosition();
+      return n;
+    });
+  }
+
+  /**
+   * New storage keys the owner handed this device, newer than the ones it switched to last; null when there are none.
+   * Test them against this share, switch, then call `acceptRekey`.
+   */
+  async rekeyOffer(): Promise<RekeyOffer | null> {
+    const { repo } = await this.open();
+    const book = this.memberBook();
+    const k = this.o.member!.keys;
+    const secret = book.isOwner ? k.root : k.secret;
+    if (!secret) return null;
+    const offer = await readRekey(repo.objects, book, book.isOwner ? 'owner' : book.self, fromB64(secret));
+    return offer && offer.n > book.floor.rekey ? offer : null;
+  }
+
+  /** Records that this device switched to the keys of re-key `n`: from now on it takes only newer ones. */
+  acceptRekey(n: number): Promise<void> {
+    return this.exclusive(async () => {
+      await this.open();
+      const book = this.memberBook();
+      if (n <= book.floor.rekey) return;
+      book.floor = { ...book.floor, rekey: n };
+      await this.savePosition();
+    });
+  }
+
+  /**
+   * A member's device: sends the files at `paths` (as `SyncResult.unsent` names them) to the owner as one suggestion
+   * (`suggest.ts`): each note or canvas changed here, with the version it was changed from. `sent` holds the fingerprint
+   * of what was sent before for each path, so the same text is not sent twice. Writes nothing when nothing is left to
+   * send. A device that only receives writes this one object all the same, under a new key of its own, straight to the
+   * store it was given, past the wrapper that keeps every other write from it: a key that may not write there is refused
+   * by storage, and that refusal is thrown.
+   */
+  sendSuggestion(paths: Iterable<string>, sent: ReadonlyMap<string, string> = new Map()): Promise<SuggestOutcome> {
+    return this.exclusive(async () => {
+      const { repo, st } = await this.open();
+      const k = this.o.member?.keys;
+      if (!this.book || !k?.secret) throw new Error('Only a member’s device can send a suggestion to the owner of a shared folder');
+      const out: SuggestOutcome = { sent: [], skipped: [] };
+      const files: SuggestedFile[] = [];
+      let total = 0;
+      for (const path of [...new Set([...paths].map(vaultKey))].sort()) {
+        const skip = (why: SuggestOutcome['skipped'][number]['why']) => out.skipped.push({ path, why });
+        if (!suggestKind(path) || this.excluded(path)) {
+          skip('kind');
+          continue;
+        }
+        const disk = this.known?.paths.get(path) ?? path;
+        const stat = await this.o.fs.stat(disk);
+        if (!stat) {
+          skip('gone');
+          continue;
+        }
+        if (stat.size > SUGGEST_MAX_FILE) {
+          skip('large');
+          continue;
+        }
+        const data = await this.o.fs.read(disk);
+        let text: string;
+        try {
+          // A byte order mark stays, so the owner's device compares and writes the text byte for byte.
+          text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(data);
+        } catch {
+          skip('binary');
+          continue;
+        }
+        const base = st.synced.get(path)?.entry;
+        if (base && hasChunks(base, (await repo.split(data)).ids)) {
+          skip('same');
+          continue;
+        }
+        const sum = await digest(data);
+        if (sent.get(path) === sum) {
+          skip('sent');
+          continue;
+        }
+        if (total + data.length > SUGGEST_MAX_TOTAL) {
+          skip('full');
+          continue;
+        }
+        total += data.length;
+        files.push({ path, text, ...(base && { base }) });
+        out.sent.push({ path, sum });
+      }
+      if (!files.length) return out;
+      const secret = fromB64(k.secret);
+      // Another of this member's devices may send in the same millisecond: each suggestion takes a key no other has.
+      for (let time = this.now(), tries = 0; tries < 5; time++, tries++) {
+        const key = inboxKey(k.id, time);
+        const sealed = await sealSuggestion(repo.id, secret, { key, member: k.id, time, device: this.cfg.deviceName, files });
+        if (await this.o.store.put(key, sealed, { ifNoneMatch: true })) return { ...out, key };
+      }
+      throw new Error('Could not find a free place in storage for the suggestion. Try again.');
+    });
+  }
+
+  /** Owner: the keys of the suggestions waiting in storage, without opening them: one listing. */
+  async inbox(): Promise<string[]> {
+    const { repo } = await this.open();
+    this.ownerKeys();
+    return (await repo.objects.list(INBOX)).map((o) => o.key).filter((key) => !!parseInboxKey(key));
+  }
+
+  /**
+   * Owner: the newest `INBOX_OPENED` suggestions waiting in storage, newest first by the time their keys name, each
+   * opened with the secret of the member its key names, and how many more wait. One whose member is not on the member
+   * list now, or that does not open, comes without its content; an object whose key names no time comes last.
+   */
+  suggestions(): Promise<WaitingSuggestions> {
+    return this.exclusive(async () => {
+      const { repo, st } = await this.open();
+      const { book, root } = this.ownerKeys();
+      await this.fetchVerified();
+      const list = book.current(st.members);
+      const listed = (await repo.objects.list(INBOX))
+        .filter((o) => inInbox(o.key))
+        .map((o) => ({ ...o, at: parseInboxKey(o.key) }))
+        .sort((a, b) => (b.at?.time ?? -1) - (a.at?.time ?? -1) || (a.key < b.key ? -1 : 1));
+      const opened = listed.slice(0, INBOX_OPENED);
+      const out: (WaitingSuggestion | undefined)[] = [];
+      await pool(opened, this.cfg.concurrency, async ({ key, size, at }, i) => {
+        const member = at && list.find((m) => m.id === at.member && m.role !== 'owner');
+        const item: WaitingSuggestion = { key, ...at, ...(member && { name: member.name }) };
+        // A member who may add to the inbox can store anything there: what no suggestion fits in is not downloaded.
+        if (at && member && size <= MAX_SEALED) {
+          const raw = await repo.objects.get(key, { start: 0, end: MAX_SEALED + 1 });
+          if (!raw) return;
+          item.suggestion = await openSuggestion(repo.id, await memberSecret(root, at.member), key, raw).catch(() => undefined);
+        }
+        out[i] = item;
+      });
+      return { items: out.filter((w) => w !== undefined), more: listed.length - opened.length };
+    });
+  }
+
+  /**
+   * Owner: one file of suggestion `key` was dealt with, taken into the folder or not: it is taken out of the suggestion,
+   * and the suggestion out of storage once no file is left in it. Nothing happens to a suggestion already gone.
+   */
+  settleSuggestion(key: string, path: string): Promise<void> {
+    return this.exclusive(async () => {
+      const { repo } = await this.open();
+      const { root } = this.ownerKeys();
+      const at = parseInboxKey(key);
+      if (!at) throw new Error('That is not a suggestion');
+      const raw = await repo.objects.get(key, { start: 0, end: MAX_SEALED + 1 });
+      if (!raw) return;
+      const secret = await memberSecret(root, at.member);
+      const s = await openSuggestion(repo.id, secret, key, raw);
+      const files = s.files.filter((f) => f.path !== vaultKey(path));
+      if (!files.length) await repo.objects.delete(key);
+      else if (files.length < s.files.length) await repo.objects.put(key, await sealSuggestion(repo.id, secret, { ...s, files }));
+    });
+  }
+
+  /** Owner: takes suggestion `key` out of storage whole, as when it can not be opened or none of it is wanted; any object `suggestions` lists. */
+  async dismissSuggestion(key: string): Promise<void> {
+    const { repo } = await this.open();
+    this.ownerKeys();
+    if (!inInbox(key)) throw new Error('That is not a suggestion');
+    await repo.objects.delete(key);
+  }
+
+  /**
+   * A write member's device the owner's has not confirmed yet: makes sure, once per engine, that its join is in storage,
+   * as when the app stopped after keeping its keys and before `publishJoin`. Best effort.
+   */
+  private async sendJoin(): Promise<void> {
+    const { repo, st } = await this.open();
+    const book = this.memberBook();
+    const k = this.o.member!.keys;
+    const me = book.me(st.members);
+    if (this.joinSent || this.cfg.readOnly || !k.key || !k.secret || me?.role !== 'write' || me.pub) return;
+    this.joinSent = true;
+    try {
+      const pub = book.selfPub!;
+      if (!(await writeJoin(repo.objects, repo.id, k.id, fromB64(k.secret), pub))) this.log('Another device used this invite first');
+    } catch (e) {
+      this.joinSent = false;
+      this.log(`Could not ask the owner's device to confirm this one: ${errorText(e)}`);
+    }
+  }
+
+  /**
+   * After a sync, on a device that may write, at most every minute on the owner's and hourly on others: the owner's
+   * confirm joins and put back a member list storage lost (as after a restore from a backup); each drops expired
+   * invites and snapshots found forged. Best effort.
+   */
+  private async chores(): Promise<void> {
+    const book = this.memberBook();
+    const { repo, st } = await this.open();
+    const now = this.now();
+    if (this.cfg.readOnly || !book.mayWrite(st.members) || now - this.choresDone < (book.isOwner ? OWNER_CHORES_EVERY : CHORES_EVERY)) return;
+    this.choresDone = now;
+    try {
+      if (book.isOwner) {
+        await this.confirmHeld();
+        if ((st.members.at(-1)?.gen ?? 0) < book.floor.gen) await this.changeMembers((list) => list);
+      }
+      const store = repo.objects;
+      const listed = book.isOwner ? new Set(book.current(st.members).map((m) => m.id)) : undefined;
+      for (const o of await store.list('slot/')) {
+        const id = o.key.slice(5);
+        // The invite of someone no longer a member, left when a removal could not take it out. An invite made on another
+        // of the owner's devices writes its slot just before the member: it is given an hour to land.
+        if (listed && !listed.has(id) && now - o.modified > ORPHAN_SLOT_AGE) {
+          await deleteSlot(store, id);
+          continue;
+        }
+        const e = await slotExpiry(store, id);
+        if (e && now > e) await deleteSlot(store, id);
+      }
+      for (const seq of [...repo.forged]) {
+        // Read again first: one read that came back damaged in transit must not delete a good snapshot.
+        repo.forged.delete(seq);
+        await repo.readSnapshotWithHead(seq);
+        if (!repo.forged.has(seq)) continue;
+        await repo.deleteSnapshot(seq);
+        repo.forged.delete(seq);
+      }
+    } catch (e) {
+      this.log(`Could not tidy the shared folder's invites: ${errorText(e)}`);
+    }
   }
 }

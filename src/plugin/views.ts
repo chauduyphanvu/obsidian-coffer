@@ -4,11 +4,15 @@ import { errorText } from '../core/text.ts';
 import { chooseDeferred } from './deferred.ts';
 import type CofferPlugin from './main.ts';
 import { resolveConflict } from './resolve.ts';
-import { describeStorage, hasStorageAddress, parseNumberSetting, passphraseProblem, type Share } from './settings.ts';
+import { describeStorage, hasStorageAddress, labelOf, parseNumberSetting, passphraseProblem, type Share } from './settings.ts';
+import { WhatsSharedModal } from './byproperty-ui.ts';
 import { SetupModal } from './setup.ts';
 import { renderDevices } from './devices.ts';
+import { RemoveUnverifiedModal } from './people.ts';
 import { confirmStopSharing, downloadAgain, renderShares } from './sharing.ts';
-import { isConflictProblem, leftInStorage, quietText, type Problem } from './status.ts';
+import { SendSuggestionModal } from './inbox.ts';
+import { sentNote } from './suggestions.ts';
+import { isConflictProblem, isUnsentProblem, leftInStorage, quietText, type Problem } from './status.ts';
 import { button, buttonRow, field, message, openLink, passphraseFields, statusLine } from './ui.ts';
 
 type SecretKey = 'accessKeySecret' | 'secretKeySecret' | 'passphraseSecret' | 'webdavPasswordSecret';
@@ -382,8 +386,9 @@ export class ProblemsModal extends Modal {
         button(row, 'Enter the passphrase', () => new EnterPassphraseModal(this.app, plugin, share).open(), 'cta');
         break;
       case 'resolve-deletes':
-        button(row, 'Keep all files', () => plugin.keepAllFiles(share), 'cta');
-        button(row, 'Delete them everywhere', () => plugin.sync(true, share ? share.id : true), 'warning');
+        // Notes shared by a property only send: keeping the files keeps them for the others, not here.
+        button(row, share?.property ? `Keep them in “${share.property}”` : 'Keep all files', () => plugin.keepAllFiles(share), 'cta');
+        button(row, share?.property ? `Delete them from “${share.property}” too` : 'Delete them everywhere', () => plugin.sync(true, share ? share.id : true), 'warning');
         break;
       case 'missing-folder':
         if (!share) break;
@@ -396,6 +401,24 @@ export class ProblemsModal extends Modal {
       case 'accept-storage':
         button(row, 'Carry on from storage as it is…', () => new AcceptStorageModal(this.app, plugin, share).open(), 'warning');
         break;
+      case 'remove-unverified':
+        if (!share) break;
+        button(row, 'Remove changes that were not signed by a member…', () => new RemoveUnverifiedModal(this.app, plugin, share).open(), 'warning');
+        break;
+      case 'stop-sharing':
+        if (!share) break;
+        button(row, 'Stop sharing on this device', () => confirmStopSharing(plugin, share));
+        break;
+      case 'whats-shared':
+        if (!share) break;
+        button(row, "What's shared", () => new WhatsSharedModal(this.app, plugin, share).open(), 'cta');
+        break;
+    }
+    if (share && isUnsentProblem(p) && plugin.canSuggest(share)) {
+      message(card, sentNote(share, plugin.unsentOf(share), plugin.standingOf(share)?.owner ?? ''), 'coffer-hint');
+      // Below the note, which says what was sent before.
+      card.appendChild(row);
+      button(row, 'Send as a suggestion…', () => new SendSuggestionModal(this.app, plugin, share).open(), 'cta');
     }
   }
 }
@@ -421,7 +444,7 @@ class AcceptStorageModal extends Modal {
   private render(): void {
     const c = this.contentEl;
     c.empty();
-    this.setTitle(this.share ? `Carry on with “${this.share.folder}” from storage as it is?` : 'Carry on from storage as it is?');
+    this.setTitle(this.share ? `Carry on with “${labelOf(this.share)}” from storage as it is?` : 'Carry on from storage as it is?');
     c.createEl('p', {
       cls: 'coffer-intro',
       text: 'What storage holds is not what this device last saw there: part of the sync history was taken back or replaced.',
@@ -430,7 +453,9 @@ class AcceptStorageModal extends Modal {
     what.createEl('li', { text: 'That is expected right after storage was restored from a backup or an older copy on purpose. Then carry on.' });
     what.createEl('li', { text: 'If nobody did that, someone else may have changed what is stored. Cancel, leave sync stopped, and find out who can reach your storage.' });
     what.createEl('li', {
-      text: "Carrying on, this device takes storage as it is now and syncs with it. Nothing is deleted. Where a file differs, both versions are kept: storage's under the name, this device's beside it with “(conflict …)” in its name. Settings are combined instead.",
+      text: this.share?.property
+        ? 'Carrying on, storage is taken as it is now and your notes are sent again where they differ. Nothing is deleted, and nothing is written into your vault.'
+        : "Carrying on, this device takes storage as it is now and syncs with it. Nothing is deleted. Where a file differs, both versions are kept: storage's under the name, this device's beside it with “(conflict …)” in its name. Settings are combined instead.",
     });
     message(c, this.error);
     const row = buttonRow(c);

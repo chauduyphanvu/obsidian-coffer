@@ -4,7 +4,7 @@ Sync your Obsidian vault between your devices through storage you own: an S3-com
 
 Coffer runs on desktop and mobile, keeps a version history of every file, merges edits made on two devices, and can bring back deleted files or a whole folder as it was at an earlier time.
 
-> Coffer is young (0.3). It is covered by 404 tests and has been run on macOS and iOS, but keep a backup of a vault you care about while you try it.
+> Coffer is young (0.4). It is covered by 630 tests and has been run on macOS and iOS, but keep a backup of a vault you care about while you try it.
 
 ## What you need to know first
 
@@ -20,7 +20,7 @@ Coffer runs on desktop and mobile, keeps a version history of every file, merges
 - **Merges, not overwrites.** A note edited on two devices is merged line by line, and word by word inside a paragraph; its properties are merged key by key. Canvases are merged node by node, and settings files key by key. When a merge is not possible, both versions are kept side by side, and a resolver walks you through the differences.
 - **History and restore.** Every version is kept for a day, then hourly states for a week, then daily states for the retention window (30 days by default). You can restore a version of a file, bring back deleted files, or return a folder or the whole vault to an earlier time, with a preview of what will change.
 - **Safety checks.** A sync that would delete more than 10 files and half the vault stops and asks first. Each change is chained to the one before it, so a device notices if storage was rolled back or tampered with. A "Check synced data for damage" command checks the stored data end to end, and "Repair synced data" stores again, from the files on a device that has them, whatever it finds missing.
-- **Shared folders.** Share one folder with someone else, or with another of your vaults: it gets its own storage and passphrase, and others join through an invite link.
+- **Sharing.** Share one folder with other people as members who can edit, only read, or read and suggest changes, each joining through their own invite link; or share notes scattered across the vault by marking them with a property. A shared folder gets its own storage. See [Sharing](#sharing).
 - **Made for phones too.** Setup works from a phone, a new device joins by opening a setup link, and edits are sent before the app is suspended.
 - **Clear status.** The status bar says when the vault last synced; a problems screen says plainly what is wrong and what to do.
 - **Command-line tool** (optional) to keep a folder in sync from an always-on computer. See [Command line](#command-line).
@@ -90,6 +90,22 @@ Turning on versioning for the bucket, with a rule that deletes old versions afte
 
 Coffer syncs when Obsidian starts, a few seconds after an edit, every few minutes, and sooner when it notices another device has synced. All of these can be changed in settings.
 
+## Sharing
+
+Everything shared is encrypted like the vault, in storage you choose, and separate from the vault's own: people you share with hold no key to the rest of your notes. Add one under **Settings → Coffer → Shared folders**.
+
+- **A shared folder with members.** You are its owner, and invite each person with their own link, which works once, expires, and needs no passphrase. A member can edit, only read, or read and suggest. Every change is signed by the device that made it, and devices accept only changes signed by a current member who may edit, so "only read" holds even where the storage key itself could write. Someone invited to edit only reads until one of your devices has confirmed them, and an invite to edit is for one device.
+- **Removing someone.** Remove them under **Members**; their changes are refused from then on. To also stop them reading what is added later, give the folder new storage keys (**Give everyone new storage keys**): the new keys reach the remaining members through storage.
+- **Suggestions.** A member who reads and suggests sends the edits they made on their own device; you review each file and take it in or leave it out.
+- **Activity.** **Show recent changes in a shared folder** lists who changed what.
+- **Limited storage keys.** For S3, R2 and B2, Coffer writes the provider rule, when you invite someone, for a key that reaches only the shared folder: one that writes, one that only reads, one that reads and may send suggestions. Give members a limited key, not your own.
+- **Follow links.** Where a shared folder's storage can be read publicly, a follow link lets someone receive it with no storage key at all. A follower cannot be removed afterwards short of sharing the folder again elsewhere.
+- **Your other devices.** A shared folder added on one device is offered on your others, to add with one tap.
+- **Notes shared by a property.** Choose a name, such as `Family`, and every note whose properties say `share: Family` is shared, with the attachments it shows, at its place in the vault. This is one way: members read, or read and suggest, and nothing they do changes your vault unless you take a suggestion in. A note that stops saying `share: Family` stays shared until you remove it, under **What's shared**. One device sends these notes, and a vault has one such share.
+- **A shared folder with a passphrase**, as before 0.4: everyone who has the storage keys and the passphrase is an equal. These keep working, and still work with 0.3. A folder with members needs 0.4 on every device; to move, share the folder again with members.
+
+What members cannot be stopped from doing: anyone whose storage key can write can delete objects or add garbage that holds a shared folder up until the owner removes it. They cannot get a change accepted.
+
 ## Commands
 
 | Command | What it does |
@@ -101,6 +117,9 @@ Coffer syncs when Obsidian starts, a few seconds after an edit, every few minute
 | Check storage connection | Tests that the storage supports everything Coffer needs |
 | Show version history of the current file | Lists stored versions, with a diff, and restores one |
 | Download a file left in storage | Lists the files kept in storage by the size setting, and downloads the one you choose |
+| Show recent changes in a shared folder | Lists who changed what in a shared folder with members |
+| Add the current note to the notes shared by property | Marks the note to be shared at the next sync |
+| Remove the current note from the notes shared by property… | Deletes the note for the people it is shared with, and keeps yours |
 | Restore deleted files | Lists deleted files that can still be brought back |
 | Restore the vault or a folder to an earlier time | Previews and applies a point-in-time restore |
 | Resolve a file changed on two devices | Walks through a conflict copy line by line |
@@ -136,11 +155,15 @@ To check that the file was built by this repository's release workflow, run `gh 
 }
 ```
 
-Secrets come from the environment: `COFFER_PASSPHRASE` (at least 8 characters to make a new vault, and the same for `COFFER_NEW_PASSPHRASE`), and `COFFER_ACCESS_KEY` with `COFFER_SECRET_KEY` for S3, or `COFFER_WEBDAV_PASSWORD` for WebDAV. Other commands: `sync`, `fetch`, `check`, `history`, `restore`, `deleted`, `log`, `restore-at`, `verify`, `repair`, `clean`, `change-passphrase` and `accept-storage`. Run `node coffer.js --help` (from a clone, `npm run cli`) for details, and `--version` for the version.
+Secrets come from the environment: `COFFER_PASSPHRASE` (at least 8 characters to make a new vault, and the same for `COFFER_NEW_PASSPHRASE`), and `COFFER_ACCESS_KEY` with `COFFER_SECRET_KEY` for S3, or `COFFER_WEBDAV_PASSWORD` for WebDAV. Other commands: `join`, `sync`, `fetch`, `check`, `history`, `restore`, `deleted`, `log`, `restore-at`, `verify`, `repair`, `clean`, `change-passphrase` and `accept-storage`. Run `node coffer.js --help` (from a clone, `npm run cli`) for details, and `--version` for the version.
 
 To keep large files off this machine, set `deferAboveMB` under `sync` to a size in MB: files above it stay in storage, `sync` lists them as not downloaded, and `fetch <path>...` downloads the ones you name, after which they sync like any other file.
 
+To join a shared folder with members, or follow one, pass its link on standard input so it stays out of shell history: `pbpaste | node coffer.js join - --config=family.json --vault=Family`. The keys are kept in `<folder>/.coffer/keys.json`, readable by you alone, and the other commands then work on that config. The command line cannot own a shared folder, send suggestions, or send notes shared by a property.
+
 ## Known limitations
+
+- In a shared folder with members, a device that joins with an invite made before someone was removed can be shown storage put back to before the removal, until the folder is given new keys.
 
 - If objects are deleted from storage by something other than Coffer, **Check synced data for damage** reports which files are affected, and **Repair synced data** stores them again from a device that still has those files. What no device has any more cannot be recovered, and neither can an earlier version that no current file shares data with.
 - If storage is put back to an older copy, a device notices when it next sends a change, and at once takes back the one change it sent, or within an hour if it has nothing to send, as a device that only receives never does.

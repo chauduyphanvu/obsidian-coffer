@@ -1,3 +1,4 @@
+import type { MemberChange } from './members.ts';
 import { sameContent, type Commit, type Entry } from './types.ts';
 import { PackTable, decEntry, encEntry, type WireEntry } from './wire.ts';
 
@@ -19,12 +20,17 @@ export class LocalState {
   synced = new Map<string, Synced>();
   /** Paths a commit marked `confirmed` deleted, and nothing has changed since: their deletion here is not counted by the guard. */
   confirmed = new Set<string>();
+  /** A shared folder with members: every member change up to `lastSeq`, oldest first, which the commits after are checked by. */
+  members: MemberChange[] = [];
+  /** A shared folder with members: when each member's newest commit this device has taken was made, by member id. */
+  lastBy = new Map<string, number>();
 
   static parse(json: string | null): LocalState {
     const st = new LocalState();
     if (!json) return st;
     const w = JSON.parse(json) as {
       id: string; seq: number; h?: string; p: string[]; f: [string, WireEntry | 0, 0 | [number, number] | [number, number, WireEntry]][]; c?: string[];
+      m?: MemberChange[]; b?: [string, number][];
     };
     st.vaultId = w.id;
     st.lastSeq = w.seq;
@@ -35,6 +41,8 @@ export class LocalState {
       if (s) st.synced.set(path, { entry: s[2] ? decEntry(s[2], w.p) : remote!, lsize: s[0], lmtime: s[1] });
     }
     st.confirmed = new Set(w.c);
+    st.members = w.m ?? [];
+    st.lastBy = new Map(w.b);
     return st;
   }
 
@@ -46,6 +54,8 @@ export class LocalState {
       if (c.confirmed && !ch.entry) this.confirmed.add(ch.path);
       else this.confirmed.delete(ch.path);
     }
+    if (c.members) this.members.push({ seq: c.seq, gen: c.members.gen, members: c.members.members, ...(c.hash && { hash: c.hash }) });
+    if (c.signer && !c.moved && c.time > (this.lastBy.get(c.signer) ?? 0)) this.lastBy.set(c.signer, c.time);
     this.lastSeq = c.seq;
     this.head = c.hash;
   }
@@ -83,7 +93,9 @@ export class LocalState {
     if (before.size === 0) this.packsInUse = pt.list.length;
     const head = this.head === undefined ? '' : `,"h":${JSON.stringify(this.head)}`;
     const confirmed = this.confirmed.size ? `,"c":${JSON.stringify([...this.confirmed])}` : '';
-    return `{"id":${JSON.stringify(this.vaultId)},"seq":${this.lastSeq}${head},"p":${JSON.stringify(pt.list)},"f":[${out.join(',')}]${confirmed}}`;
+    const members = this.members.length ? `,"m":${JSON.stringify(this.members)}` : '';
+    const lastBy = this.lastBy.size ? `,"b":${JSON.stringify([...this.lastBy])}` : '';
+    return `{"id":${JSON.stringify(this.vaultId)},"seq":${this.lastSeq}${head},"p":${JSON.stringify(pt.list)},"f":[${out.join(',')}]${confirmed}${members}${lastBy}}`;
   }
 }
 
