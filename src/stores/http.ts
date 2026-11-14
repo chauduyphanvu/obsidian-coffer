@@ -27,6 +27,17 @@ export const fetchHttp: Http = async (req) => {
 export const uncachedHeaders = (req: HttpRequest): Record<string, string> =>
   req.method === 'GET' ? { ...req.headers, 'cache-control': 'no-store, no-cache' } : req.headers;
 
+/** `headers` split into the content type they name, if any, and the rest: for HTTP clients that take the type apart from the other headers. */
+export function splitContentType(headers: Record<string, string>): { contentType?: string; headers: Record<string, string> } {
+  const rest: Record<string, string> = {};
+  let contentType: string | undefined;
+  for (const [name, value] of Object.entries(headers)) {
+    if (name.toLowerCase() === 'content-type') contentType = value;
+    else rest[name] = value;
+  }
+  return contentType === undefined ? { headers: rest } : { contentType, headers: rest };
+}
+
 export const unescapeXml = (s: string) => s.replace(/&(amp|lt|gt|quot|apos);/g, (_, e) => ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" })[e as string]!);
 
 /** Store ranges end before `end`; an HTTP range names its last byte. */

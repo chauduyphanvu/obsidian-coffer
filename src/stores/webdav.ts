@@ -79,8 +79,9 @@ export class WebDavStore implements RemoteStore {
     this.fail(res, `GET ${key}`);
   }
 
-  async put(key: string, data: Uint8Array, opts?: { ifNoneMatch?: boolean }): Promise<boolean> {
+  async put(key: string, data: Uint8Array, opts?: { ifNoneMatch?: boolean; contentType?: string }): Promise<boolean> {
     const headers: Record<string, string> = opts?.ifNoneMatch ? { 'if-none-match': '*' } : {};
+    if (opts?.contentType) headers['content-type'] = opts.contentType;
     let res = await this.request('PUT', this.url(key), headers, data);
     if (res.status === 409 || res.status === 404 || res.status === 403) {
       // A parent folder is missing (servers disagree on which of these codes says so).

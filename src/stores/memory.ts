@@ -1,7 +1,7 @@
 import type { ObjectInfo, RemoteStore } from '../core/types.ts';
 
 export class MemoryStore implements RemoteStore {
-  objects = new Map<string, { data: Uint8Array; modified: number }>();
+  objects = new Map<string, { data: Uint8Array; modified: number; type?: string }>();
   private now: () => number;
 
   constructor(now: () => number = Date.now) {
@@ -14,9 +14,9 @@ export class MemoryStore implements RemoteStore {
     return range ? o.data.slice(range.start, range.end) : o.data.slice();
   }
 
-  async put(key: string, data: Uint8Array, opts?: { ifNoneMatch?: boolean }): Promise<boolean> {
+  async put(key: string, data: Uint8Array, opts?: { ifNoneMatch?: boolean; contentType?: string }): Promise<boolean> {
     if (opts?.ifNoneMatch && this.objects.has(key)) return false;
-    this.objects.set(key, { data: data.slice(), modified: this.now() });
+    this.objects.set(key, { data: data.slice(), modified: this.now(), ...(opts?.contentType && { type: opts.contentType }) });
     return true;
   }
 

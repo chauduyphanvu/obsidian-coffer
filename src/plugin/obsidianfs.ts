@@ -4,7 +4,7 @@ import { PROPERTY, readAlready, type Catalog } from './byproperty.ts';
 import { loadState, removeState, saveState } from './statefile.ts';
 import type { FolderFS } from '../core/scopedfs.ts';
 import type { FileStat, LocalFile, StateStore } from '../core/types.ts';
-import { uncachedHeaders, type Http } from '../stores/http.ts';
+import { splitContentType, uncachedHeaders, type Http } from '../stores/http.ts';
 
 const CONFIG_RESCAN_MS = 5 * 60_000;
 
@@ -13,12 +13,14 @@ const toBuffer = (u: Uint8Array): ArrayBuffer =>
 
 /** `requestUrl` goes through the app's native side, so it works on mobile where `fetch` is blocked by CORS. */
 export const obsidianHttp: Http = async (req) => {
+  // Only an upload's type is taken out of the headers: every other request goes out as it always has.
+  const { contentType, headers } = req.method === 'PUT' ? splitContentType(req.headers) : { headers: uncachedHeaders(req) };
   const r = await requestUrl({
     url: req.url,
     method: req.method,
-    headers: uncachedHeaders(req),
+    headers,
     body: req.body && toBuffer(req.body),
-    contentType: 'application/octet-stream',
+    contentType: contentType ?? 'application/octet-stream',
     throw: false,
   });
   return { status: r.status, body: new Uint8Array(r.arrayBuffer) };

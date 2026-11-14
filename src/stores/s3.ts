@@ -74,8 +74,10 @@ export class S3Store implements RemoteStore {
     return res.body;
   }
 
-  async put(key: string, data: Uint8Array, opts?: { ifNoneMatch?: boolean }): Promise<boolean> {
-    const res = await this.request('PUT', key, {}, opts?.ifNoneMatch ? { 'if-none-match': '*' } : {}, data);
+  async put(key: string, data: Uint8Array, opts?: { ifNoneMatch?: boolean; contentType?: string }): Promise<boolean> {
+    const headers: Record<string, string> = opts?.ifNoneMatch ? { 'if-none-match': '*' } : {};
+    if (opts?.contentType) headers['content-type'] = opts.contentType;
+    const res = await this.request('PUT', key, {}, headers, data);
     if (res.status === 412) return false;
     if (res.status !== 200) this.fail(res, `PUT ${key}`);
     return true;

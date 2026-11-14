@@ -73,8 +73,11 @@ export interface ObjectInfo {
 export interface RemoteStore {
   /** `range.end` is exclusive. Resolves to null when the key does not exist. */
   get(key: string, range?: { start: number; end: number }): Promise<Uint8Array | null>;
-  /** With `ifNoneMatch`, resolves to false (and writes nothing) when the key already exists. */
-  put(key: string, data: Uint8Array, opts?: { ifNoneMatch?: boolean }): Promise<boolean>;
+  /**
+   * With `ifNoneMatch`, resolves to false (and writes nothing) when the key already exists. With `contentType`, a store
+   * that serves its objects to browsers records it as the object's type; others ignore it.
+   */
+  put(key: string, data: Uint8Array, opts?: { ifNoneMatch?: boolean; contentType?: string }): Promise<boolean>;
   /** With `once`, a store that retries failed requests makes a single attempt: for a delete that must not be repeated after it may have taken effect. */
   delete(key: string, opts?: { once?: boolean }): Promise<void>;
   /** Keys under `prefix`, in ascending key order, strictly after `startAfter` when given. */
