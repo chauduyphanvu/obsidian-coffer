@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -1058,6 +1058,18 @@ test('cli: a new vault and a new passphrase need at least 8 characters, an exist
     assert.equal(changed.status, 0, changed.stderr);
     assert.notEqual(header(), was);
     assert.equal(bare(t.dir, ['sync', `--config=${t.config}`], { COFFER_PASSPHRASE: 'eight-chars' }).status, 0);
+
+    // Storage refuses the new key file: said to be unchanged, and it is.
+    const kept = header();
+    chmodSync(remote, 0o555);
+    try {
+      const refusedWrite = bare(t.dir, ['change-passphrase', `--config=${t.config}`], { COFFER_PASSPHRASE: 'eight-chars', COFFER_NEW_PASSPHRASE: 'another-one' });
+      assert.equal(refusedWrite.status, 1);
+      assert.match(refusedWrite.stderr, /^the passphrase was not changed\n/);
+    } finally {
+      chmodSync(remote, 0o755);
+    }
+    assert.equal(header(), kept);
   } finally {
     t.done();
   }

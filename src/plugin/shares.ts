@@ -200,7 +200,7 @@ export type ShareFS = LocalFS & { pathOf(path: string): string };
  * A shared folder with members opens with this device's keys to it, and keeps the member list it accepted in a file
  * of its own, which nothing that resets its sync state touches.
  */
-export function makeEngine(h: EngineHost, share: Share | undefined, extra: Pick<EngineOptions, 'onProgress' | 'now'> = {}): { engine: SyncEngine; fs: ShareFS } {
+export function makeEngine(h: EngineHost, share: Share | undefined, extra: Pick<EngineOptions, 'onProgress' | 'now' | 'nextPassphrase' | 'onPassphrase'> = {}): { engine: SyncEngine; fs: ShareFS } {
   const s = h.settings;
   if (share?.property) return propertyEngine(h, share, extra);
   // A folder of '' would be the whole vault.

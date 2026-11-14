@@ -3,14 +3,15 @@ import { test } from 'node:test';
 import { WrongPassphraseError } from '../src/core/crypto.ts';
 import { HistoryError, RemovedError, UnverifiedError } from '../src/core/engine.ts';
 import {
-  changeOf, decodeFollow, decodeInvite, encodeFollow, encodeInvite, MemberBook, openOwnerLink, ownerKeysFrom, ownerLinkFields, parseMemberKeys, sealOwnerLink,
+  changeOf, decodeFollow, decodeInvite, encodeFollow, encodeInvite, MemberBook, openOwnerLink, ownerKeysFrom, ownerLinkFields, parseMemberKeys, sealOwnerLink, serializePosition,
 } from '../src/core/members.ts';
-import { joinShare, publishJoin } from '../src/core/membership.ts';
+import { createMemberShare, joinShare, publishJoin } from '../src/core/membership.ts';
 import { seqKey } from '../src/core/repo.ts';
 import { listVersions } from '../src/core/retention.ts';
 import { listActivity, listCommits, listDeleted, tableAt } from '../src/core/timeline.ts';
 import type { RemoteStore } from '../src/core/types.ts';
-import { DAY, Device, memberShare, rawRepo } from './helpers.ts';
+import { MemoryStore } from '../src/stores/memory.ts';
+import { DAY, Device, TEST_CONFIG, lossy, memberShare, rawRepo } from './helpers.ts';
 
 const states = async (d: Device) => (await d.engine.members()).map((m) => [m.name, m.role, m.state]);
 
@@ -611,4 +612,63 @@ test('a member invited to read and suggest is marked in the signed member list, 
   await raw.writeCommit({ ...real, members: { ...real.members!, members: real.members!.members.map(({ suggest: _, ...m }) => m) } });
   const tablet = new Device('tablet', net, clock, {}, keys);
   await assert.rejects(tablet.sync(), UnverifiedError);
+});
+
+test('an invite whose reply is lost adds the member once, and every device keeps syncing', async () => {
+  let l!: ReturnType<typeof lossy>;
+  const { owner, invite, writer, store, keys, clock } = await memberShare({}, (net) => (l = lossy(net)).store);
+  owner.fs.put('plan.md', 'v1\n');
+  await owner.sync();
+  const lan = await writer('Lan');
+  await lan.sync();
+  const phone = new Device('phone', store, clock, {}, keys);
+  await phone.sync();
+
+  // The member change lands, its reply is lost, and the retry is told the number is taken.
+  l.lose((key) => key.startsWith('log/'));
+  const link = await invite('Mai', 'read');
+  assert.ok(!l.armed, 'the reply was lost');
+  assert.deepEqual((await owner.engine.members()).map((m) => m.name), ['Vu', 'Lan', 'Mai']);
+  await owner.sync();
+  await lan.sync();
+  await phone.sync();
+  const mai = new Device('Mai', store, clock, { readOnly: true }, await joinShare(store, link, clock.now));
+  await mai.sync();
+  assert.deepEqual(mai.snapshot(), owner.snapshot());
+  assert.deepEqual((await phone.engine.members()).map((m) => m.name), ['Vu', 'Lan', 'Mai']);
+});
+
+test('an owner device whose saved member list names someone twice puts back each member once', async () => {
+  const { owner, writer, keys, clock } = await memberShare();
+  owner.fs.put('plan.md', 'v1\n');
+  await owner.sync();
+  const lan = await writer('Lan');
+  await lan.sync();
+  // As an owner device hit by a duplicated member list keeps it after storage lost it: newer than storage's newest.
+  const list = (await owner.engine.view()).st.members.at(-1)!;
+  const lanEntry = list.members.find((m) => m.name === 'Lan')!;
+  await owner.position.save(serializePosition(keys.repo, { gen: list.gen + 1, seq: 99, hash: 'gone', members: [...list.members, lanEntry], rekey: 0 }));
+  owner.restart();
+  clock.now += 120_000;
+  await owner.sync();
+  assert.deepEqual((await owner.engine.members()).map((m) => m.name), ['Vu', 'Lan']);
+  await lan.sync();
+  lan.fs.put('lan.md', 'from lan\n');
+  assert.equal((await lan.sync()).pushed, 1);
+  await owner.sync();
+  assert.equal(owner.fs.text('lan.md'), 'from lan\n');
+});
+
+test('starting a shared folder survives a lost reply on its key file and on its first commit', async () => {
+  for (const at of ['vault.json', 'log/']) {
+    const clock = { now: 1_800_000_000_000 };
+    const l = lossy(new MemoryStore(() => clock.now));
+    l.lose((key) => key.startsWith(at));
+    const keys = await createMemberShare(l.store, { owner: 'Vu', device: 'mac', passphrase: 'owner passphrase', kdfIterations: 1000, chunk: TEST_CONFIG.chunk!, now: clock.now });
+    assert.ok(!l.armed, `the reply of ${at} was lost`);
+    const owner = new Device('mac', l.store, clock, {}, keys);
+    owner.fs.put('a.md', 'a\n');
+    assert.equal((await owner.sync()).pushed, 1, at);
+    assert.deepEqual((await owner.engine.members()).map((m) => m.name), ['Vu'], at);
+  }
 });

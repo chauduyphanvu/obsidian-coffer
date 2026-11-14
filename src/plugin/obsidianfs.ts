@@ -1,6 +1,7 @@
 import { TFile, TFolder, Vault, getLinkpath, requestUrl, type App, type TAbstractFile } from 'obsidian';
 import { vaultKey } from '../core/paths.ts';
 import { PROPERTY, readAlready, type Catalog } from './byproperty.ts';
+import { loadState, removeState, saveState } from './statefile.ts';
 import type { FolderFS } from '../core/scopedfs.ts';
 import type { FileStat, LocalFile, StateStore } from '../core/types.ts';
 import { uncachedHeaders, type Http } from '../stores/http.ts';
@@ -129,6 +130,7 @@ export class ObsidianFS implements FolderFS {
   }
 }
 
+/** A state file in the plugin's folder, kept so that one cut short by the app stopping is never all there is (statefile.ts). */
 export class PluginState implements StateStore {
   private app: App;
   private path: string;
@@ -136,12 +138,14 @@ export class PluginState implements StateStore {
     this.app = app;
     this.path = path;
   }
-  async load(): Promise<string | null> {
-    const adapter = this.app.vault.adapter;
-    return (await adapter.exists(this.path)) ? adapter.read(this.path) : null;
+  load(): Promise<string | null> {
+    return loadState(this.app.vault.adapter, this.path);
   }
-  async save(data: string): Promise<void> {
-    await this.app.vault.adapter.write(this.path, data);
+  save(data: string): Promise<void> {
+    return saveState(this.app.vault.adapter, this.path, data);
+  }
+  remove(): Promise<void> {
+    return removeState(this.app.vault.adapter, this.path);
   }
 }
 

@@ -39,6 +39,8 @@ export interface Share extends Storage {
   lastCleanup: number;
   /** Conflict copies made here that still exist, as paths inside the folder. */
   conflictCopies: string[];
+  /** Files a restore removed here, by path inside the folder, until a sync deletes them from storage as confirmed. */
+  restored: string[];
   /** The folder went missing. Nothing syncs until the user downloads it again or stops sharing it here. */
   missing: boolean;
   /**
@@ -101,6 +103,11 @@ export interface Settings extends Storage {
   lastSuccess: number;
   /** Conflict copies made here that still exist, so they stay on the problem list until dealt with. */
   conflictCopies: string[];
+  /**
+   * Files a restore removed here, until a sync deletes them from storage as deletions the user confirmed (`allowDeletes`):
+   * kept across restarts, so a restart before that sync does not send them as deletions nobody confirmed.
+   */
+  restored: string[];
   shares: Share[];
   /** Shared folders offered by the vault's other devices (offers.ts) that this device has announced, by share id. */
   offersTold: string[];
@@ -140,6 +147,7 @@ export function defaultSettings(isMobile: boolean): Settings {
     compression: DEFAULT_CONFIG.compression,
     lastSuccess: 0,
     conflictCopies: [],
+    restored: [],
     shares: [],
     offersTold: [],
     offersHidden: [],
@@ -165,7 +173,7 @@ const STORAGE_DEFAULTS: Storage = {
 /** A share with every field present, as saved by any version. */
 export function shareWith(fields: Partial<Share> & Pick<Share, 'id' | 'folder'>): Share {
   return {
-    ...STORAGE_DEFAULTS, lastSuccess: 0, lastCleanup: 0, conflictCopies: [], missing: false, vaultCopies: [], role: '', memberKeysSecret: '', followUrl: '', offerPending: '', suggested: [],
+    ...STORAGE_DEFAULTS, lastSuccess: 0, lastCleanup: 0, conflictCopies: [], restored: [], missing: false, vaultCopies: [], role: '', memberKeysSecret: '', followUrl: '', offerPending: '', suggested: [],
     property: '', removed: [], approved: [], ask: [],
     ...fields,
   };
@@ -269,6 +277,8 @@ export function syncConfig(s: Settings, configDir: string, pluginDir: string): S
       // Device-specific. The plugin's code itself does sync, so an update reaches every device.
       statePath(pluginDir),
       `${pluginDir}/data.json`,
+      // A state file's copy while it is saved, or left by an app stopped then (statefile.ts).
+      `${pluginDir}/*.json.tmp`,
       ...s.exclude.split('\n'),
       // Notes shared by a property stay in the vault's sync: only their share's own files are left out.
       ...s.shares.flatMap((x) => [

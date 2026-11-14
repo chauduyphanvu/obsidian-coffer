@@ -4,7 +4,7 @@ import { WrongPassphraseError } from '../src/core/crypto.ts';
 import { HistoryError, SafetyError, type SyncResult } from '../src/core/engine.ts';
 import { MissingFolderError } from '../src/core/scopedfs.ts';
 import { plural } from '../src/core/text.ts';
-import { connectError, describeFailure, inShare, isConflictProblem, keptNote, keysMissingProblem, leftInStorage, missingProblem, quietText, resultProblems, RunProgress, staleProblem, statusText, summarize, targetProblems, type Problem } from '../src/plugin/status.ts';
+import { connectError, describeFailure, inShare, isConflictProblem, keptNote, keysMissingProblem, leftInStorage, missingProblem, passphraseFailure, quietText, resultProblems, RunProgress, staleProblem, statusText, summarize, targetProblems, type Problem } from '../src/plugin/status.ts';
 
 const result = (over: Partial<SyncResult> = {}): SyncResult => ({
   pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0, conflictCopies: [], skipped: 0, tooLarge: [], deferred: [], unsent: [], arrived: [], errors: [], commits: 0, rounds: 1, ...over,
@@ -266,4 +266,9 @@ test('an engine that keeps working after its place ended says nothing that shows
   assert.equal(run.line(), '“B”: Receiving 1 of 3');
   run.clear();
   assert.equal(run.line(), 'Syncing…');
+});
+
+test('a passphrase change that failed says the passphrase was not changed, in plain words when storage is out of reach', () => {
+  assert.equal(passphraseFailure(new Error('WebDAV GET failed with HTTP 503')), "The passphrase was not changed: can't reach the storage. Try again when it is back. (WebDAV GET failed with HTTP 503)");
+  assert.equal(passphraseFailure(new Error('WebDAV PUT failed with HTTP 403')), 'The passphrase was not changed: WebDAV PUT failed with HTTP 403');
 });

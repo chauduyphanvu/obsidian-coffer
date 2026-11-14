@@ -1,4 +1,5 @@
 import { Modal, Notice, PluginSettingTab, type App, type ButtonComponent, type Setting, type SettingDefinitionItem, type SettingGroupItem } from 'obsidian';
+import { PassphraseUnknownError } from '../core/engine.ts';
 import { conflictOriginal } from '../core/paths.ts';
 import { errorText } from '../core/text.ts';
 import { chooseDeferred } from './deferred.ts';
@@ -12,7 +13,7 @@ import { RemoveUnverifiedModal } from './people.ts';
 import { confirmStopSharing, downloadAgain, renderShares } from './sharing.ts';
 import { SendSuggestionModal } from './inbox.ts';
 import { sentNote } from './suggestions.ts';
-import { isConflictProblem, isUnsentProblem, leftInStorage, quietText, type Problem } from './status.ts';
+import { isConflictProblem, isUnsentProblem, leftInStorage, passphraseFailure, quietText, type Problem } from './status.ts';
 import { button, buttonRow, field, message, openLink, passphraseFields, statusLine } from './ui.ts';
 
 type SecretKey = 'accessKeySecret' | 'secretKeySecret' | 'passphraseSecret' | 'webdavPasswordSecret';
@@ -556,7 +557,18 @@ class PassphraseModal extends Modal {
         this.close();
         new Notice('Passphrase changed. Enter the new one on your other devices.');
       } catch (e) {
-        new Notice(`Could not change the passphrase: ${errorText(e)}`, 10_000);
+        if (!(e instanceof PassphraseUnknownError)) {
+          new Notice(passphraseFailure(e), 10_000);
+          return;
+        }
+        this.close();
+        new Notice(
+          this.plugin.fragment(
+            'The passphrase may have changed',
+            'The connection failed before storage said whether it took the new one. This device finds out at its next sync and keeps whichever works. If your other devices ask for a passphrase, try the new one.',
+          ),
+          0,
+        );
       }
     }, 'cta');
   }

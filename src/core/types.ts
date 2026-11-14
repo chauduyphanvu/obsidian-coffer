@@ -1,3 +1,4 @@
+import { equalBytes } from './bytes.ts';
 import type { MemberList } from './members.ts';
 
 export interface ChunkRef {
@@ -98,6 +99,18 @@ export function readOnlyStore(store: RemoteStore): RemoteStore {
     delete: () => Promise.reject(new ReadOnlyError()),
     ...(store.noList && { noList: true }),
   };
+}
+
+/**
+ * Creates `key` with `data` unless it exists, and says whether storage now holds this write. A store that retries sends
+ * the request again when a reply is lost, and the second try finds the first one's object: so "already there" is
+ * checked against what is there, which is this write when it is these very bytes. Every caller's data is its own: sealed
+ * under a random nonce, or holding a random id.
+ */
+export async function putNew(store: RemoteStore, key: string, data: Uint8Array): Promise<boolean> {
+  if (await store.put(key, data, { ifNoneMatch: true })) return true;
+  const there = await store.get(key);
+  return !!there && equalBytes(there, data);
 }
 
 export interface FileStat {

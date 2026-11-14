@@ -3,6 +3,7 @@ import { pool } from '../core/bytes.ts';
 import { DEFAULT_CONFIG, compileExcludes, type SyncConfig } from '../core/config.ts';
 import { forgetDevice, heartbeatDue, writeHeartbeat } from '../core/devices.ts';
 import {
+  PassphraseUnknownError,
   RemovedError,
   UnverifiedError,
   type Arrival,
@@ -165,8 +166,6 @@ interface Tracked {
   found: Problem[];
   /** Files the last finished sync left in storage until asked for, by their path in this place. */
   deferred?: string[];
-  /** Files a restore removed, which the next sync to finish deletes from storage as confirmed (`allowDeletes`). */
-  restored?: Set<string>;
   /** A shared folder with members: what this device is in it, as of its last sync that got as far as the member list. */
   standing?: MemberStanding;
   /** A shared folder with members: the re-key found not to work on this device, tried again only after a while (`rekeySkip`). */
@@ -585,8 +584,10 @@ export default class CofferPlugin extends Plugin {
   private scope(share?: Share): { engine: SyncEngine; fs: ShareFS } {
     let e = this.engines.get(keyOf(share));
     if (!e) {
+      const pending = share ? '' : this.secret(this.pendingPassphrase());
       e = makeEngine(this.host(), share, {
         onProgress: (p) => this.showProgress(placeOfRun(share), `${p.phase === 'upload' ? 'Sending' : 'Receiving'} ${p.done.toLocaleString()} of ${p.total.toLocaleString()}`, p.total),
+        ...(pending && { nextPassphrase: pending, onPassphrase: (p: string) => this.settlePassphrase(p) }),
       });
       this.engines.set(keyOf(share), e);
     }
@@ -937,7 +938,7 @@ export default class CofferPlugin extends Plugin {
       ? undefined
       : this.changes.take(share, why, share ? { folderMissing: !(lookup(this.app, share.folder) instanceof TFolder) } : { settingsDue: this.files?.configListingDue() ?? true });
     // What the sharer removed goes for everyone as a deletion they confirmed, whatever else changed.
-    const allowDeletes = share?.property ? [...(t.restored ?? []), ...share.removed] : t.restored;
+    const allowDeletes = share?.property ? [...rec.restored, ...share.removed] : rec.restored;
     let r: SyncResult;
     let shared: Problem[] = [];
     try {
@@ -951,7 +952,7 @@ export default class CofferPlugin extends Plugin {
     if (hasMembers(share)) t.standing = standingHere(share, await engine.memberStanding());
     this.pauses.lift(keyOf(share));
     this.retries.reset(keyOf(share));
-    t.restored = undefined;
+    rec.restored = [];
     if (!share && (r.pulled || r.deletedLocal)) this.files?.forgetConfigListing();
     if (receivedChanges(r)) this.noteActivity();
     t.failure = undefined;
@@ -1245,11 +1246,36 @@ export default class CofferPlugin extends Plugin {
     await this.saveSettings();
   }
 
+  /**
+   * The new passphrase waits under a secret of its own until storage is known to take it. When the connection fails
+   * before storage could say (`PassphraseUnknownError`), it stays there, and the vault's next open tries both and keeps
+   * the one that works (`settlePassphrase`).
+   */
   async changePassphrase(next: string): Promise<void> {
-    await this.getEngine().changePassphrase(next);
+    const pending = this.pendingPassphrase();
+    if (this.secret(pending)) throw new Error('An earlier change of the passphrase is not confirmed yet. Sync first: that settles it.');
+    this.app.secretStorage.setSecret(pending, next);
+    try {
+      await this.getEngine().changePassphrase(next);
+      this.settlePassphrase(next);
+    } catch (e) {
+      if (!(e instanceof PassphraseUnknownError)) this.forgetSecret(pending);
+      throw e;
+    } finally {
+      this.engines.delete('');
+    }
+  }
+
+  private pendingPassphrase(): string {
+    return secretName('coffer-passphrase-next', this.app.vault.getName());
+  }
+
+  /** Storage opens with `passphrase`: it is the vault's from now on, and a change that waited for that is settled. */
+  private settlePassphrase(passphrase: string): void {
     const id = this.settings.passphraseSecret;
-    this.app.secretStorage.setSecret(id, next);
-    this.engines.delete('');
+    if (this.secret(id) !== passphrase) this.app.secretStorage.setSecret(id, passphrase);
+    const pending = this.pendingPassphrase();
+    if (this.secret(pending)) this.forgetSecret(pending);
   }
 
   /**
@@ -1273,12 +1299,7 @@ export default class CofferPlugin extends Plugin {
 
   /** Forgets a share's sync state. Its member list, if it has one, stays: see `positionPath`. */
   private removeState(share: Share): Promise<void> {
-    return this.removeFile(statePath(this.pluginDir(), share.id));
-  }
-
-  private async removeFile(path: string): Promise<void> {
-    const adapter = this.app.vault.adapter;
-    if (await adapter.exists(path)) await adapter.remove(path);
+    return new PluginState(this.app, statePath(this.pluginDir(), share.id)).remove();
   }
 
   /** Every secret a setting of the vault or of a share names. */
@@ -1310,30 +1331,45 @@ export default class CofferPlugin extends Plugin {
    * device never writes to the vault's storage.
    */
   async addShare(share: Share, secrets: [string, string][], offered = false): Promise<void> {
-    await this.exclusive('Adding the shared folder…', async () => {
-      const s = this.settings;
-      if (share.property) {
-        // Its notes stay where they are: no folder to make, nothing to take out of the vault, and offered to no other
-        // device, since only this one sends it.
-        const problem = startProblem(s, share.property) || storageProblem(s, share);
-        if (problem) throw new Error(problem);
-        this.engines.clear();
-        for (const [id, value] of secrets) this.app.secretStorage.setSecret(id, value);
-        share.offerPending = '';
-        s.shares.push(share);
-        await this.saveSettings();
-        return;
-      }
-      const problem = folderProblem(s, share.folder, this.app.vault.configDir, this.pluginDir(), '', await this.propertyHeld()) || storageProblem(s, share);
-      if (problem) throw new Error(problem);
+    await this.exclusive('Adding the shared folder…', () => this.placeShare(share, secrets, offered));
+  }
+
+  /**
+   * Starts a shared folder with members in `share`'s storage, which must be empty, with this device as its owner,
+   * `owner` being the name members see, and adds it as `addShare` does. Storage is written only once every check has
+   * passed and the folder is there, and the keys are kept right after, with nothing to wait for in between: closing the
+   * screen meanwhile can not leave a shared folder whose keys nobody has.
+   */
+  async startMemberShare(share: Share, secrets: [string, string][], owner: string, passphrase: string): Promise<void> {
+    await this.exclusive('Starting the shared folder…', () =>
+      this.placeShare(share, secrets, false, async () => {
+        const values = new Map(secrets);
+        const store = openRemote(remoteSpec(share, (n) => values.get(n) ?? ''), obsidianHttp);
+        const keys = await createMemberShare(store, { owner, device: this.settings.deviceName, passphrase, kdfIterations: DEFAULT_CONFIG.kdfIterations, chunk: DEFAULT_CONFIG.chunk });
+        return [[share.memberKeysSecret, JSON.stringify(keys)]];
+      }),
+    );
+  }
+
+  /** What `addShare` and `startMemberShare` do while no sync runs. `start` runs last before anything is kept, and gives secrets to keep too. */
+  private async placeShare(share: Share, secrets: [string, string][], offered: boolean, start?: () => Promise<[string, string][]>): Promise<void> {
+    const s = this.settings;
+    // Notes shared by a property stay where they are: no folder to make, nothing to take out of the vault, and offered to
+    // no other device, since only this one sends them.
+    const problem =
+      (share.property ? startProblem(s, share.property) : folderProblem(s, share.folder, this.app.vault.configDir, this.pluginDir(), '', await this.propertyHeld())) ||
+      storageProblem(s, share);
+    if (problem) throw new Error(problem);
+    if (!share.property) {
       share.folder = await this.ensureFolder(share.folder);
-      this.engines.clear();
       await takeVaultCopies(this.host(), share);
-      for (const [id, value] of secrets) this.app.secretStorage.setSecret(id, value);
-      share.offerPending = offered || s.readOnly ? '' : 'add';
-      s.shares.push(share);
-      await this.saveSettings();
-    });
+    }
+    const more = start ? await start() : [];
+    this.engines.clear();
+    for (const [id, value] of [...secrets, ...more]) this.app.secretStorage.setSecret(id, value);
+    share.offerPending = share.property || offered || s.readOnly ? '' : 'add';
+    s.shares.push(share);
+    await this.saveSettings();
   }
 
   /** Whether a file has a vault path, by key, as the vault's index has it. The index is read on the first question. */
@@ -1385,7 +1421,7 @@ export default class CofferPlugin extends Plugin {
       this.pauses.lift(share.id);
       this.retries.reset(share.id);
       await this.removeState(share);
-      await this.removeFile(positionPath(this.pluginDir(), share.id));
+      await new PluginState(this.app, positionPath(this.pluginDir(), share.id)).remove();
       await this.saveSettings();
     });
     this.report();
@@ -1467,20 +1503,6 @@ export default class CofferPlugin extends Plugin {
     if (share.memberKeysSecret) return this.memberKeysOf(share).repo;
     const st = LocalState.parse(await new PluginState(this.app, statePath(this.pluginDir(), share.id)).load());
     return st.vaultId || undefined;
-  }
-
-  /**
-   * Starts a shared folder with members in `share`'s storage, which must be empty, with this device as its owner,
-   * `owner` being the name members see. Returns the keys to keep; adding the share is `addShare`'s.
-   */
-  async newMemberShare(share: Share, secrets: [string, string][], owner: string, passphrase: string): Promise<MemberKeys> {
-    const problem =
-      (share.property ? startProblem(this.settings, share.property) : folderProblem(this.settings, share.folder, this.app.vault.configDir, this.pluginDir(), '', this.propertyFiles())) ||
-      storageProblem(this.settings, share);
-    if (problem) throw new Error(problem);
-    const values = new Map(secrets);
-    const store = openRemote(remoteSpec(share, (n) => values.get(n) ?? ''), obsidianHttp);
-    return createMemberShare(store, { owner, device: this.settings.deviceName, passphrase, kdfIterations: DEFAULT_CONFIG.kdfIterations, chunk: DEFAULT_CONFIG.chunk });
   }
 
   /**
@@ -1934,8 +1956,10 @@ export default class CofferPlugin extends Plugin {
       );
       this.files?.forgetConfigListing();
       const removed = done.filter((s) => s.kind === 'remove').map((s) => s.path);
-      const t = this.tracked(share);
-      t.restored = new Set([...(t.restored ?? []), ...removed]);
+      const rec = share ?? this.settings;
+      rec.restored = [...new Set([...rec.restored, ...removed])];
+      // Kept before the sync that sends them, which may fail: whichever sync goes through next sends them as confirmed.
+      await this.saveData(this.settings);
       this.say('Sending the result to storage…');
       const sent = this.outcomeOf(await this.syncHeld(true, false, true, 'manual'), share);
       return { done, failed, sent, olderPause: deleteLimitCrossed(done.length - removed.length, removed.length, synced, cfg) !== undefined };

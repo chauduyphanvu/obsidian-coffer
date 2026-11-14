@@ -150,6 +150,13 @@ const rekeyBytes = (repo: string, target: string, n: number, storage: Record<str
 
 const sameSeqs = (a: number[], b: number[]) => a.length === b.length && a.every((x, i) => x === b[i]);
 
+/** What makes `members` a list no device takes, as far as the list alone tells: the owner's device checks before it signs one. */
+export function memberListProblem(members: Member[]): string | undefined {
+  if (members.filter((m) => m.role === 'owner').length !== 1) return 'a member list without exactly one owner';
+  if (new Set(members.map((m) => m.id)).size !== members.length) return 'a member list that names someone twice';
+  return undefined;
+}
+
 export const changeOf = (c: Commit): MemberChange => ({ seq: c.seq, gen: c.members!.gen, members: c.members!.members, ...(c.hash && { hash: c.hash }) });
 
 /**
@@ -290,7 +297,8 @@ export class MemberBook {
     const owners = l.members.filter((m) => m.role === 'owner');
     const ownerId = before?.members.find((m) => m.role === 'owner')?.id ?? c.signer;
     if (owners.length !== 1 || owners[0].pub !== this.owner || owners[0].id !== c.signer || c.signer !== ownerId) return 'a member change not made by the owner';
-    if (new Set(l.members.map((m) => m.id)).size !== l.members.length) return 'a member list that names someone twice';
+    const problem = memberListProblem(l.members);
+    if (problem) return problem;
     if (!Number.isInteger(l.gen) || l.gen <= (before?.gen ?? 0)) return 'a member list no newer than the one before it';
     if (earlier && !sameSeqs(l.earlier, earlier)) return 'a member change that leaves out earlier ones';
     return undefined;

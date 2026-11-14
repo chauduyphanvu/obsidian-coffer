@@ -4,7 +4,7 @@ import { fromB64 } from '../src/core/bytes.ts';
 import { memberSecret } from '../src/core/members.ts';
 import { INBOX, INBOX_OPENED, MAX_SEALED, SUGGEST_MAX_FILE, inboxKey, openSuggestion, parseInboxKey, sealSuggestion } from '../src/core/suggest.ts';
 import type { RemoteStore } from '../src/core/types.ts';
-import { memberShare } from './helpers.ts';
+import { lossy, memberShare } from './helpers.ts';
 
 const inboxObjects = async (store: RemoteStore) => (await store.list(INBOX)).map((o) => o.key);
 
@@ -245,4 +245,20 @@ test('a sync reports the changes other devices made since the last one, by membe
   assert.deepEqual(got.arrived.map((a) => a.paths), [['e.md']], 'member changes and the owner’s own are not files arriving');
   const own = await lan.sync();
   assert.deepEqual(own.arrived, [], 'a device’s own changes never arrive');
+});
+
+test('a suggestion whose reply is lost is kept once', async () => {
+  let l!: ReturnType<typeof lossy>;
+  const { owner, join, mem } = await memberShare({}, (net) => (l = lossy(net)).store);
+  owner.fs.put('plan.md', 'one\n');
+  await owner.sync();
+  const mai = await join('Mai', 'read');
+  await mai.sync();
+  mai.fs.put('plan.md', 'one, by Mai\n');
+  const { unsent } = await mai.sync();
+  l.lose((key) => key.startsWith(INBOX));
+  const out = await mai.engine.sendSuggestion(unsent);
+  assert.ok(!l.armed, 'the reply was lost');
+  assert.deepEqual(await inboxObjects(mem), [out.key]);
+  assert.equal((await owner.engine.suggestions()).items.length, 1);
 });

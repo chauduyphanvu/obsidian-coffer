@@ -3,7 +3,7 @@ import { cutPoints } from './chunker.ts';
 import { deflate, inflate } from './compress.ts';
 import { chunkId, createKeys, digest, keysFromMaster, open, rewrapKeys, seal, unlockKeys, wrapMaster, type KeyHeader, type Keys } from './crypto.ts';
 import { MemberBook, MemberReplay, UnverifiedError, type Member, type MemberChange, type SignedSnapshot } from './members.ts';
-import type { ChunkParams, Commit, Entry, RemoteStore } from './types.ts';
+import { putNew, type ChunkParams, type Commit, type Entry, type RemoteStore } from './types.ts';
 import { PackTable, decEntry, encEntry, type WireEntry } from './wire.ts';
 
 const FORMAT = 1;
@@ -17,6 +17,13 @@ const RESERVED = /^(log|snap|idx|pack|slot|join|rekey|inbox)\//;
 const reserved = (key: string) => key === HEADER_KEY || key === PRUNED_KEY || key === FOLLOW_KEY || RESERVED.test(key);
 /** Commits asked for at once by a reader that cannot list, until one is missing. */
 const PROBE_WINDOW = 6;
+
+/** A new passphrase was sent to storage and the connection failed before storage could say whether it took. */
+export class PassphraseUnknownError extends Error {
+  constructor(cause: unknown) {
+    super(`Could not tell whether storage took the new passphrase: the connection failed (${cause instanceof Error ? cause.message : String(cause)})`);
+  }
+}
 
 export interface Header {
   format: number;
@@ -243,7 +250,7 @@ export class Repo {
     if (await Repo.exists(store)) throw new Error('This storage location already holds a vault or a shared folder. Choose an empty one.');
     const kdf = await wrapMaster(master, toB64(randomBytes(32)), o.kdfIterations);
     const header: Header = { format: MEMBER_FORMAT, id: toB64(randomBytes(12)), kdf, chunk: o.chunk };
-    if (!(await store.put(HEADER_KEY, utf8.encode(JSON.stringify(header)), { ifNoneMatch: true }))) {
+    if (!(await putNew(store, HEADER_KEY, utf8.encode(JSON.stringify(header))))) {
       throw new Error('This storage location already holds a vault or a shared folder. Choose an empty one.');
     }
     return new Repo(store, header, await keysFromMaster(master));
@@ -365,7 +372,7 @@ export class Repo {
     const key = seqKey('log', c.seq);
     const sealed = await this.sealJson(key, encCommit(c));
     const hash = await digest(sealed);
-    return (await this.store.put(key, sealed, { ifNoneMatch: true })) ? hash : null;
+    return (await putNew(this.store, key, sealed)) ? hash : null;
   }
 
   /**
@@ -451,12 +458,24 @@ export class Repo {
     await this.store.put(PRUNED_KEY, await this.sealJson(PRUNED_KEY, body));
   }
 
+  /**
+   * When the write fails, the key file is read back, since a write whose reply was lost may have landed: it took when
+   * it holds the key just wrapped (a fresh salt, so no other), and did not when it holds another. Throws a
+   * PassphraseUnknownError when not even that can be read.
+   */
   async changePassphrase(oldPassphrase: string, newPassphrase: string, iterations: number): Promise<void> {
     const raw = await this.store.get(HEADER_KEY);
     if (!raw) throw new Error('Remote vault header is missing');
     const header = JSON.parse(new TextDecoder().decode(raw)) as Header;
     header.kdf = await rewrapKeys(header.kdf, oldPassphrase, newPassphrase, iterations);
-    await this.store.put(HEADER_KEY, utf8.encode(JSON.stringify(header)));
+    try {
+      await this.store.put(HEADER_KEY, utf8.encode(JSON.stringify(header)));
+    } catch (e) {
+      const there = await Repo.header(this.store).catch(() => {
+        throw new PassphraseUnknownError(e);
+      });
+      if (JSON.stringify(there?.kdf) !== JSON.stringify(header.kdf)) throw e;
+    }
     this.iter = header.kdf.iter;
   }
 

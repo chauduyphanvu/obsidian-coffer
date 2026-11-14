@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { SafetyError, SyncEngine, deleteLimit } from '../src/core/engine.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
 import { rng, SimStore } from '../src/testing/netsim.ts';
-import { Device } from './helpers.ts';
+import { Device, lossy } from './helpers.ts';
 
 const DAY = 86_400_000;
 
@@ -854,4 +854,20 @@ test('a sync writes the state file once, and not at all when nothing changed', a
   await a.sync();
   await b.sync();
   assert.equal(savedB(), 2, 'a merge received and sent: once, after its commit');
+});
+
+test('a commit whose reply is lost is taken as this device\'s own at once, with no second pass', async () => {
+  const clock = { now: 1_800_000_000_000 };
+  const l = lossy(new MemoryStore(() => clock.now));
+  const [a, b] = ['A', 'B'].map((n) => new Device(n, l.store, clock));
+  a.fs.put('n.md', 'one\n');
+  await a.sync();
+  await b.sync();
+  a.fs.put('n.md', 'one\ntwo\n');
+  l.lose((key) => key.startsWith('log/'));
+  const r = await a.sync();
+  assert.ok(!l.armed, 'the reply was lost');
+  assert.deepEqual([r.rounds, r.commits, r.pushed, r.conflictCopies], [1, 1, 1, []]);
+  await b.sync();
+  assert.equal(b.fs.text('n.md'), 'one\ntwo\n');
 });

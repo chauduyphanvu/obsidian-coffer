@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path';
 import { DEFAULT_CONFIG, resolveConfig, type SyncConfig } from '../core/config.ts';
 import { MIN_PASSPHRASE } from '../core/crypto.ts';
 import { heartbeatDue, writeHeartbeat } from '../core/devices.ts';
-import { HistoryError, RemovedError, SafetyError, SyncEngine, UnverifiedError, type SyncOptions, type SyncResult } from '../core/engine.ts';
+import { HistoryError, PassphraseUnknownError, RemovedError, SafetyError, SyncEngine, UnverifiedError, type SyncOptions, type SyncResult } from '../core/engine.ts';
 import { vaultKey } from '../core/paths.ts';
 import { Repo } from '../core/repo.ts';
 import { errorText, plural } from '../core/text.ts';
@@ -682,7 +682,17 @@ async function main(): Promise<number> {
   if (command === 'change-passphrase') {
     const next = env('COFFER_NEW_PASSPHRASE');
     if (next.length < MIN_PASSPHRASE) throw new Error(`a new passphrase needs at least ${MIN_PASSPHRASE} characters, and COFFER_NEW_PASSPHRASE has ${next.length}`);
-    await engine.changePassphrase(next);
+    try {
+      await engine.changePassphrase(next);
+    } catch (e) {
+      if (!(e instanceof PassphraseUnknownError)) {
+        // The reason and any hint follow from the shared error handling below.
+        console.error('the passphrase was not changed');
+        throw e;
+      }
+      console.error(`${errorText(e)}. If a sync then says the passphrase is wrong, storage took the new one: use COFFER_NEW_PASSPHRASE as COFFER_PASSPHRASE from now on`);
+      return 1;
+    }
     console.log('passphrase changed; update it on every device');
     return 0;
   }

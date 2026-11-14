@@ -823,3 +823,25 @@ test('storage with no vault at all still gets one, and opening a vault asks for 
   await Repo.open(store, 'a passphrase', create);
   assert.deepEqual(lists, []);
 });
+
+test('a state file cut short starts again from storage as it is: nothing is deleted, and a file that differs is kept both ways', async () => {
+  const { devices: [a, b] } = setup();
+  for (let i = 0; i < 30; i++) a.fs.put(`n${i}.md`, `${i}\n`);
+  await a.sync();
+  await b.sync();
+  b.fs.put('n1.md', '1, edited elsewhere\n');
+  await b.sync();
+  a.fs.put('n2.md', '2, edited here\n');
+  const full = (await a.state.load())!;
+  await a.state.save(full.slice(0, full.length >> 1));
+  a.restart();
+  const r = await a.sync();
+  assert.equal(r.deletedLocal + r.deletedRemote, 0);
+  // Without the version both last agreed on, only the two files that differ can not be told apart; the 28 others match up.
+  assert.equal(r.conflictCopies.length, 2);
+  const texts = [...a.fs.files.values()].map((f) => new TextDecoder().decode(f.data));
+  for (const t of ['1\n', '1, edited elsewhere\n', '2\n', '2, edited here\n']) assert.ok(texts.includes(t), t);
+  await b.sync();
+  assert.deepEqual(a.snapshot(), b.snapshot());
+  assert.equal((await a.sync()).commits, 0, 'settled');
+});

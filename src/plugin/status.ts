@@ -204,6 +204,15 @@ export function keptNote(kept: number, left: number): string {
 export const isTransient = (message: string) =>
   /fetch failed|network|offline|timed? ?out|ECONN|ENOTFOUND|EAI_AGAIN|socket|Request failed|net::ERR_|could not connect|could not be found|not connected to the internet|HTTP (5\d\d|429)/i.test(message);
 
+/**
+ * Why a passphrase change failed. Every failure but `PassphraseUnknownError` leaves storage on the passphrase in use, so
+ * it says so: the unknown case has words of its own, and the two must not read alike.
+ */
+export function passphraseFailure(e: unknown): string {
+  const cause = errorText(e);
+  return isTransient(cause) ? `The passphrase was not changed: can't reach the storage. Try again when it is back. (${cause})` : `The passphrase was not changed: ${cause}`;
+}
+
 /** What a shared folder with members tells about a failure: whether this device is the owner's, and the owner's name. */
 export interface MemberContext {
   owner: boolean;

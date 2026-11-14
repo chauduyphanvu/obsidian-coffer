@@ -93,7 +93,7 @@ test('settings: storage address and sync config', () => {
   assert.deepEqual(c.exclude, [
     '.coffer/**', '.config/workspace*.json', '.trash/**', '.git/**', '.DS_Store',
     '.*', '*/**/.*/', '.!(config)/', '.config/**/node_modules/',
-    '.config/plugins/coffer/state.json', '.config/plugins/coffer/data.json', 'Private/', '*.tmp',
+    '.config/plugins/coffer/state.json', '.config/plugins/coffer/data.json', '.config/plugins/coffer/*.json.tmp', 'Private/', '*.tmp',
   ]);
   assert.equal(c.deviceName, 'laptop');
   assert.equal(c.retentionDays, 1);
@@ -390,4 +390,19 @@ test('a link that did not open says what can be told: the passphrase, or that th
 test('a link cut inside a percent escape is a damaged code, not a crash', () => {
   assert.equal(setupCodeFrom('obsidian://coffer?setup=coffer2.AAk%E0%A4%A'), 'coffer2.AAk%E0%A4%A');
   assert.equal(setupCodeFrom('obsidian://coffer?setup=coffer2.AAk%41'), 'coffer2.AAkA');
+});
+
+test('settings: a restore\'s removals are kept across restarts, and settings saved before them load with none', () => {
+  const s = loadSettings({ shares: [{ id: 'x', folder: 'F' } as Share] }, false);
+  assert.deepEqual(s.restored, []);
+  assert.deepEqual(s.shares[0].restored, []);
+  assert.deepEqual(loadSettings({ restored: ['a.md'] }, false).restored, ['a.md']);
+});
+
+test('settings: the copy of a state file kept while it is saved never syncs', () => {
+  const vault = compileExcludes(syncConfig(s3(), '.obsidian', '.obsidian/plugins/coffer').exclude);
+  assert.ok(vault('.obsidian/plugins/coffer/state.json.tmp'));
+  assert.ok(vault('.obsidian/plugins/coffer/members-ab12.json.tmp'));
+  assert.ok(!vault('.obsidian/plugins/coffer/main.js'));
+  assert.ok(!vault('Notes/plan.json.tmp'));
 });

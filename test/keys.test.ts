@@ -13,7 +13,7 @@ import {
   sealWithPassphrase,
   unlockKeys,
 } from '../src/core/crypto.ts';
-import { SyncEngine } from '../src/core/engine.ts';
+import { PassphraseUnknownError, SyncEngine, type EngineOptions } from '../src/core/engine.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
 import { SimStore } from '../src/testing/netsim.ts';
 import {
@@ -28,7 +28,7 @@ import {
   setupLink,
   shareSecretName,
 } from '../src/plugin/settings.ts';
-import { Device } from './helpers.ts';
+import { Device, lossy } from './helpers.ts';
 
 // Made by the code of 0.1 and 0.2 before this format existed, from invented storage details and throwaway passphrases:
 // endpoint https://fixture.example.com, bucket fixture-bucket, keys AKIDFIXTURE and SECRETFIXTURE. They must keep opening.
@@ -259,4 +259,60 @@ test('changing the passphrase raises the vault to the configured cost, which a l
   const link = await encodeSetupCode(vaultStorage(), lookup, undefined, codeIterations(await restarted.engine.kdfIterations()));
   assert.ok(countOf(link) >= 3000);
   assert.equal(countOf(link), codeIterations(3000));
+});
+
+/** A vault on `store`, and a device of it with `passphrase` (and more engine options). */
+function passphraseRig() {
+  const clock = { now: 1_800_000_000_000 };
+  const l = lossy(new MemoryStore(() => clock.now));
+  const device = (passphrase: string, more: Partial<EngineOptions> = {}) => {
+    const d = new Device('A', l.store, clock);
+    d.engine = new SyncEngine({ fs: d.fs, store: l.store, stateStore: d.state, passphrase, config: d.config, ...more });
+    return d;
+  };
+  return { l, device };
+}
+
+test('a passphrase change whose reply is lost is confirmed by reading storage back, and one that never reached storage changes nothing', async () => {
+  const { l, device } = passphraseRig();
+  const a = device('test passphrase');
+  a.fs.put('n.md', 'x\n');
+  await a.sync();
+
+  // The new key file lands, then no write gets through: reading it back says the change took.
+  l.lose((key) => key === 'vault.json', 'writes');
+  await a.engine.changePassphrase('new passphrase 1');
+  l.online();
+  assert.equal((await device('new passphrase 1').sync()).pulled, 1);
+  await assert.rejects(device('test passphrase').sync(), WrongPassphraseError);
+
+  // No write reaches storage: a plain failure, and storage keeps the passphrase it had.
+  l.writesDown();
+  await assert.rejects(device('new passphrase 1').engine.changePassphrase('new passphrase 2'), (e: unknown) => e instanceof Error && !(e instanceof PassphraseUnknownError));
+  l.online();
+  assert.equal((await device('new passphrase 1').sync()).pulled, 1);
+});
+
+test('a passphrase change whose outcome can not be told is settled at the next open, by whichever passphrase storage takes', async () => {
+  const { l, device } = passphraseRig();
+  const a = device('test passphrase');
+  a.fs.put('n.md', 'x\n');
+  await a.sync();
+
+  // The new key file lands, then nothing gets through, not even reading it back.
+  l.lose((key) => key === 'vault.json', 'all');
+  await assert.rejects(a.engine.changePassphrase('new passphrase 1'), PassphraseUnknownError);
+  l.online();
+
+  const opened: string[] = [];
+  const onPassphrase = (p: string) => void opened.push(p);
+  const b = device('test passphrase', { nextPassphrase: 'new passphrase 1', onPassphrase });
+  await b.sync();
+  assert.equal(b.fs.text('n.md'), 'x\n');
+  assert.deepEqual(opened, ['new passphrase 1']);
+  // A change that did not land: the passphrase in use opens it, and that is said too.
+  await device('new passphrase 1', { nextPassphrase: 'never written', onPassphrase }).sync();
+  assert.deepEqual(opened, ['new passphrase 1', 'new passphrase 1']);
+  await assert.rejects(device('wrong', { nextPassphrase: 'also wrong', onPassphrase }).sync(), WrongPassphraseError);
+  assert.equal(opened.length, 2);
 });

@@ -1,5 +1,5 @@
 import { fromB64, pool, toB64 } from './bytes.ts';
-import { digest } from './crypto.ts';
+import { WrongPassphraseError, digest } from './crypto.ts';
 import { worthCompressing } from './compress.ts';
 import { copyChunks, fragmented, placeKey, planCompaction } from './compact.ts';
 import { compileExcludes, type SyncConfig } from './config.ts';
@@ -8,7 +8,7 @@ import { Packer, packRanges } from './packer.ts';
 import { conflictCopyName, ext, vaultKey } from './paths.ts';
 import { nothingToDo, planChanges, type Local, type Plan } from './plan.ts';
 import {
-  MemberBook, RemovedError, UnverifiedError, changeOf, deleteJoin, deleteRekey, deleteSlot, isMemberId, memberSecret, newMemberId, parsePosition,
+  MemberBook, RemovedError, UnverifiedError, changeOf, deleteJoin, memberListProblem, deleteRekey, deleteSlot, isMemberId, memberSecret, newMemberId, parsePosition,
   readJoin, readRekey, serializePosition, slotExpiry, writeJoin, writeRekey, writeSlot, type Member, type MemberChange, type MemberGrant, type MemberKeys,
   type RekeyOffer, type Role,
 } from './members.ts';
@@ -18,12 +18,13 @@ import { INBOX, INBOX_OPENED, MAX_SEALED, SUGGEST_MAX_FILE, SUGGEST_MAX_TOTAL, i
 import { collectGarbage, listVersions, type CleanupResult } from './retention.ts';
 import { LocalState } from './state.ts';
 import { errorText } from './text.ts';
-import { ReadOnlyError, hasChunks, readOnlyStore, sameContent, type Change, type ChunkRef, type Commit, type Entry, type FileStat, type Held, type LocalFS, type RemoteStore, type StateStore, type Version } from './types.ts';
+import { ReadOnlyError, hasChunks, putNew, readOnlyStore, sameContent, type Change, type ChunkRef, type Commit, type Entry, type FileStat, type Held, type LocalFS, type RemoteStore, type StateStore, type Version } from './types.ts';
 import { affectedBy, verifyRepo, type VerifyOptions, type VerifyReport } from './verify.ts';
 
 export type { VerifyOptions, VerifyProblem, VerifyReport } from './verify.ts';
 export type { RepairOptions, RepairReport } from './repair.ts';
 export { RemovedError, UnverifiedError } from './members.ts';
+export { PassphraseUnknownError } from './repo.ts';
 
 /** What a device of a shared folder with members holds (`members.ts`). */
 export interface MemberOptions {
@@ -42,6 +43,13 @@ export interface EngineOptions {
   stateStore: StateStore;
   /** Unused for a shared folder with members, which `member` opens. */
   passphrase: string;
+  /**
+   * A passphrase that may have replaced `passphrase` in storage, after a change whose outcome was not known
+   * (`PassphraseUnknownError`): tried when `passphrase` does not open the vault. `onPassphrase` is then told which of
+   * the two did.
+   */
+  nextPassphrase?: string;
+  onPassphrase?: (passphrase: string) => void;
   config: SyncConfig;
   /** Set for a shared folder with members: then every change is signed and checked. Without it, nothing changes. */
   member?: MemberOptions;
@@ -487,14 +495,35 @@ export class SyncEngine {
       if (this.o.member) this.repo = await this.openMember();
       else {
         // A device that only reads never creates the vault: the key it would make is not worth deriving.
-        this.repo = await Repo.open(readOnly ? readOnlyStore(this.o.store) : this.o.store, this.o.passphrase, { kdfIterations: readOnly ? 1 : kdfIterations, chunk }).catch((e: unknown) => {
-          // Only creating vault.json writes while opening.
-          throw e instanceof ReadOnlyError ? new Error('Storage holds no synced vault yet, and this device only reads from it') : e;
-        });
+        const open = (passphrase: string) =>
+          Repo.open(readOnly ? readOnlyStore(this.o.store) : this.o.store, passphrase, { kdfIterations: readOnly ? 1 : kdfIterations, chunk }).catch((e: unknown) => {
+            // Only creating vault.json writes while opening.
+            throw e instanceof ReadOnlyError ? new Error('Storage holds no synced vault yet, and this device only reads from it') : e;
+          });
+        const next = this.o.nextPassphrase;
+        try {
+          this.repo = await open(this.o.passphrase);
+        } catch (e) {
+          if (!next || !(e instanceof WrongPassphraseError)) throw e;
+          this.repo = await open(next).catch(() => {
+            throw e;
+          });
+          this.o.passphrase = next;
+        }
+        if (next) this.o.onPassphrase?.(this.o.passphrase);
       }
     }
     if (!this.st) {
-      const st = LocalState.parse(await this.o.stateStore.load());
+      const saved = await this.o.stateStore.load();
+      let st: LocalState;
+      try {
+        st = LocalState.parse(saved);
+      } catch (e) {
+        // Damaged, as by a save cut short: carried on from storage as it is, as `acceptStorage` does, which deletes nothing.
+        this.log(`This device's sync state could not be read (${errorText(e)}); carrying on from storage as it is`);
+        st = new LocalState();
+        this.unsaved = true;
+      }
       if (st.vaultId !== this.repo.id) {
         // A different remote vault than last time: nothing recorded about the old one applies.
         if (st.vaultId) this.log('Remote vault changed; starting from a clean local state');
@@ -2034,8 +2063,12 @@ export class SyncEngine {
     const { book } = this.ownerKeys();
     await this.fetchRemote();
     for (let round = 0; round < MAX_ROUNDS; round++) {
-      const members = edit(book.current(st.members).map((m) => ({ ...m })));
+      // Each member once: a list saved here that names someone twice, as an earlier version could make, is put right.
+      const seen = new Set<string>();
+      const members = edit(book.current(st.members).filter((m) => !seen.has(m.id) && seen.add(m.id)).map((m) => ({ ...m })));
       if (!members) return undefined;
+      const problem = memberListProblem(members);
+      if (problem) throw new Error(`The members were not changed: that would make ${problem}`);
       const c: Commit = {
         seq: st.lastSeq + 1, device: this.cfg.deviceName, time: this.now(), changes: [], prev: st.head, moved: true,
         members: { gen: Math.max(st.members.at(-1)?.gen ?? 0, book.floor.gen) + 1, members, earlier: st.members.map((x) => x.seq) },
@@ -2278,7 +2311,7 @@ export class SyncEngine {
       for (let time = this.now(), tries = 0; tries < 5; time++, tries++) {
         const key = inboxKey(k.id, time);
         const sealed = await sealSuggestion(repo.id, secret, { key, member: k.id, time, device: this.cfg.deviceName, files });
-        if (await this.o.store.put(key, sealed, { ifNoneMatch: true })) return { ...out, key };
+        if (await putNew(this.o.store, key, sealed)) return { ...out, key };
       }
       throw new Error('Could not find a free place in storage for the suggestion. Try again.');
     });

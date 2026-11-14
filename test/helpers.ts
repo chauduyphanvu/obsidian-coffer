@@ -6,6 +6,7 @@ import { createMemberShare, joinShare, publishJoin } from '../src/core/membershi
 import { Repo } from '../src/core/repo.ts';
 import type { RemoteStore } from '../src/core/types.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
+import { withRetry } from '../src/stores/retry.ts';
 import { MemFS, MemState } from '../src/testing/memfs.ts';
 import { carries, type Catalog } from '../src/plugin/byproperty.ts';
 import { SimStore } from '../src/testing/netsim.ts';
@@ -69,20 +70,22 @@ export const DAY = 86_400_000;
  * A shared folder with members in memory, started by the owner's device `mac` (member "Vu"). `join` invites a member,
  * through an encoded link, and joins one device of it; a read member's device is set to only receive, as the plugin does.
  */
-export async function memberShare(config: Partial<SyncConfig> = {}) {
+export async function memberShare(config: Partial<SyncConfig> = {}, wrap?: (net: RemoteStore) => RemoteStore) {
   const clock = { now: 1_800_000_000_000 };
   const mem = new MemoryStore(() => clock.now);
   const net = new SimStore(mem);
-  const keys = await createMemberShare(net, { owner: 'Vu', device: 'mac', passphrase: 'owner passphrase', kdfIterations: 1000, chunk: TEST_CONFIG.chunk!, now: clock.now });
-  const owner = new Device('mac', net, clock, config, keys);
+  /** What every device and link goes through: `net`, or what `wrap` puts in front of it. */
+  const store = wrap ? wrap(net) : net;
+  const keys = await createMemberShare(store, { owner: 'Vu', device: 'mac', passphrase: 'owner passphrase', kdfIterations: 1000, chunk: TEST_CONFIG.chunk!, now: clock.now });
+  const owner = new Device('mac', store, clock, config, keys);
   const invite = async (name: string, role: 'write' | 'read', expires = clock.now + 7 * DAY) => {
     const grant = await owner.engine.invite({ name, role, expires });
     return decodeInvite(encodeInvite({ ...grant, storage: { bucket: 'b' }, share: 'Family', folder: 'Family' }));
   };
   const join = async (name: string, role: 'write' | 'read', o: { expires?: number; config?: Partial<SyncConfig> } = {}) => {
-    const joined = await joinShare(net, await invite(name, role, o.expires), clock.now);
-    if (role === 'write') await publishJoin(net, joined);
-    return new Device(name, net, clock, { ...config, ...(role === 'read' && { readOnly: true }), ...o.config }, joined);
+    const joined = await joinShare(store, await invite(name, role, o.expires), clock.now);
+    if (role === 'write') await publishJoin(store, joined);
+    return new Device(name, store, clock, { ...config, ...(role === 'read' && { readOnly: true }), ...o.config }, joined);
   };
   /** A write member, joined and confirmed. */
   const writer = async (name: string, o: { config?: Partial<SyncConfig> } = {}) => {
@@ -90,7 +93,48 @@ export async function memberShare(config: Partial<SyncConfig> = {}) {
     await owner.engine.confirmJoins();
     return d;
   };
-  return { clock, mem, net, keys, owner, invite, join, writer };
+  return { clock, mem, net, store, keys, owner, invite, join, writer };
+}
+
+/**
+ * `inner` behind the retrying wrapper every network store has. `lose` makes the next write whose key it matches land and
+ * then fail, as when its reply is lost; with `after`, the writes after it fail too, or every request does, until `online`.
+ */
+export function lossy(inner: RemoteStore) {
+  let armed: { match: (key: string) => boolean; after?: 'writes' | 'all' } | undefined;
+  let down: 'writes' | 'all' | undefined;
+  const fail = () => Promise.reject(new Error('the network is down'));
+  const raw: RemoteStore = {
+    get: (key, range) => (down === 'all' ? fail() : inner.get(key, range)),
+    list: (prefix, after) => (down === 'all' ? fail() : inner.list(prefix, after)),
+    put: async (key, data, opts) => {
+      if (down) return fail();
+      const ok = await inner.put(key, data, opts);
+      if (armed?.match(key)) {
+        down = armed.after;
+        armed = undefined;
+        throw new Error('the reply was lost');
+      }
+      return ok;
+    },
+    delete: (key) => (down ? fail() : inner.delete(key)),
+  };
+  return {
+    store: withRetry(raw, 5, 1),
+    lose(match: (key: string) => boolean, after?: 'writes' | 'all') {
+      armed = { match, after };
+    },
+    /** Writes fail from now on, before they reach storage. */
+    writesDown() {
+      down = 'writes';
+    },
+    online() {
+      down = undefined;
+    },
+    get armed() {
+      return !!armed;
+    },
+  };
 }
 
 /** The share's storage as someone who holds its master key and nothing else sees it: no member changes, no signing key. */

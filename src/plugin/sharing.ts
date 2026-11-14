@@ -514,8 +514,6 @@ export class ShareModal extends Modal {
   private offer?: Offer;
   /** Starting a shared folder with members: the name its members see for this device's owner. */
   private ownerName = '';
-  /** The keys of the shared folder with members this screen started, kept for trying again if adding it failed. */
-  private created?: MemberKeys;
   /** Joining to write: whether the request for the owner's device to confirm this one went out. */
   private sent = true;
   /** Sharing notes by a property (byproperty.ts) rather than a folder: its name, and what it would send now. */
@@ -818,7 +816,6 @@ export class ShareModal extends Modal {
    * an invite instead.
    */
   private async checkLocation(storage: Storage): Promise<void> {
-    this.created = undefined;
     this.exists = await tryStorage(storage, {}, this.keys);
     if (!this.exists) return;
     if (this.byProperty) throw new Error('This location already holds a shared folder. Notes shared by a property need a location of their own, with nothing in it yet.');
@@ -935,14 +932,19 @@ export class ShareModal extends Modal {
     } else {
       // A new shared folder with members, this device its owner.
       Object.assign(share, { role: 'owner', memberKeysSecret: name(MEMBER_KEYS) });
-      try {
-        this.created ??= await this.plugin.newMemberShare(share, secrets, this.ownerName.trim(), this.passphrase);
-      } catch (e) {
-        return this.fail(`Could not start sharing there: ${errorText(e)}`);
-      }
-      secrets.push([share.memberKeysSecret, JSON.stringify(this.created)]);
+      return this.start(share, secrets, this.passphrase);
     }
     await this.add(share, secrets);
+  }
+
+  /** Starts a shared folder with members at the location chosen, and adds it (`startMemberShare`). */
+  private async start(share: Share, secrets: [string, string][], passphrase: string): Promise<void> {
+    try {
+      await this.plugin.startMemberShare(share, secrets, this.ownerName.trim(), passphrase);
+    } catch (e) {
+      return this.fail(`Could not start sharing there: ${errorText(e)}`);
+    }
+    await this.synced(share);
   }
 
   /** Notes shared by a property, this device the one that sends them, in storage that holds nothing yet. */
@@ -967,15 +969,9 @@ export class ShareModal extends Modal {
     this.busy = true;
     this.error = '';
     this.render();
-    try {
-      // The share's header wants a passphrase; no link is ever sealed with this one, so it is kept nowhere.
-      const unused = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(24))));
-      this.created ??= await this.plugin.newMemberShare(share, secrets, this.ownerName.trim(), unused);
-    } catch (e) {
-      return this.fail(`Could not start sharing there: ${errorText(e)}`);
-    }
-    secrets.push([share.memberKeysSecret, JSON.stringify(this.created)]);
-    await this.add(share, secrets);
+    // The share's header wants a passphrase; no link is ever sealed with this one, so it is kept nowhere.
+    const unused = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(24))));
+    await this.start(share, secrets, unused);
   }
 
   private joinStep(): void {
