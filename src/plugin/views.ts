@@ -5,8 +5,10 @@ import { errorText } from '../core/text.ts';
 import { chooseDeferred } from './deferred.ts';
 import type CofferPlugin from './main.ts';
 import { resolveConflict } from './resolve.ts';
-import { describeStorage, hasStorageAddress, labelOf, parseNumberSetting, passphraseProblem, type Share } from './settings.ts';
+import { describeStorage, hasStorageAddress, labelOf, parseNumberSetting, passphraseProblem, siteAtVaultStorage, type Share } from './settings.ts';
 import { WhatsSharedModal } from './byproperty-ui.ts';
+import { PublishModal } from './publish-ui.ts';
+import { momentLabel } from './restore.ts';
 import { SetupModal } from './setup.ts';
 import { renderDevices } from './devices.ts';
 import { RemoveUnverifiedModal } from './people.ts';
@@ -20,6 +22,8 @@ type SecretKey = 'accessKeySecret' | 'secretKeySecret' | 'passphraseSecret' | 'w
 type TextKey = 'endpoint' | 'region' | 'bucket' | 'prefix' | 'deviceName' | 'webdavUrl' | 'webdavUser';
 type NumberKey = 'intervalMinutes' | 'changeDelaySeconds' | 'pollSeconds' | 'autoCleanDays' | 'retentionDays' | 'maxFileSizeMB' | 'deferAboveMB' | 'concurrency';
 type ToggleKey = 'pathStyle' | 'syncOnStart' | 'syncConfigDir' | 'compression' | 'readOnly';
+type SiteTextKey = 'endpoint' | 'region' | 'bucket' | 'prefix' | 'webdavUrl' | 'webdavUser' | 'title' | 'home' | 'url';
+type SiteSecretKey = 'accessKeySecret' | 'secretKeySecret' | 'webdavPasswordSecret';
 
 const TRIMMED = new Set<string>(['endpoint', 'region', 'bucket', 'prefix', 'deviceName', 'webdavUrl', 'webdavUser']);
 
@@ -93,6 +97,58 @@ export class SettingsTab extends PluginSettingTab {
         if (disabled) return plugin.onChange(() => button.setDisabled(disabled()));
       },
     });
+
+    // The website's settings are one object of their own, so these read and write it rather than going through `setControlValue`.
+    const site = () => plugin.settings.site;
+    const siteWebdav = () => site().storageType === 'webdav';
+    const siteS3 = () => !siteWebdav();
+    const siteText = (name: string, desc: string, key: SiteTextKey, placeholder = '', visible?: () => boolean, aliases: string[] = []): SettingGroupItem => ({
+      name,
+      desc,
+      visible,
+      aliases: ['website', 'publish', ...aliases],
+      render: (setting) => {
+        setting.addText((t) => {
+          t.inputEl.setAttrs({ autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false' });
+          t.setPlaceholder(placeholder)
+            .setValue(site()[key])
+            .onChange((v) => {
+              site()[key] = v.trim();
+              void plugin.saveSettings();
+              // The warning about the location follows what is typed.
+              this.refreshDomState();
+            });
+        });
+      },
+    });
+    const siteToggle = (name: string, desc: string, key: 'pathStyle', visible?: () => boolean): SettingGroupItem => ({
+      name,
+      desc,
+      visible,
+      aliases: ['website', 'publish'],
+      render: (setting) => {
+        setting.addToggle((t) =>
+          t.setValue(site()[key]).onChange((v) => {
+            site()[key] = v;
+            void plugin.saveSettings();
+          }),
+        );
+      },
+    });
+    const siteSecret = (name: string, key: SiteSecretKey, id: string, visible?: () => boolean): SettingGroupItem => ({
+      name,
+      visible,
+      aliases: ['website', 'publish'],
+      render: (setting) => {
+        setting.addText((t) => {
+          t.inputEl.type = 'password';
+          t.inputEl.setAttrs({ autocapitalize: 'off', autocorrect: 'off', autocomplete: 'off', spellcheck: 'false' });
+          t.setPlaceholder(plugin.secret(site()[key]) ? 'Saved on this device' : 'Not set');
+          t.onChange((v) => v && void plugin.setSiteSecret(key, id, v));
+        });
+      },
+    });
+    const lastPublished = (at: number) => (at ? `Last published ${momentLabel(at, Date.now())}.` : 'Not published yet.');
 
     return [
       { name: 'Sync status', searchable: false, render: (setting) => this.renderCard(setting) },
@@ -249,6 +305,85 @@ export class SettingsTab extends PluginSettingTab {
               },
               number('Keep old versions (days)', 'Any synced version can be restored for this long.', 'retentionDays', 1, ['retention', 'version history']),
               number('Remove expired versions every (days)', '0 leaves it to the command.', 'autoCleanDays', 0, ['cleanup']),
+            ],
+          },
+          {
+            type: 'page',
+            name: 'Website',
+            displayValue: () => (plugin.siteConfigured() ? 'Set up' : 'Not set up'),
+            items: [
+              {
+                name: 'Publish notes as a website',
+                desc:
+                  'Notes whose properties say publish: true become web pages, with the pictures and files they show, and are uploaded to the place below. They are not encrypted: anyone with the address can read them. ' +
+                  'Use a bucket or folder of its own, never the one this vault syncs to. If you use Obsidian Publish, the notes it publishes carry the same property and will be published here too.',
+                aliases: ['publish', 'static site', 'website', 'web page'],
+              },
+              {
+                name: 'Storage type',
+                aliases: ['website', 'publish', 'S3', 'WebDAV', 'bucket'],
+                render: (setting) => {
+                  setting.addDropdown((d) =>
+                    d
+                      .addOptions({ s3: 'S3-compatible', webdav: 'WebDAV' })
+                      .setValue(site().storageType)
+                      .onChange((v) => {
+                        site().storageType = v === 'webdav' ? 'webdav' : 's3';
+                        void plugin.saveSettings();
+                        this.refreshDomState();
+                      }),
+                  );
+                },
+              },
+              siteText('Endpoint', '', 'endpoint', 'https://<account>.r2.cloudflarestorage.com', siteS3),
+              siteText('Region', '"auto" for Cloudflare R2.', 'region', 'auto', siteS3),
+              siteText('Bucket', '', 'bucket', '', siteS3),
+              siteText('Folder in the bucket', 'Can be empty, for the top of the bucket.', 'prefix', '', siteS3),
+              siteToggle('Path-style addresses', 'On for R2, B2, MinIO and most others; off for Amazon S3.', 'pathStyle', siteS3),
+              siteSecret('Access key', 'accessKeySecret', 'coffer-access-key', siteS3),
+              siteSecret('Secret key', 'secretKeySecret', 'coffer-secret-key', siteS3),
+              siteText('Address', 'Created if missing.', 'webdavUrl', 'https://cloud.example.com/remote.php/dav/files/me/website', siteWebdav),
+              siteText('User name', '', 'webdavUser', '', siteWebdav),
+              siteSecret('Password', 'webdavPasswordSecret', 'coffer-webdav-password', siteWebdav),
+              {
+                name: 'This is where the vault or a shared folder is stored, or a folder that holds it or is inside it.',
+                desc: 'Choose another bucket or folder for the website.',
+                searchable: false,
+                visible: () => siteAtVaultStorage(site(), plugin.settings),
+                render: (setting) => setting.settingEl.addClass('coffer-publish-warning'),
+              },
+              siteText('Website title', 'Shown at the top of every page.', 'title', 'Notes', undefined, ['name']),
+              siteText(
+                'Front page',
+                'The note shown first, as its path in the vault, for example Home.md. Leave empty for a list of the pages.',
+                'home',
+                '',
+                undefined,
+                ['home page', 'index'],
+              ),
+              siteText(
+                'Public address',
+                'Where people open the website, for example https://notes.example.com. Only used for the link Coffer shows after publishing.',
+                'url',
+                'https://notes.example.com',
+                undefined,
+                ['url', 'link'],
+              ),
+              {
+                name: 'Publish',
+                aliases: ['website', 'publish', 'upload'],
+                render: (setting) => {
+                  let publish!: ButtonComponent;
+                  const draw = () => {
+                    setting.setDesc(lastPublished(site().lastPublished));
+                    publish.setDisabled(!plugin.siteConfigured() || siteAtVaultStorage(site(), plugin.settings));
+                  };
+                  setting.addButton((b) => (publish = b.setButtonText('Publish…').onClick(() => new PublishModal(this.app, plugin).open())));
+                  draw();
+                  // Keys typed on this page, and a publish finishing, change both.
+                  return plugin.onChange(draw);
+                },
+              },
             ],
           },
           {

@@ -80,6 +80,30 @@ export interface Share extends Storage {
   ask: string[];
 }
 
+/** Where this vault's website goes and what it is called. Its location is never the vault's own storage: pages are stored there as they are, readable by anyone. */
+export interface SiteSettings {
+  storageType: 's3' | 'webdav';
+  webdavUrl: string;
+  webdavUser: string;
+  webdavPasswordSecret: string;
+  endpoint: string;
+  region: string;
+  bucket: string;
+  prefix: string;
+  pathStyle: boolean;
+  /** Names of entries in Obsidian's secret storage. */
+  accessKeySecret: string;
+  secretKeySecret: string;
+  /** Shown at the top of every page. */
+  title: string;
+  /** Vault path of the note that is the front page; '' for a list of pages only. */
+  home: string;
+  /** The address people open the website at, for the link shown after publishing; '' when not given. */
+  url: string;
+  /** When a publish last finished here; 0 before the first. */
+  lastPublished: number;
+}
+
 export interface Settings extends Storage {
   deviceName: string;
   syncOnStart: boolean;
@@ -113,7 +137,26 @@ export interface Settings extends Storage {
   offersTold: string[];
   /** Offers the user chose not to add on this device, by share id. */
   offersHidden: string[];
+  site: SiteSettings;
 }
+
+const SITE_DEFAULTS: SiteSettings = {
+  storageType: 's3',
+  webdavUrl: '',
+  webdavUser: '',
+  webdavPasswordSecret: '',
+  endpoint: '',
+  region: 'auto',
+  bucket: '',
+  prefix: '',
+  pathStyle: true,
+  accessKeySecret: '',
+  secretKeySecret: '',
+  title: '',
+  home: '',
+  url: '',
+  lastPublished: 0,
+};
 
 export function defaultSettings(isMobile: boolean): Settings {
   return {
@@ -151,6 +194,7 @@ export function defaultSettings(isMobile: boolean): Settings {
     shares: [],
     offersTold: [],
     offersHidden: [],
+    site: { ...SITE_DEFAULTS },
   };
 }
 
@@ -183,6 +227,7 @@ export function shareWith(fields: Partial<Share> & Pick<Share, 'id' | 'folder'>)
 export function loadSettings(saved: Partial<Settings> | null, isMobile: boolean): Settings {
   const s = { ...defaultSettings(isMobile), ...saved };
   s.shares = (saved?.shares ?? []).map(shareWith);
+  s.site = { ...SITE_DEFAULTS, ...saved?.site };
   return s;
 }
 
@@ -232,6 +277,54 @@ export function remoteSpec(s: Place, secret: SecretLookup): RemoteSpec {
     accessKey: secret(s.accessKeySecret),
     secretKey: secret(s.secretKeySecret),
   };
+}
+
+/** The website's location, its credentials and an address for them are all there. */
+export function siteConfigured(site: SiteSettings, secret: SecretLookup): boolean {
+  if (site.storageType === 'webdav') return !!(site.webdavUrl.trim() && site.webdavUser.trim() && secret(site.webdavPasswordSecret));
+  return !!(site.endpoint.trim() && site.bucket.trim() && secret(site.accessKeySecret) && secret(site.secretKeySecret));
+}
+
+/** How to reach the website's location, in the form every store opens. */
+export function siteSpec(site: SiteSettings, secret: SecretLookup): RemoteSpec {
+  return remoteSpec({ ...STORAGE_DEFAULTS, ...site }, secret);
+}
+
+/** An address with its scheme and host in lower case and no slash at the end, so two spellings of one address compare equal. */
+function addressOf(url: string): string {
+  const u = withScheme(url);
+  try {
+    const p = new URL(u);
+    return `${p.protocol}//${p.host}${p.pathname}${p.search}`.replace(/\/+$/, '');
+  } catch {
+    return u;
+  }
+}
+
+const trimmedPath = (path: string) => path.replace(/^[\s/]+|[\s/]+$/g, '');
+
+/** Whether one of two paths is the other or a folder inside it; the empty path is the top, which holds everything. */
+const overlaps = (a: string, b: string) => a === b || !a || !b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+
+/** Whether one of `a` and `b` is the other's place or a folder inside it: an address that is not filled in is no place. */
+function overlappingLocation(a: Storage | SiteSettings, b: Storage | SiteSettings): boolean {
+  if (a.storageType !== b.storageType) return false;
+  if (a.storageType === 'webdav') return !!(a.webdavUrl.trim() && b.webdavUrl.trim()) && overlaps(addressOf(a.webdavUrl), addressOf(b.webdavUrl));
+  return !!(a.endpoint.trim() && a.bucket.trim()) && addressOf(a.endpoint) === addressOf(b.endpoint) && a.bucket.trim() === b.bucket.trim() && overlaps(trimmedPath(a.prefix), trimmedPath(b.prefix));
+}
+
+/**
+ * The website's location is where the vault or a shared folder is stored, or a folder inside that, or one that holds it:
+ * pages must not land among synced data, and a location made public must not hold any.
+ */
+export function siteAtVaultStorage(site: SiteSettings, s: Settings): boolean {
+  return overlappingLocation(site, s) || s.shares.some((x) => !x.followUrl && overlappingLocation(site, x));
+}
+
+/** The website's public address with one slash at the end, or '' when none is given or it is not an http or https address. */
+export function siteLink(site: SiteSettings): string {
+  const url = site.url.trim();
+  return /^https?:\/\/[^\s/]/i.test(url) ? `${url.replace(/\/+$/, '')}/` : '';
 }
 
 /** Where an engine keeps this device's sync state, inside the plugin's own folder: the vault's, or share `id`'s. */

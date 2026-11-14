@@ -25,9 +25,11 @@ import type { Repo } from '../core/repo.ts';
 import { LocalState } from '../core/state.ts';
 import { errorText, firstSentence, plural } from '../core/text.ts';
 import { planRestore, type DeletedFile } from '../core/timeline.ts';
-import type { Entry, Version } from '../core/types.ts';
+import type { Entry, RemoteStore, Version } from '../core/types.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
+import { preparePublish, publishPrepared, type Prepared } from '../publish/publish.ts';
+import { PUBLISH, saysTrue, type VaultReader } from '../publish/site.ts';
 import { arrivalLine, type Self } from './activity.ts';
 import { ChangeLog, fromEvents, type Why } from './changes.ts';
 import { chooseDeferred } from './deferred.ts';
@@ -56,6 +58,9 @@ import {
   setupLink,
   shareConfig,
   shareSecretName,
+  siteAtVaultStorage,
+  siteConfigured,
+  siteSpec,
   statePath,
   storagePayload,
   storageProblem,
@@ -63,6 +68,7 @@ import {
   type Settings,
   type Share,
 } from './settings.ts';
+import { PublishModal } from './publish-ui.ts';
 import { IDS, SetupModal, type Keys } from './setup.ts';
 import {
   followRename,
@@ -117,6 +123,7 @@ import { ActivityModal, DeletedModal, RepairModal, RestoreEarlierModal, VerifyMo
 import { ProblemsModal, SettingsTab } from './views.ts';
 
 type SecretKey = 'accessKeySecret' | 'secretKeySecret' | 'passphraseSecret' | 'webdavPasswordSecret';
+type SiteSecretKey = 'accessKeySecret' | 'secretKeySecret' | 'webdavPasswordSecret';
 /** Every setting of a share that names a secret, so that stopping it forgets them all. */
 const SHARE_SECRETS = ['accessKeySecret', 'secretKeySecret', 'passphraseSecret', 'webdavPasswordSecret', 'memberKeysSecret'] as const;
 
@@ -190,6 +197,8 @@ export default class CofferPlugin extends Plugin {
   /** One line for the whole run, such as "Receiving 40 of 249", while a sync moves files; otherwise empty. */
   progress = '';
   running = false;
+  /** The website is being uploaded. Only one publish runs at a time, however many windows ask. */
+  publishing = false;
   private files?: ObsidianFS;
   /** What Obsidian has read of the vault's notes, for notes shared by a property. */
   catalog!: ObsidianCatalog;
@@ -357,6 +366,30 @@ export default class CofferPlugin extends Plugin {
         if (!checking) new WhatsSharedModal(this.app, this, share).open();
         return true;
       },
+    });
+    this.addCommand({
+      id: 'publish-site',
+      name: 'Publish notes to the website…',
+      callback: () => {
+        if (this.siteConfigured()) new PublishModal(this.app, this).open();
+        else new Notice("Choose where the website goes first, in Coffer's settings under Website.");
+      },
+    });
+    const noteOnSite = (checking: boolean, published: boolean, act: (file: TFile) => void) => {
+      const file = this.app.workspace.getActiveFile();
+      if (!file || !isNote(file.path) || this.marked(file) !== published) return false;
+      if (!checking) act(file);
+      return true;
+    };
+    this.addCommand({
+      id: 'publish-note',
+      name: 'Put the current note on the website',
+      checkCallback: (checking) => noteOnSite(checking, false, (file) => void this.markForWebsite(file, true)),
+    });
+    this.addCommand({
+      id: 'unpublish-note',
+      name: 'Take the current note off the website',
+      checkCallback: (checking) => noteOnSite(checking, true, (file) => void this.markForWebsite(file, false)),
     });
     this.registerEvent(
       this.app.workspace.on('file-menu', (menu, file) => {
@@ -536,6 +569,11 @@ export default class CofferPlugin extends Plugin {
 
   configured(): boolean {
     return isConfigured(this.settings, this.lookup);
+  }
+
+  /** Where the website goes is chosen and its keys are here. */
+  siteConfigured(): boolean {
+    return siteConfigured(this.settings.site, this.lookup);
   }
 
   private store() {
@@ -1246,6 +1284,15 @@ export default class CofferPlugin extends Plugin {
     await this.saveSettings();
   }
 
+  /** As `setSecret`, for the website's keys. Their names start with `site-`, so they never meet the vault's own. */
+  async setSiteSecret(key: SiteSecretKey, base: string, value: string): Promise<void> {
+    const site = this.settings.site;
+    const name = site[key] || secretName(`site-${base}`, this.app.vault.getName());
+    this.app.secretStorage.setSecret(name, value);
+    site[key] = name;
+    await this.saveSettings();
+  }
+
   /**
    * The new passphrase waits under a secret of its own until storage is known to take it. When the connection fails
    * before storage could say (`PassphraseUnknownError`), it stays there, and the vault's next open tries both and keeps
@@ -1305,7 +1352,7 @@ export default class CofferPlugin extends Plugin {
   /** Every secret a setting of the vault or of a share names. */
   private secretsInUse(): Set<string> {
     const s = this.settings;
-    const names: string[] = [s.accessKeySecret, s.secretKeySecret, s.passphraseSecret, s.webdavPasswordSecret];
+    const names: string[] = [s.accessKeySecret, s.secretKeySecret, s.passphraseSecret, s.webdavPasswordSecret, s.site.accessKeySecret, s.site.secretKeySecret, s.site.webdavPasswordSecret];
     for (const x of s.shares) for (const k of SHARE_SECRETS) names.push(x[k]);
     return new Set(names.filter(Boolean));
   }
@@ -1810,6 +1857,56 @@ export default class CofferPlugin extends Plugin {
   /** As `keptOut` for files, and with those left in storage until asked for, which the engine lists now, not as of the last sync. */
   keptOutFiles(share?: Share): Promise<(path: string) => boolean> {
     return keepDeferred(this.keptOut(share), this.getEngine(share));
+  }
+
+  /** Builds the website from the vault and compares it with its location. Writes nothing there. */
+  async prepareSite(): Promise<{ prepared: Prepared; store: RemoteStore }> {
+    const site = this.settings.site;
+    if (siteAtVaultStorage(site, this.settings)) throw new Error('Choose a bucket or folder of its own for the website: this one is where the vault or a shared folder is stored, or holds it, or is inside it.');
+    const store = openRemote(siteSpec(site, this.lookup), obsidianHttp);
+    const { vault } = this.app;
+    const reader: VaultReader = {
+      list: async () => vault.getFiles().map((f) => f.path),
+      read: async (path) => new Uint8Array(await vault.adapter.readBinary(path)),
+    };
+    const prepared = await preparePublish(reader, store, { title: site.title, home: site.home, excluded: this.keptOut() });
+    return { prepared, store };
+  }
+
+  /** Uploads what `prepareSite` prepared, and notes when it finished. Only one runs at a time, and it does not wait for or hold up a sync. */
+  async publishSite(prepared: Prepared, store: RemoteStore, onProgress: (done: number, total: number) => void): Promise<void> {
+    if (this.publishing) throw new Error('The website is already being published.');
+    this.publishing = true;
+    try {
+      await publishPrepared(store, prepared, { onProgress });
+      this.settings.site.lastPublished = Date.now();
+      // Not `saveSettings`, which would take the engine away from a sync that is running.
+      await this.saveData(this.settings);
+    } finally {
+      this.publishing = false;
+      // Tells the windows that watch `publishing`.
+      this.updateStatus();
+    }
+  }
+
+  /** Whether the note's properties, as Obsidian has read them, say `publish: true` in any of the ways the website takes it. */
+  private marked(file: TFile): boolean {
+    const fm: Record<string, unknown> = this.app.metadataCache.getFileCache(file)?.frontmatter ?? {};
+    return Object.keys(fm).some((k) => k.toLowerCase() === PUBLISH && saysTrue(fm[k]));
+  }
+
+  /** Puts `publish: true` in the note's properties, or takes that property out. The website changes at the next publish. */
+  private async markForWebsite(file: TFile, on: boolean): Promise<void> {
+    try {
+      await this.app.fileManager.processFrontMatter(file, (fm: Record<string, unknown>) => {
+        // The website reads the name in any letter case but only one entry of it, so no other spelling stays.
+        for (const k of Object.keys(fm)) if (k.toLowerCase() === PUBLISH && (!on || k !== PUBLISH)) delete fm[k];
+        if (on) fm[PUBLISH] = true;
+      });
+      new Notice(`“${file.basename}” ${on ? 'goes on' : 'comes off'} the website the next time you publish.`);
+    } catch (e) {
+      new Notice(`Could not change the properties of “${file.basename}”: ${errorText(e)}`, 8000);
+    }
   }
 
   /** The files of the vault, or of a shared folder, by key, with the path each has there. */

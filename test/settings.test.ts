@@ -32,6 +32,10 @@ import {
   shareConfig,
   shareSecretName,
   shareWith,
+  siteAtVaultStorage,
+  siteConfigured,
+  siteLink,
+  siteSpec,
   statePath,
   storageLocation,
   storageProblem,
@@ -39,6 +43,7 @@ import {
   syncConfig,
   type Settings,
   type Share,
+  type SiteSettings,
   type StorageForm,
 } from '../src/plugin/settings.ts';
 
@@ -405,4 +410,104 @@ test('settings: the copy of a state file kept while it is saved never syncs', ()
   assert.ok(vault('.obsidian/plugins/coffer/members-ab12.json.tmp'));
   assert.ok(!vault('.obsidian/plugins/coffer/main.js'));
   assert.ok(!vault('Notes/plan.json.tmp'));
+});
+
+const site = (over: Partial<SiteSettings> = {}): SiteSettings => ({
+  ...defaultSettings(false).site,
+  endpoint: 'https://s3.example.com',
+  bucket: 'web',
+  accessKeySecret: 'ak',
+  secretKeySecret: 'sk',
+  ...over,
+});
+
+test('site: settings saved before the website, or with part of it, load with every field', () => {
+  const empty = defaultSettings(false).site;
+  assert.deepEqual(empty, {
+    storageType: 's3', webdavUrl: '', webdavUser: '', webdavPasswordSecret: '', endpoint: '', region: 'auto', bucket: '', prefix: '', pathStyle: true,
+    accessKeySecret: '', secretKeySecret: '', title: '', home: '', url: '', lastPublished: 0,
+  });
+  const old = { ...s3(), deviceName: 'laptop' } as Partial<Settings>;
+  delete old.site;
+  assert.deepEqual(loadSettings(JSON.parse(JSON.stringify(old)), false).site, empty);
+  const partial = loadSettings({ site: { bucket: 'web', pathStyle: false, lastPublished: 7 } as SiteSettings }, false).site;
+  assert.deepEqual(partial, { ...empty, bucket: 'web', pathStyle: false, lastPublished: 7 });
+  assert.notEqual(loadSettings(null, false).site, loadSettings(null, false).site, 'no two loads share one object');
+  assert.notEqual(defaultSettings(false).site, defaultSettings(false).site);
+});
+
+test('site: set up when the address and every credential are there', () => {
+  assert.ok(siteConfigured(site(), secret));
+  assert.ok(!siteConfigured(site({ endpoint: ' ' }), secret));
+  assert.ok(!siteConfigured(site({ bucket: '' }), secret));
+  assert.ok(!siteConfigured(site({ accessKeySecret: 'missing' }), secret));
+  assert.ok(!siteConfigured(site({ secretKeySecret: '' }), secret));
+  const onDav = (over: Partial<SiteSettings> = {}) => site({ storageType: 'webdav', webdavUrl: 'https://dav.example.com/site', webdavUser: 'me', webdavPasswordSecret: 'dp', endpoint: '', bucket: '', accessKeySecret: '', secretKeySecret: '', ...over });
+  assert.ok(siteConfigured(onDav(), secret));
+  assert.ok(!siteConfigured(onDav({ webdavUrl: '' }), secret));
+  assert.ok(!siteConfigured(onDav({ webdavUser: '' }), secret));
+  assert.ok(!siteConfigured(onDav({ webdavPasswordSecret: '' }), secret));
+  assert.ok(!siteConfigured(site({ storageType: 'webdav' }), secret), 'S3 fields do not make a WebDAV site');
+});
+
+test('site: the store is opened from the site\'s own fields, never the vault\'s', () => {
+  assert.deepEqual(siteSpec(site({ endpoint: ' https://s3.example.com ', region: ' ', bucket: ' web ', prefix: 'pub', pathStyle: false }), secret), {
+    type: 's3', endpoint: 'https://s3.example.com', region: 'auto', bucket: 'web', prefix: 'pub', pathStyle: false, accessKey: 'AKID', secretKey: 'SECRET',
+  });
+  assert.deepEqual(siteSpec(site({ storageType: 'webdav', webdavUrl: ' https://dav.example.com/site ', webdavUser: 'me', webdavPasswordSecret: 'dp' }), secret), {
+    type: 'webdav', url: 'https://dav.example.com/site', username: 'me', password: 'dav pw',
+  });
+});
+
+test('site: a website location that is the vault\'s storage, or a shared folder\'s, is refused early', () => {
+  const vault = s3({ endpoint: 'https://s3.example.com', bucket: 'web', prefix: 'vault' });
+  const at = (over: Partial<SiteSettings>) => siteAtVaultStorage(site({ prefix: 'vault', ...over }), vault);
+  assert.ok(at({}));
+  assert.ok(at({ endpoint: ' HTTPS://S3.Example.COM/ ', prefix: ' /vault/ ' }), 'letter case of the host, slashes and spaces do not make another place');
+  assert.ok(at({ endpoint: 's3.example.com' }), 'no scheme reads as https');
+  assert.ok(!at({ bucket: 'Web' }), 'bucket names are exact');
+  assert.ok(!at({ bucket: 'other' }));
+  assert.ok(!at({ prefix: 'site' }));
+  assert.ok(at({ prefix: '' }), 'the top of the bucket holds the vault');
+  assert.ok(at({ prefix: 'vault/site' }), 'a folder inside the vault\'s');
+  assert.ok(!at({ prefix: 'vault-site' }), 'a name that only starts the same is another folder');
+  assert.ok(!at({ prefix: 'Vault' }), 'a folder name is exact');
+  assert.ok(!at({ endpoint: 'https://s3.other.com' }));
+  assert.ok(!at({ storageType: 'webdav', webdavUrl: 'https://s3.example.com/web/vault' }), 'another kind of storage is another place');
+
+  const davVault = dav({ webdavUrl: 'https://dav.example.com/me/vault' });
+  const davSite = (url: string) => site({ storageType: 'webdav', webdavUrl: url });
+  assert.ok(siteAtVaultStorage(davSite('https://dav.example.com/me/vault/'), davVault));
+  assert.ok(siteAtVaultStorage(davSite(' https://DAV.example.com/me/vault '), davVault));
+  assert.ok(!siteAtVaultStorage(davSite('https://dav.example.com/me/site'), davVault));
+  assert.ok(siteAtVaultStorage(davSite('https://dav.example.com/me'), davVault), 'a folder that holds the vault\'s');
+  assert.ok(siteAtVaultStorage(davSite('https://dav.example.com/me/vault/site'), davVault));
+  assert.ok(!siteAtVaultStorage(davSite('https://dav.example.com/me/Vault'), davVault), 'a path is exact');
+
+  const shared = s3({ endpoint: 'https://s3.a.com', bucket: 'own', prefix: 'v', shares: [share({ id: 'w', folder: 'Work', endpoint: 'https://s3.example.com', bucket: 'team', prefix: 'shared/work' })] });
+  assert.ok(siteAtVaultStorage(site({ bucket: 'team', prefix: 'shared/work/' }), shared), 'a shared folder\'s location counts too');
+  assert.ok(siteAtVaultStorage(site({ bucket: 'team', prefix: 'shared' }), shared), 'a folder that holds a shared folder\'s');
+  assert.ok(!siteAtVaultStorage(site({ bucket: 'team', prefix: 'web' }), shared));
+  const followed = s3({ endpoint: 'https://s3.a.com', bucket: 'own', shares: [share({ id: 'f', folder: 'Read', followUrl: 'https://pub.example.com/x', endpoint: 'https://s3.example.com', bucket: 'team' })] });
+  assert.ok(!siteAtVaultStorage(site({ bucket: 'team', prefix: '' }), followed), 'a followed copy has no storage of its own');
+
+  assert.ok(!siteAtVaultStorage(site({ endpoint: '', bucket: '' }), s3({ endpoint: '', bucket: '' })), 'two places that are not filled in are not the same place');
+  assert.ok(!siteAtVaultStorage(site(), s3({ endpoint: '', bucket: '' })));
+  assert.ok(!siteAtVaultStorage(site({ storageType: 'webdav', webdavUrl: '' }), dav({ webdavUrl: '' })));
+});
+
+test('site: the public address is shown with one slash at the end, and only when it is a web address', () => {
+  const link = (url: string) => siteLink(site({ url }));
+  assert.equal(link('https://notes.example.com'), 'https://notes.example.com/');
+  assert.equal(link(' https://notes.example.com/ '), 'https://notes.example.com/');
+  assert.equal(link('http://notes.example.com///'), 'http://notes.example.com/');
+  assert.equal(link('https://example.com/me/notes'), 'https://example.com/me/notes/');
+  assert.equal(link('HTTPS://Notes.example.com'), 'HTTPS://Notes.example.com/');
+  assert.equal(link(''), '');
+  assert.equal(link('   '), '');
+  assert.equal(link('notes.example.com'), '');
+  assert.equal(link('javascript:alert(1)'), '');
+  assert.equal(link('ftp://notes.example.com'), '');
+  assert.equal(link('https://'), '');
+  assert.equal(link('https:///'), '');
 });
