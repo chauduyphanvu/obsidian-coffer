@@ -111,16 +111,21 @@ function entryValues(entry: string): string[] | undefined {
   return out;
 }
 
-/** The share entries of a properties block, by key as written: `share` in any letter case, as Obsidian takes property names. */
-const shareKeys = (es: Map<string, string>) => [...es.keys()].filter((k) => k && k.toLowerCase() === PROPERTY);
+/** The entries of a properties block for the property `key`, by key as written: in any letter case, as Obsidian takes property names. */
+const propertyKeys = (es: Map<string, string>, key: string) => [...es.keys()].filter((k) => k && k.toLowerCase() === key.toLowerCase());
 
-/** What a note's property `share` says, read from its text: every value under that key; undefined when its properties can not be read. */
-export function shareValues(text: string): string[] | undefined {
+/** Every value a note's text gives the property `key` (in any letter case): a value, an inline list or `- item` lines; undefined when its properties can not be read. */
+export function propertyValues(text: string, key: string): string[] | undefined {
   const fm = frontmatter(text.startsWith(BOM) ? text.slice(1) : text);
   if (!fm) return [];
   const es = entries(fm.props);
   if (!es) return undefined;
-  return shareKeys(es).flatMap((k) => entryValues(es.get(k)!) ?? []);
+  return propertyKeys(es, key).flatMap((k) => entryValues(es.get(k)!) ?? []);
+}
+
+/** What a note's property `share` says, read from its text: every value under that key; undefined when its properties can not be read. */
+export function shareValues(text: string): string[] | undefined {
+  return propertyValues(text, PROPERTY);
 }
 
 /** Whether a note's text says `share: <name>`, alone or in a list, in any letter case. */
@@ -147,7 +152,7 @@ export function withoutShare(text: string, name: string): string | undefined {
   if (!fm) return text;
   const es = entries(fm.props);
   if (!es) return undefined;
-  const keys = new Set(shareKeys(es));
+  const keys = new Set(propertyKeys(es, PROPERTY));
   let props = '';
   for (const [key, entry] of es) props += keys.has(key) ? dropValue(entry, name) : entry;
   if (props === fm.props) return text;
@@ -183,7 +188,7 @@ export function withShare(text: string, name: string): string | undefined {
   if (!fm) return `---${eol}${line}---${eol}${text}`;
   const es = entries(fm.props);
   if (!es) return undefined;
-  const key = shareKeys(es)[0];
+  const key = propertyKeys(es, PROPERTY)[0];
   if (key === undefined) return fm.open + fm.props + line + fm.close + fm.body;
   const entry = es.get(key)!;
   const values = entryValues(entry);
