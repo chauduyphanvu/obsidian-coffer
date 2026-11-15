@@ -358,7 +358,7 @@ function momentOf(when: string): number | { seq: number } {
 /** The files in storage at `at`, which `when` was read as. */
 function vaultAt(v: RepoView, at: number | { seq: number }, when: string): Promise<PastVault> {
   return tableAt(v.repo, v.st.remote, v.st.lastSeq, v.cfg, v.now, at).catch((e: unknown) => {
-    throw e instanceof TooOldError ? new Error(`${when} is too far back; the earliest time that can be restored is ${iso(e.earliest.time)} (number ${e.earliest.seq})`) : e;
+    throw e instanceof TooOldError ? new Error(`${when} is too far back; the earliest time storage still holds is ${iso(e.earliest.time)} (number ${e.earliest.seq})`) : e;
   });
 }
 
@@ -969,7 +969,7 @@ async function main(): Promise<number> {
         : member
           ? 'not listed for a shared folder with members, where devices do not record how far they have got'
           : '';
-    return status(engine, fs, describeRemote(cli.remote), noDevices, selfOf, flags.has('json'), () => Repo.exists(store).then(() => true, () => false));
+    return status(engine, fs, describeRemote(cli.remote), noDevices, selfOf, flags.has('json'), () => Repo.answers(store));
   }
   if (command === 'export' && rest[0]) return exportTo(engine, vault, rest[0], rest[1] ?? '', flags.get('at'));
   if (command === 'activity') {
@@ -988,6 +988,7 @@ async function main(): Promise<number> {
       if (page.next === undefined) break;
       beforeSeq = page.next;
     }
+    if (!items.length) console.error(`no changes ${prefix ? `to ${prefix} ` : ''}in the history storage keeps`);
     for (const r of activityRows(items.slice(0, limit), selfOf(v))) {
       if (!r.who) {
         console.log(`${iso(r.time)}  ${r.text}`);

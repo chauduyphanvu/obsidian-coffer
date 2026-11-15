@@ -210,7 +210,7 @@ test('cli: restore-at needs a time it can read, and one not before the earliest 
     assert.match(r.stderr, /"yesterday" is not a time; use ISO 8601/);
     r = t.run('restore-at', '2000-01-01T00:00:00Z', '--dry-run');
     assert.equal(r.status, 1);
-    assert.match(r.stderr, /too far back; the earliest time that can be restored is \d{4}-\d\d-\d\dT/);
+    assert.match(r.stderr, /too far back; the earliest time storage still holds is \d{4}-\d\d-\d\dT/);
     assert.deepEqual(files(t.vault), { 'a.md': 'a\n' });
   } finally {
     t.done();
@@ -2425,7 +2425,7 @@ test('cli export: refuses a folder that is not empty, is inside the vault or hol
     refused([t.dir], / holds the vault \(/);
     refused([join(t.dir, 'out'), 'nowhere'], /^no file in storage is in nowhere\/, so nothing was exported\n$/);
     refused([join(t.dir, 'out'), '--at=yesterday'], /^"yesterday" is not a time; use ISO 8601/);
-    refused([join(t.dir, 'out'), '--at=2000-01-01T00:00:00Z'], /too far back; the earliest time that can be restored is /);
+    refused([join(t.dir, 'out'), '--at=2000-01-01T00:00:00Z'], /too far back; the earliest time storage still holds is /);
     assert.equal(existsSync(join(t.dir, 'out')), false);
     assert.equal(t.run('export').status, 2, 'a folder to export to is needed');
     assert.deepEqual({ remote: stored(remote), vault: files(t.vault) }, before);
@@ -2513,7 +2513,8 @@ test('cli activity: lists the changes newest first, who made each and the files,
     assert.equal(untimed(a.cli('activity', '--limit=1')), untimed(r.stdout).split('This device')[0]);
     assert.equal(untimed(a.cli('activity', 'notes', '--limit', '1')), 'phone            1 added, 1 deleted\n  added    notes/new.md\n  deleted  notes/a.md\n');
     assert.equal(untimed(a.cli('activity', 'notes/')), 'phone            1 added, 1 deleted\n  added    notes/new.md\n  deleted  notes/a.md\nThis device      1 added\n  added    notes/a.md\n');
-    assert.equal(a.cli('activity', 'nowhere'), '');
+    const none = a.run('activity', 'nowhere');
+    assert.deepEqual([none.status, none.stdout, none.stderr], [0, '', 'no changes to nowhere/ in the history storage keeps\n']);
     assert.match(a.run('activity', '--limit=0').stderr, /--limit must be a whole number above 0/);
   } finally {
     a.done();
@@ -2634,6 +2635,22 @@ test('cli status: storage that answers with damaged data says it could not be re
     assert.deepEqual([got.storage.reachable, got.storage.problem], [true, 'unreadable']);
     assert.match(got.storage.error as string, /corrupted or tampered with/);
     assert.match(t.run('status').stdout, /^storage: reachable, .+, but it could not be read: .*corrupted or tampered with\n$/);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli status: storage that lost vault.json but still holds data answered, so it is not called unreachable', () => {
+  const t = setup({});
+  try {
+    put(t.vault, 'a.md', 'one\n');
+    t.cli('sync');
+    rmSync(join(t.dir, 'remote', 'vault.json'));
+    const r = t.run('status', '--json');
+    assert.equal(r.status, 1);
+    const got = JSON.parse(r.stdout) as { storage: Record<string, unknown> };
+    assert.deepEqual([got.storage.reachable, got.storage.problem], [true, 'unreadable']);
+    assert.match(got.storage.error as string, /vault\.json, is missing from storage, though it still holds/);
   } finally {
     t.done();
   }

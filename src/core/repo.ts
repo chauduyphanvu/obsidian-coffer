@@ -220,6 +220,14 @@ export class Repo {
     return false;
   }
 
+  /** Whether storage answers at all, whatever it holds. */
+  static answers(store: RemoteStore): Promise<boolean> {
+    return store.get(HEADER_KEY).then(
+      () => true,
+      () => false,
+    );
+  }
+
   /** The plaintext header, or null when storage holds none. */
   static async header(store: RemoteStore): Promise<Header | null> {
     const raw = await store.get(HEADER_KEY);
