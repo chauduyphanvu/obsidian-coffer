@@ -3,7 +3,7 @@ import { WrongPassphraseError, digest } from './crypto.ts';
 import { worthCompressing } from './compress.ts';
 import { copyChunks, fragmented, placeKey, planCompaction } from './compact.ts';
 import { compileExcludes, type SyncConfig } from './config.ts';
-import { merge3, mergeCanvas, mergeJson, mergeNote, sharedBase } from './merge.ts';
+import { merge3, mergeCanvas, mergeJson, mergeNote, mergeStrict } from './merge.ts';
 import { Packer, packRanges } from './packer.ts';
 import { conflictCopyName, ext, vaultKey } from './paths.ts';
 import { nothingToDo, planChanges, type Local, type Plan } from './plan.ts';
@@ -249,12 +249,16 @@ export interface GcCounts extends CleanupResult {
   bytesFreedLater: number;
 }
 
-export interface GcResult extends GcCounts {
-  /** Files whose current version needs data that storage no longer holds, as `VerifyProblem.paths`. */
-  missing: string[];
-  /** Files whose current version is whole, but an earlier version history offers needs such data, as `VerifyProblem.earlier`. */
-  missingEarlier: string[];
-}
+/** What a cleanup did, and what it found missing: no lists when it did not look, on a device that only reads, or could not tell, as when a check failed. */
+export type GcResult = GcCounts & (
+  | {
+      /** Files whose current version needs data that storage no longer holds, as `VerifyProblem.paths`. */
+      missing: string[];
+      /** Files whose current version is whole, but an earlier version history offers needs such data, as `VerifyProblem.earlier`. */
+      missingEarlier: string[];
+    }
+  | { missing?: undefined; missingEarlier?: undefined }
+);
 
 /**
  * Thrown instead of syncing when a sync would delete a suspiciously large share of the vault. The counts
@@ -281,6 +285,13 @@ export class SafetyError extends Error {
  * commit) is a plain Error: accepting storage would only find it again.
  */
 export class HistoryError extends Error {}
+
+/** Storage holds no vault, and this device only reads from it, so it makes none. */
+export class NoVaultError extends Error {
+  constructor() {
+    super('Storage holds no synced vault yet, and this device only reads from it');
+  }
+}
 
 /**
  * The guard against a vault that looks empty for the wrong reason (unmounted folder, wrong path, files
@@ -380,14 +391,6 @@ interface Run {
   unsettled: Set<string>;
   /** See `SyncOptions.suggested`, by key. */
   suggested?: Map<string, string>;
-  /**
-   * This device's files may be old copies (`LocalState.fresh`), so one that differs from storage's with no common
-   * version keeps both versions, rather than merging as a note made on two devices apart (`tryMerge`) would, which
-   * brings back what either removed.
-   */
-  fresh: boolean;
-  /** Every path planned as changed on both sides, by key. */
-  conflicts: Set<string>;
 }
 
 /** The local files a pass works with. */
@@ -520,7 +523,7 @@ export class SyncEngine {
         const open = (passphrase: string) =>
           Repo.open(readOnly ? readOnlyStore(this.o.store) : this.o.store, passphrase, { kdfIterations: readOnly ? 1 : kdfIterations, chunk }).catch((e: unknown) => {
             // Only creating vault.json writes while opening.
-            throw e instanceof ReadOnlyError ? new Error('Storage holds no synced vault yet, and this device only reads from it') : e;
+            throw e instanceof ReadOnlyError ? new NoVaultError() : e;
           });
         const next = this.o.nextPassphrase;
         try {
@@ -1013,12 +1016,11 @@ export class SyncEngine {
       conflictCopies: [], skipped: 0, tooLarge: [], deferred: [], unsent: [], arrived: [], errors: [], commits: 0, rounds: 0,
     };
     const { st } = await this.open();
-    if (!st.synced.size) st.fresh = true;
     const allow = new Set([...(opts.allowDeletes ?? [])].map(vaultKey));
     const known = this.known;
     const fetch = new Set([...(opts.fetch ?? [])].map(vaultKey));
     const suggested = opts.suggested && new Map([...opts.suggested].map(([path, sum]) => [vaultKey(path), sum]));
-    const run: Run = { force: !!opts.force, allow, fetch, known: known ?? { tooLarge: new Set(), paths: new Map() }, unsettled: new Set(), suggested, fresh: st.fresh, conflicts: new Set() };
+    const run: Run = { force: !!opts.force, allow, fetch, known: known ?? { tooLarge: new Set(), paths: new Map() }, unsettled: new Set(), suggested };
     if (opts.changed && known) {
       run.hint = new Map();
       for (const p of opts.changed) run.hint.set(vaultKey(p), p);
@@ -1040,12 +1042,6 @@ export class SyncEngine {
         this.known = run.known;
         this.recheck = new Set([...res.errors.map((e) => e.path), ...run.unsettled]);
         this.unplanned = false;
-        // Every file this device had apart from storage now has a version both agreed on: a difference from here on is an edit.
-        if (st.fresh && ![...run.conflicts].some((k) => this.recheck.has(k))) {
-          st.fresh = false;
-          this.unsaved = true;
-          await this.save();
-        }
       }
       this.stuck = false;
       if (this.book) {
@@ -1101,7 +1097,6 @@ export class SyncEngine {
     await this.save();
 
     for (const key of p.conflicts) {
-      run.conflicts.add(key);
       try {
         const extra = await this.resolve(pass, key, v.local.get(key)!);
         if (extra) p.pushes.push(extra);
@@ -1374,7 +1369,7 @@ export class SyncEngine {
     const settings = key.startsWith(`${this.cfg.configDir}/`);
     const merged = settings
       ? await this.mergeSettings(key, base, mine, r)
-      : this.cfg.conflictStrategy === 'merge' && (base || !run.fresh) && this.cfg.mergeExtensions.includes(ext(key))
+      : this.cfg.conflictStrategy === 'merge' && base && this.cfg.mergeExtensions.includes(ext(key))
         ? await this.tryMerge(key, base, mine, r)
         : null;
     if (merged) {
@@ -1411,9 +1406,15 @@ export class SyncEngine {
     return { key: copy, path: copy, ...copyStat };
   }
 
-  /** JSON settings merge key by key, even with no common version (two devices set up apart); other text line by line. */
+  /**
+   * JSON settings merge key by key, even with no common version (two devices set up apart); other text line by line,
+   * strictly but for the user's own snippets, so that two versions of a plugin or theme are never spliced together.
+   */
   private async mergeSettings(key: string, base: Entry | undefined, mine: Uint8Array, remote: Entry): Promise<Uint8Array | null> {
-    if (ext(key) !== 'json') return base ? this.tryMerge(key, base, mine, remote) : null;
+    if (ext(key) !== 'json') {
+      const own = key.startsWith(`${this.cfg.configDir}/snippets/`);
+      return base ? this.tryMerge(key, base, mine, remote, own ? undefined : mergeStrict) : null;
+    }
     try {
       const text = (data: Uint8Array) => new TextDecoder('utf-8', { fatal: true }).decode(data);
       const theirs = text(await this.readVersion(remote));
@@ -1426,20 +1427,13 @@ export class SyncEngine {
     }
   }
 
-  /**
-   * With no common version, as for one note made from a template on two devices before either synced, the lines both
-   * have stand in for it (`sharedBase`). Not for a canvas: its lines are mostly layout, which any two canvases share.
-   */
-  private async tryMerge(key: string, base: Entry | undefined, mine: Uint8Array, remote: Entry): Promise<Uint8Array | null> {
-    const kind = ext(key);
-    if (!base && kind === 'canvas') return null;
+  /** `merge` replaces the merge `key`'s kind of file takes. */
+  private async tryMerge(key: string, base: Entry, mine: Uint8Array, remote: Entry, merge?: typeof merge3): Promise<Uint8Array | null> {
     try {
       const text = (data: Uint8Array) => new TextDecoder('utf-8', { fatal: true }).decode(data);
-      const [theirBase, theirs] = await Promise.all([base && this.readVersion(base), this.readVersion(remote)]);
-      const merge = kind === 'canvas' ? mergeCanvas : kind === 'md' || kind === 'markdown' ? mergeNote : merge3;
-      const [ours, t] = [text(mine), text(theirs)];
-      const ancestor = theirBase ? text(theirBase) : sharedBase(ours, t);
-      const merged = ancestor === undefined ? null : merge(ancestor, ours, t);
+      const [theirBase, theirs] = await Promise.all([this.readVersion(base), this.readVersion(remote)]);
+      const kind = ext(key);
+      const merged = (merge ?? (kind === 'canvas' ? mergeCanvas : kind === 'md' || kind === 'markdown' ? mergeNote : merge3))(text(theirBase), text(mine), text(theirs));
       return merged === null ? null : new TextEncoder().encode(merged);
     } catch {
       // Not text, or the base version is no longer stored: fall back to keeping both.
@@ -1676,7 +1670,7 @@ export class SyncEngine {
     return this.exclusive(async () => {
       const { st } = await this.open();
       await this.fetchRemote();
-      const run: Run = { force: false, allow: new Set(), fetch: new Set(), known: { tooLarge: new Set(), paths: new Map() }, unsettled: new Set(), fresh: st.fresh, conflicts: new Set() };
+      const run: Run = { force: false, allow: new Set(), fetch: new Set(), known: { tooLarge: new Set(), paths: new Map() }, unsettled: new Set() };
       const { local, tooLarge } = await this.scan(run, st);
       let kept = 0;
       for (const key of [...st.synced.keys()]) {
@@ -1694,11 +1688,12 @@ export class SyncEngine {
 
   /**
    * Files left in storage until asked for, with their sizes: those over `deferAboveMB` that this device does not
-   * have, under that path or another. Pass their paths to `sync` as `fetch` to download them.
+   * have, under that path or another. Pass their paths to `sync` as `fetch` to download them. With `refresh` false,
+   * from the file table as this engine last read it, as just after `view`, asking storage nothing.
    */
-  deferred(): Promise<{ path: string; size: number }[]> {
+  deferred(o: { refresh?: boolean } = {}): Promise<{ path: string; size: number }[]> {
     return this.exclusive(async () => {
-      const { st } = await this.refresh();
+      const { st } = o.refresh === false ? await this.open() : await this.refresh();
       const defer = this.deferral(st);
       const maxSize = this.maxSize();
       const out: { path: string; size: number }[] = [];
@@ -1860,13 +1855,15 @@ export class SyncEngine {
    */
   gc(): Promise<GcResult> {
     return this.exclusive(async () => {
-      const none = { packsDeleted: 0, bytesFreed: 0, snapshotsDeleted: 0, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0, missing: [], missingEarlier: [] };
+      const none = { packsDeleted: 0, bytesFreed: 0, snapshotsDeleted: 0, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0 };
       if (this.cfg.readOnly) return none;
       const { repo, st, cfg, now } = await this.refresh();
       if (this.readOnly()) return none;
-      const { result, packs, missing } = await collectGarbage(repo, st, cfg, now);
-      const lost = await missingFiles(repo, st, cfg, now, packs, missing);
-      const out: GcResult = { ...result, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0, missing: lost.paths, missingEarlier: lost.earlier };
+      const { result, packs, missing, unsure } = await collectGarbage(repo, st, cfg, now);
+      // A check that failed leaves what is missing unknown, so no lists: what an earlier cleanup found stands.
+      const lost = unsure ? undefined : await missingFiles(repo, st, cfg, now, packs, missing);
+      const counts: GcCounts = { ...result, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0 };
+      const out: GcResult = lost ? { ...counts, missing: lost.paths, missingEarlier: lost.earlier } : counts;
       const plan = planCompaction(packs, st.remote, cfg, now);
       if (!plan) return out;
       const moved = await copyChunks(repo, plan, cfg);

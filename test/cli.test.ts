@@ -2465,6 +2465,26 @@ test('cli export: works on a device that only receives, includes the files left 
   }
 });
 
+test('cli export: files above 16 MB, which it writes one at a time, come out whole beside the smaller ones', () => {
+  const t = setup({});
+  try {
+    put(t.vault, 'a.md', 'a\n');
+    const large = (fill: number) => Buffer.alloc(17 << 20, fill);
+    writeFileSync(join(t.vault, 'one.bin'), large(1));
+    writeFileSync(join(t.vault, 'two.bin'), large(2));
+    t.cli('sync');
+    const out = join(t.dir, 'out');
+    const r = t.run('export', out);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /^exported 3 files \(36 MB\) of the vault to /);
+    assert.deepEqual(readFileSync(join(out, 'one.bin')), large(1));
+    assert.deepEqual(readFileSync(join(out, 'two.bin')), large(2));
+    assert.equal(readFileSync(join(out, 'a.md'), 'utf8'), 'a\n');
+  } finally {
+    t.done();
+  }
+});
+
 /** An activity listing with the times taken out, for comparing. */
 const untimed = (text: string) => text.replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z {2}/gm, '');
 
@@ -2565,6 +2585,60 @@ test('cli status: says storage is reachable, its newest change, each device and 
   }
 });
 
+test('cli status: storage that answers but cannot be read says why, a wrong passphrase or history this device did not see, and exits 1', () => {
+  const t = setup({});
+  try {
+    put(t.vault, 'a.md', 'one\n');
+    t.cli('sync');
+    const remote = join(t.dir, 'remote');
+    const status = (passphrase: string, ...args: string[]) => bare(t.dir, ['status', ...args, `--config=${t.config}`], { COFFER_PASSPHRASE: passphrase });
+
+    const wrong = status('not the passphrase');
+    assert.equal(wrong.status, 1);
+    assert.equal(wrong.stdout, `storage: reachable, folder ${remote}, but the passphrase is wrong\n`);
+    const wrongJson = status('not the passphrase', '--json');
+    assert.equal(wrongJson.status, 1);
+    assert.deepEqual(JSON.parse(wrongJson.stdout), { ok: false, storage: { reachable: true, where: `folder ${remote}`, problem: 'passphrase', error: 'Wrong passphrase' } });
+
+    cpSync(remote, join(t.dir, 'backup'), { recursive: true });
+    put(t.vault, 'a.md', 'two\n');
+    t.cli('sync');
+    rmSync(remote, { recursive: true });
+    cpSync(join(t.dir, 'backup'), remote, { recursive: true });
+    const back = t.run('status');
+    assert.equal(back.status, 1);
+    assert.match(
+      back.stdout,
+      new RegExp(`^storage: reachable, folder ${escaped(remote)}, but its history is not the one this device saw: Remote commit 2, the newest this device has seen, is missing: .+\\nif storage was put back to a backup or an older copy on purpose, run accept-storage to carry on from it as it is now\\n$`),
+    );
+    const backJson = t.run('status', '--json');
+    assert.equal(backJson.status, 1);
+    const got = JSON.parse(backJson.stdout) as { ok: boolean; storage: Record<string, unknown> };
+    assert.deepEqual([got.ok, got.storage.reachable, got.storage.problem], [false, true, 'history']);
+    assert.match(got.storage.error as string, /^Remote commit 2, the newest this device has seen, is missing/);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli status: storage that answers with damaged data says it could not be read, not that it cannot be reached', () => {
+  const t = setup({});
+  try {
+    put(t.vault, 'a.md', 'one\n');
+    t.cli('sync');
+    const log = join(t.dir, 'remote', 'log');
+    writeFileSync(join(log, readdirSync(log).sort().at(-1)!), 'garbage');
+    const r = t.run('status', '--json');
+    assert.equal(r.status, 1);
+    const got = JSON.parse(r.stdout) as { storage: Record<string, unknown> };
+    assert.deepEqual([got.storage.reachable, got.storage.problem], [true, 'unreadable']);
+    assert.match(got.storage.error as string, /corrupted or tampered with/);
+    assert.match(t.run('status').stdout, /^storage: reachable, .+, but it could not be read: .*corrupted or tampered with\n$/);
+  } finally {
+    t.done();
+  }
+});
+
 test('cli status: a conflict copy where sync does not look, as one deleted to .trash, is not counted', () => {
   const t = setup({});
   try {
@@ -2610,7 +2684,9 @@ test('cli status and export: looking at storage before the first sync makes neit
     mkdirSync(join(t.dir, 'remote'));
     const empty = t.run('status');
     assert.equal(empty.status, 1);
-    assert.match(empty.stdout, /: Storage holds no synced vault yet, and this device only reads from it\n$/);
+    assert.match(empty.stdout, /^storage: reachable, folder \S+, but it holds no synced vault yet\n$/);
+    const emptyJson = JSON.parse(t.run('status', '--json').stdout) as { storage: Record<string, unknown> };
+    assert.deepEqual([emptyJson.storage.reachable, emptyJson.storage.problem], [true, 'empty']);
     assert.equal(t.run('export', join(t.dir, 'out')).status, 1);
     assert.deepEqual(readdirSync(join(t.dir, 'remote')), []);
   } finally {

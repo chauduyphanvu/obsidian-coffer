@@ -195,30 +195,15 @@ export function merge3(base: string, ours: string, theirs: string): string | nul
 }
 
 /**
- * `merge3` where lines both sides added at one place conflict, for properties: there they may be two values for one
- * key, or text put above the properties block.
+ * `merge3` where lines both sides added at one place conflict, for properties, a canvas's labels and the plugins and
+ * themes in the settings folder: there they may be two values for one key or label, text put above the properties
+ * block, or two versions of someone else's code.
  */
-function mergeStrict(base: string, ours: string, theirs: string): string | null {
+export function mergeStrict(base: string, ours: string, theirs: string): string | null {
   if (ours === theirs) return ours;
   if (base === ours) return theirs;
   if (base === theirs) return ours;
   return mergeTokens(splitLines(base), splitLines(ours), splitLines(theirs), undefined, mergeWords);
-}
-
-/**
- * What stands in for the version two texts started from when they have none, as one daily note made from a template
- * on two devices before either synced: the lines both have. Undefined when those are fewer than half the lines with
- * text in the shorter one, as for two notes that only happen to share a name.
- */
-export function sharedBase(a: string, b: string): string | undefined {
-  const eol = lineBreak(a, b);
-  const closed = (s: string) => (unended(s) ? s + eol : s);
-  const regions = lineDiff(closed(a), closed(b));
-  if (!regions) return undefined;
-  const shared = regions.flatMap((r) => (r.kind === 'same' ? r.lines : []));
-  const solid = (ls: string[]) => ls.filter((l) => l.trim()).length;
-  if (2 * solid(shared) < Math.min(solid(lines(a)), solid(lines(b)))) return undefined;
-  return shared.join('');
 }
 
 /** A note's properties block, cut so that `open + props + close + body` is the whole text. */
@@ -556,7 +541,7 @@ function parseCanvas(text: string): Canvas | undefined {
   return items(nodes) && items(edges) ? { nodes, edges, other } : undefined;
 }
 
-/** A node or edge on both sides: key by key, a text by `merge3`, and for any other key both changed, theirs. Null when a text cannot be merged. */
+/** A node or edge on both sides: key by key, a text by `mergeStrict`, and for any other key both changed, theirs. Null when a text cannot be merged. */
 function mergeItem(base: Item | undefined, ours: Item, theirs: Item): Item | null {
   const out = Object.create(null) as Item;
   for (const k of new Set([...Object.keys(theirs), ...Object.keys(ours)])) {
@@ -566,7 +551,8 @@ function mergeItem(base: Item | undefined, ours: Item, theirs: Item): Item | nul
     let v = t;
     if (equal(b, t)) v = o;
     else if (!equal(b, o) && !equal(o, t) && (k === 'text' || k === 'label') && typeof o === 'string' && typeof t === 'string') {
-      const text = merge3(typeof b === 'string' ? b : '', o, t);
+      // A card's text is written like a note; a label is one value.
+      const text = (k === 'text' ? merge3 : mergeStrict)(typeof b === 'string' ? b : '', o, t);
       if (text === null) return null;
       v = text;
     }

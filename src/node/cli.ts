@@ -4,14 +4,15 @@ import { hostname } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pool } from '../core/bytes.ts';
 import { DEFAULT_CONFIG, compileExcludes, resolveConfig, type SyncConfig } from '../core/config.ts';
-import { MIN_PASSPHRASE } from '../core/crypto.ts';
+import { MIN_PASSPHRASE, WrongPassphraseError } from '../core/crypto.ts';
 import { agoText, heartbeatDue, listDevices, statusText, writeHeartbeat, type Beat } from '../core/devices.ts';
-import { HistoryError, PassphraseUnknownError, RemovedError, SafetyError, SyncEngine, UnverifiedError, type RepoView, type SyncOptions, type SyncResult } from '../core/engine.ts';
+import { HistoryError, NoVaultError, PassphraseUnknownError, RemovedError, SafetyError, StorageGoneError, SyncEngine, UnverifiedError, type RepoView, type SyncOptions, type SyncResult } from '../core/engine.ts';
 import { conflictOriginal, vaultKey } from '../core/paths.ts';
 import { Repo } from '../core/repo.ts';
+import { listVersions } from '../core/retention.ts';
 import { errorText, plural } from '../core/text.ts';
 import { TooOldError, listActivity, listCommits, listDeleted, planRestore, tableAt, type Activity, type PastVault } from '../core/timeline.ts';
-import type { RemoteStore } from '../core/types.ts';
+import type { Entry, RemoteStore } from '../core/types.ts';
 import { changesOf, preparePublish, publishPrepared, summaryLines, type Prepared } from '../publish/publish.ts';
 import { activityRows, whoLabel, type Self } from '../plugin/activity.ts';
 import { applyRestore, countSteps, deleteLimitCrossed, keepDeferred, keepOut, leftNote, restoreSteps, sizeLabel, unsent } from '../plugin/restore.ts';
@@ -72,9 +73,9 @@ const USAGE = `Usage: node coffer.js <command> [--config=coffer.json]
   check                  test that the remote storage supports everything sync needs
   status [--json]        say, without syncing or writing anything to storage, whether storage can be reached,
                          its newest change, how each device keeps up, the files left in storage and the
-                         conflict copies among synced files; exits 1 if storage cannot be reached, a device
-                         disagrees about the sync history, or conflict copies are there. --json prints the
-                         same as one JSON object, whose "ok" says whether all is well
+                         conflict copies among synced files; exits 1 if storage cannot be reached or read, a
+                         device disagrees about the sync history, or conflict copies are there. --json prints
+                         the same as one JSON object, whose "ok" says whether all is well
   history <path>         list stored versions of a file
   restore <path> <seq>   write a stored version back into the vault
   deleted [folder]       list deleted files that can still be restored, newest first
@@ -184,6 +185,8 @@ const FORCE_HINT = 'to delete them anyway, run sync --force';
 const READ_ONLY_HINT = 'if these keys may only read, set "readOnly": true under "sync" in the config file, so this device only receives';
 const ACCEPT_HINT = 'if storage was put back to a backup or an older copy on purpose, run accept-storage to carry on from it as it is now';
 const WATCH_SETTLE_MS = 3000;
+/** Export holds each file whole while it writes it: files above this size one at a time, the others a few at a time. */
+const EXPORT_ALONE = 16 << 20;
 /** Changes read at a time when activity lists only those in one folder, which may be far apart. */
 const ACTIVITY_PAGE = 100;
 /** Node's names for systems, as the devices list shows them. */
@@ -508,8 +511,8 @@ async function publish(cli: CliConfig, vault: string, configFile: string, dry: b
 /**
  * Writes the files in storage, or those in `folder`, decrypted into `dir` at their paths in the vault, each with its
  * modified time: as storage holds them now, or with `when`, as they were then. Only into a new or empty folder apart from
- * the vault, so nothing there or anywhere else is overwritten. A few files at a time, so memory stays flat; one that
- * cannot be read is named, and the others are written all the same.
+ * the vault, so nothing there or anywhere else is overwritten. Memory holds a few small files or one large one at a time
+ * (`EXPORT_ALONE`); one that cannot be read is named, and the others are written all the same.
  */
 async function exportTo(engine: SyncEngine, vault: string, dir: string, folder: string, when: string | undefined): Promise<number> {
   const asked = when === undefined ? undefined : { when, at: momentOf(when) };
@@ -531,7 +534,7 @@ async function exportTo(engine: SyncEngine, vault: string, dir: string, folder: 
   const out = new NodeFS(there);
   const failed: { path: string; message: string }[] = [];
   let bytes = 0;
-  await pool(files, v.cfg.concurrency, async ([path, entry]) => {
+  const one = async ([path, entry]: [string, Entry]) => {
     try {
       // The paths come from storage: one that would lead out of the folder is never written.
       if (path.split(/[\\/]/).some((part) => !part || part === '.' || part === '..')) throw new Error('not a path inside the folder');
@@ -541,7 +544,9 @@ async function exportTo(engine: SyncEngine, vault: string, dir: string, folder: 
     } catch (e) {
       failed.push({ path, message: errorText(e) });
     }
-  });
+  };
+  await pool(files.filter(([, e]) => e.size <= EXPORT_ALONE), v.cfg.concurrency, one);
+  for (const [path, entry] of files) if (entry.size > EXPORT_ALONE) await one([path, entry]);
   for (const f of failed.sort((a, b) => (a.path < b.path ? -1 : 1))) console.error(`failed: ${f.path}: ${f.message}`);
   console.log(`exported ${plural(files.length - failed.length, 'file')} (${sizeLabel(bytes)}) of ${prefix || 'the vault'}${asOf} to ${there}`);
   return failed.length ? 1 : 0;
@@ -550,23 +555,43 @@ async function exportTo(engine: SyncEngine, vault: string, dir: string, folder: 
 /** Who made a change, as history, log, deleted and status say it: where it is signed, as the plugin names people; elsewhere its device. */
 const namer = (self: Self) => (c: { seq: number; device: string; signer?: string }) => (c.signer ? whoLabel(c, self) : c.device);
 
+/** Why storage that answered could not be read, as status names it in JSON and says it after "but"; undefined when it may not have answered. */
+function unreadable(e: unknown): { problem: string; but: string } | undefined {
+  if (e instanceof WrongPassphraseError) return { problem: 'passphrase', but: 'the passphrase is wrong' };
+  if (e instanceof HistoryError) return { problem: 'history', but: `its history is not the one this device saw: ${errorText(e)}\n${ACCEPT_HINT}` };
+  if (e instanceof NoVaultError) return { problem: 'empty', but: 'it holds no synced vault yet' };
+  if (e instanceof StorageGoneError) return { problem: 'gone', but: `the vault is gone from it: ${errorText(e)}` };
+  return undefined;
+}
+
 /**
  * What an unattended device needs watched, without syncing or writing anything to storage: whether storage can be read,
  * its newest change, how each device keeps up (as the plugin's Devices list says it, unless `noDevices` says why not),
  * the files left in storage, and the conflict copies among the files sync sees. 1 when storage cannot be read, a device disagrees
  * about the sync history, or conflict copies are there; one that is behind or quiet is only reported, as a phone that
- * is switched off often is.
+ * is switched off often is. Storage that answers but cannot be read says why: the passphrase, its history, no vault, or what else it answered with.
  */
-async function status(engine: SyncEngine, fs: NodeFS, where: string, noDevices: string, selfOf: (v: RepoView) => Self, json: boolean): Promise<number> {
+async function status(
+  engine: SyncEngine,
+  fs: NodeFS,
+  where: string,
+  noDevices: string,
+  selfOf: (v: RepoView) => Self,
+  json: boolean,
+  answers: () => Promise<boolean>,
+): Promise<number> {
   let read;
   try {
     const v = await engine.view();
     const [newest] = v.st.lastSeq ? await listCommits(v.repo, v.st.lastSeq, v.cfg, v.now, { limit: 1 }) : [];
-    read = { v, newest, devices: noDevices ? undefined : await listDevices(v), left: await engine.deferred() };
+    read = { v, newest, devices: noDevices ? undefined : await listDevices(v), left: await engine.deferred({ refresh: false }) };
   } catch (e) {
     const error = errorText(e);
-    if (json) console.log(JSON.stringify({ ok: false, storage: { reachable: false, where, error } }, null, 2));
-    else console.log(`storage: not reachable, ${where}: ${error}`);
+    // Anything else, such as a log with a hole or a member list that does not verify, is told apart from storage that
+    // never answered by asking it once more.
+    const why = unreadable(e) ?? ((await answers()) ? { problem: 'unreadable', but: `it could not be read: ${error}` } : undefined);
+    if (json) console.log(JSON.stringify({ ok: false, storage: { reachable: !!why, where, problem: why?.problem ?? 'unreachable', error } }, null, 2));
+    else console.log(why ? `storage: reachable, ${where}, but ${why.but}` : `storage: not reachable, ${where}: ${error}`);
     return 1;
   }
   const { v, newest, devices, left } = read;
@@ -944,7 +969,7 @@ async function main(): Promise<number> {
         : member
           ? 'not listed for a shared folder with members, where devices do not record how far they have got'
           : '';
-    return status(engine, fs, describeRemote(cli.remote), noDevices, selfOf, flags.has('json'));
+    return status(engine, fs, describeRemote(cli.remote), noDevices, selfOf, flags.has('json'), () => Repo.exists(store).then(() => true, () => false));
   }
   if (command === 'export' && rest[0]) return exportTo(engine, vault, rest[0], rest[1] ?? '', flags.get('at'));
   if (command === 'activity') {
@@ -974,12 +999,13 @@ async function main(): Promise<number> {
     return 0;
   }
   if (command === 'history' && rest[0]) {
-    const versions = await engine.history(vaultKey(rest[0]));
+    const view = await engine.view();
+    const versions = await listVersions(view.repo, view.st.lastSeq, vaultKey(rest[0]), view.cfg, view.now);
     if (!versions.length) {
       console.error(`no stored versions of ${rest[0]}`);
       return 1;
     }
-    const by = namer(selfOf(await engine.view()));
+    const by = namer(selfOf(view));
     for (const v of versions) {
       console.log(`${String(v.seq).padStart(6)}  ${new Date(v.time).toISOString()}  ${by(v).padEnd(16)} ${v.entry ? `${v.entry.size} bytes` : 'deleted'}`);
     }
@@ -1067,6 +1093,10 @@ async function main(): Promise<number> {
       );
     }
     if (!deleted.length && !r.packsCombined) console.log('nothing to clean: no stored version has expired, and no pack is worth combining');
+    if (!r.missing) {
+      console.error('could not tell this time whether storage still holds all the data the files need: run clean again later');
+      return 0;
+    }
     for (const path of r.missing) console.error(`missing from storage: ${path}`);
     for (const path of r.missingEarlier) console.log(`earlier versions of ${path} cannot be restored`);
     if (!r.missing.length) return 0;

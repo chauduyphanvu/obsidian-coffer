@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { merge3, mergeCanvas, mergeNote, sharedBase, words } from '../src/core/merge.ts';
+import { merge3, mergeCanvas, mergeNote, words } from '../src/core/merge.ts';
 import { rng } from '../src/testing/netsim.ts';
 
 test('merge3 by words: different sentences of one paragraph merge', () => {
@@ -119,6 +119,7 @@ test('merge3: appending to a text whose last line has no line break', () => {
   assert.equal(mergeNote('# Day\n\n- a', '# Day\n\n- a\n- from mac', '# Day\n\n- a\n- from phone'), '# Day\n\n- a\n- from phone\n- from mac');
   assert.equal(merge3('a\r\nb', 'a\r\nb\r\nmac', 'a\r\nb\r\nphone'), 'a\r\nb\r\nphone\r\nmac');
   assert.equal(merge3('one line', 'one line\nmac', 'one line\nphone'), 'one line\nphone\nmac');
+  assert.equal(merge3('# Day\n- a\n', '# Day\n- a', '# Day\n- a\n- b'), '# Day\n- a\n- b');
   // One side appends after the last line and the other edits further up.
   assert.equal(merge3('top\nlast', 'TOP\nlast', 'top\nlast\nmore'), 'TOP\nlast\nmore');
   assert.equal(merge3('top\nlast', 'top\nlast\nmore', 'TOP\nlast'), 'TOP\nlast\nmore');
@@ -187,28 +188,6 @@ test('mergeNote: properties do not keep both sides\' additions at one place; the
   // A properties block one side added stays at the top, or the note conflicts.
   assert.equal(mergeNote('text\n', note('a: 1\n', 'text\n'), 'new top\ntext\n'), null);
   assert.equal(mergeNote('text\n', note('a: 1\n', 'text\n'), 'text\nmore\n'), note('a: 1\n', 'text\nmore\n'));
-});
-
-test('sharedBase: the lines two versions made apart share, when they are enough to be one note', () => {
-  const mac = '# 2026-11-14\n\n## Tasks\n- buy milk\n\n## Notes\n';
-  const phone = '# 2026-11-14\n\n## Tasks\n\n## Notes\n- an idea\n';
-  const base = sharedBase(mac, phone);
-  assert.equal(base, '# 2026-11-14\n\n## Tasks\n\n## Notes\n');
-  assert.equal(mergeNote(base!, mac, phone), '# 2026-11-14\n\n## Tasks\n- buy milk\n\n## Notes\n- an idea\n');
-  // A last line without a line break is still shared.
-  assert.equal(sharedBase('# Day\n- a', '# Day\n- a\n- b'), '# Day\n- a\n');
-  assert.equal(merge3('# Day\n- a\n', '# Day\n- a', '# Day\n- a\n- b'), '# Day\n- a\n- b');
-
-  // Two notes that only share a name, or share fewer than half the lines with text of the shorter: none.
-  assert.equal(sharedBase('Shopping\n- milk\n- eggs\n', 'Meeting\n- agenda\n'), undefined);
-  assert.equal(sharedBase('# Plan\n\none\ntwo\nthree\n', '# Plan\n\nfour\nfive\nsix\n'), undefined);
-  // Blank lines count for nothing.
-  assert.equal(sharedBase('\n\n\nmac\n', '\n\n\nphone\n'), undefined);
-  // Half is enough.
-  assert.equal(sharedBase('# Plan\none\n', '# Plan\ntwo\nthree\n'), '# Plan\n');
-  // An empty version has nothing to lose.
-  assert.equal(sharedBase('', 'text\n'), '');
-  assert.equal(merge3('', '', 'text\n'), 'text\n');
 });
 
 test('mergeNote: properties merge key by key and the text below merges as before', () => {
@@ -419,6 +398,15 @@ test('mergeCanvas: where both changed a position or colour, theirs wins; a text 
   assert.deepEqual(parse(mergeCanvas(base, moved(10, 'x y z'), moved(20, 'x y z'))).nodes, [node('a', { x: 20, color: '20', text: 'x y z' })]);
   assert.equal(mergeCanvas(base, moved(10, 'x A z'), moved(20, 'x B z')), null);
   assert.deepEqual(parse(mergeCanvas(base, moved(10, 'x y z'), moved(20, 'x y z!'))).nodes, [node('a', { x: 20, color: '20', text: 'x y z!' })]);
+});
+
+test('mergeCanvas: a label set differently on both sides conflicts, while a card keeps both sides\' added lines as a note does', () => {
+  const nodes = [node('a'), node('b')];
+  const labelled = (label?: string) => obsidian(nodes, [{ ...edge('e', 'a', 'b'), ...(label !== undefined && { label }) }]);
+  assert.equal(mergeCanvas(labelled(), labelled('Yes'), labelled('No')), null);
+  assert.equal(mergeCanvas(labelled(''), labelled('Yes'), labelled('No')), null);
+  const texts = (a: string) => obsidian([node('a', { text: a })]);
+  assert.deepEqual(parse(mergeCanvas(texts('one\n'), texts('one\nmac\n'), texts('one\nphone\n'))).nodes, [node('a', { text: 'one\nphone\nmac\n' })]);
 });
 
 test('mergeCanvas: nodes added on both sides are all kept, theirs first', () => {

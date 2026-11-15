@@ -442,6 +442,16 @@ test('cleanup names the files whose current version needs data deleted from stor
   assert.deepEqual((await a.engine.gc()).missing, [], 'once repaired, nothing is missing');
 });
 
+test('a cleanup on a device that only reads looks for no missing data, and gives no lists rather than empty ones', async () => {
+  const { devices: [a], mem, befores, clock } = await twoPacks(setup(['A']));
+  mem.objects.delete(await packOf(a, 'a.bin'));
+  const b = new Device('B', befores[0], clock, { readOnly: true });
+  await b.sync();
+  const r = await b.engine.gc();
+  assert.deepEqual([r.missing, r.missingEarlier, r.packsDeleted], [undefined, undefined, 0]);
+  assert.deepEqual((await a.engine.gc()).missing, ['a.bin', 'copy of a.bin'], 'the files are missing all the same');
+});
+
 test('cleanup names apart the files only an earlier version of which needs data deleted from storage, and forgets them once history no longer offers it', async () => {
   const { devices: [a], mem, clock } = setup(['A']);
   a.fs.put('x', random(3000, 1));
@@ -519,5 +529,40 @@ test('a pack the listing leaves out is asked for by name, once and for one byte,
 
   // Once storage no longer holds it either, it is missing.
   mem.objects.delete(pack);
+  assert.deepEqual((await a.engine.gc()).missing, ['a.bin']);
+});
+
+test('a cleanup whose check fails gives no lists, so what an earlier one found stands, and still deletes what has expired', async () => {
+  const clock = { now: 1_800_000_000_000 };
+  const mem = new MemoryStore(() => clock.now);
+  let failing = '';
+  // Reading one pack fails, as with a 5xx or a timeout.
+  const flaky: RemoteStore = {
+    get: (k, range) => (k === failing ? Promise.reject(new Error('HTTP 503 Slow Down')) : mem.get(k, range)),
+    put: (k, data, opts) => mem.put(k, data, opts),
+    delete: (k) => mem.delete(k),
+    list: (prefix, after) => mem.list(prefix, after),
+  };
+  const a = new Device('A', flaky, clock);
+  a.fs.put('a.bin', random(3000, 1));
+  await a.sync();
+  a.fs.put('x.bin', random(3000, 2));
+  await a.sync();
+  const expired = await packOf(a, 'x.bin');
+  a.fs.put('x.bin', random(3000, 3));
+  await a.sync();
+  clock.now += 40 * DAY;
+  const pack = await packOf(a, 'a.bin');
+  mem.objects.delete(pack);
+  failing = pack;
+
+  const r = await a.engine.gc();
+  // Not "nothing missing", which would clear a problem an earlier cleanup found.
+  assert.deepEqual([r.missing, r.missingEarlier], [undefined, undefined]);
+  assert.equal(r.packsDeleted, 1);
+  assert.equal(mem.objects.has(expired), false);
+
+  // The next cleanup whose check gets an answer names the file.
+  failing = '';
   assert.deepEqual((await a.engine.gc()).missing, ['a.bin']);
 });

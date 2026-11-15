@@ -695,7 +695,8 @@ export default class CofferPlugin extends Plugin {
     if (share && !isConfigured(share, this.lookup)) return [keysMissingProblem(share)];
     const t = this.tracked(share);
     const rec = share ?? this.settings;
-    const lost = lostProblems({ current: rec.lost.current.map((p) => vaultPath(share, p)), earlier: rec.lost.earlier.map((p) => vaultPath(share, p)) });
+    // A device that only receives neither checks for missing data nor can repair it, so what it once found would only go stale.
+    const lost = this.receivesOnly(share) ? [] : lostProblems({ current: rec.lost.current.map((p) => vaultPath(share, p)), earlier: rec.lost.earlier.map((p) => vaultPath(share, p)) });
     return targetProblems({ failure: t.failure, found: [...t.found, ...lost], conflictCopies: this.conflictCopies(share), lastSuccess: rec.lastSuccess, readOnly: this.receivesOnly(share) }, Date.now());
   }
 
@@ -1016,7 +1017,7 @@ export default class CofferPlugin extends Plugin {
     if (!r.errors.length && cleanupDue({ autoCleanDays: this.settings.autoCleanDays, lastCleanup: rec.lastCleanup }, Date.now(), r.commits > 0 && (await engine.compactionDue()))) {
       const cleaned = await engine.gc();
       rec.lastCleanup = Date.now();
-      rec.lost = { current: cleaned.missing, earlier: cleaned.missingEarlier };
+      if (cleaned.missing) rec.lost = { current: cleaned.missing, earlier: cleaned.missingEarlier };
     }
     if (!share) await this.vaultChores();
     // A followed folder has no storage keys to change.
@@ -1831,7 +1832,7 @@ export default class CofferPlugin extends Plugin {
         try {
           const r = await this.getEngine(share).gc();
           for (const k of Object.keys(total) as (keyof GcCounts)[]) total[k] += r[k];
-          (share ?? this.settings).lost = { current: r.missing, earlier: r.missingEarlier };
+          if (r.missing) (share ?? this.settings).lost = { current: r.missing, earlier: r.missingEarlier };
         } catch (e) {
           failed.push(`${share ? `“${labelOf(share)}”` : 'This vault'}: ${errorText(e)}`);
         }
