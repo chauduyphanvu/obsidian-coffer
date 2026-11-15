@@ -228,7 +228,7 @@ test('activity pages continue where the last one stopped, and a page still loadi
   assert.deepEqual(pages.items, []);
 });
 
-test('activity for a legacy shared folder reads device names, through the same steps the screen takes', async () => {
+test('activity for the vault, or a legacy shared folder, reads device names, through the same steps the screen takes', async () => {
   const clock = { now: 1_800_000_000_000 };
   const net = new SimStore(new MemoryStore(() => clock.now));
   const [a, b] = ['mac', 'desktop-1'].map((n) => new Device(n, net, clock));

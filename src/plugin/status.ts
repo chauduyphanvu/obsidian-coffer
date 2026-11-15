@@ -1,7 +1,7 @@
 // What a sync did, what went wrong and what a conflict leaves to choose, in words a user can act on.
 // No Obsidian import, so it runs under plain Node tests.
 import { WrongPassphraseError } from '../core/crypto.ts';
-import { HistoryError, RemovedError, SafetyError, UnverifiedError, type MemberStanding, type SyncResult } from '../core/engine.ts';
+import { HistoryError, RemovedError, SafetyError, StorageGoneError, UnverifiedError, type MemberStanding, type SyncResult } from '../core/engine.ts';
 import { lineDiff, type DiffRegion } from '../core/merge.ts';
 import { ext } from '../core/paths.ts';
 import { DAY } from '../core/retention.ts';
@@ -20,10 +20,13 @@ export function summarize(r: SyncResult): string {
     r.conflictCopies.length && plural(r.conflictCopies.length, 'conflict copy', 'conflict copies'),
     r.errors.length && `${r.errors.length.toLocaleString()} failed`,
   ].filter(Boolean);
-  return parts.length ? parts.join(', ') : 'everything is up to date';
+  const left = r.deferred.length;
+  if (!parts.length) return left ? `everything is up to date · ${plural(left, 'file')} left in storage` : 'everything is up to date';
+  if (left) parts.push(`${left.toLocaleString()} left in storage`);
+  return parts.join(', ');
 }
 
-export type Action = 'settings' | 'passphrase' | 'resolve-deletes' | 'files' | 'retry' | 'missing-folder' | 'accept-storage' | 'remove-unverified' | 'stop-sharing' | 'whats-shared';
+export type Action = 'settings' | 'passphrase' | 'resolve-deletes' | 'files' | 'retry' | 'missing-folder' | 'accept-storage' | 'remove-unverified' | 'stop-sharing' | 'whats-shared' | 'repair';
 
 export interface Problem {
   /** A notice is shown once per id, so the same problem does not nag on every sync. */
@@ -65,6 +68,48 @@ export function keysMissingProblem(share: Pick<Share, 'role' | 'memberKeysSecret
       (share.property ? 'Stop sharing it on this device, then start a new share and invite people again.' : `Stop sharing it on this device, then join again with ${rejoinNeeds(share)}.`),
     action: 'settings',
   };
+}
+
+/** Files named in a problem's words, at most; the rest are counted. */
+const NAMED = 10;
+
+/** One path a line, the first `NAMED` of them, then how many more. */
+const named = (paths: string[]) =>
+  [...paths.slice(0, NAMED), ...(paths.length > NAMED ? [`and ${(paths.length - NAMED).toLocaleString()} more`] : [])].join('\n');
+
+/**
+ * What the last cleanup found storage no longer holds (`GcResult.missing`, `missingEarlier`), by vault path. Files whose
+ * current version needs it are critical: only a device that still has them can store it again, and only while it does.
+ * Files only earlier versions of which need it are a warning: nothing brings those versions back.
+ */
+export function lostProblems(lost: { current: string[]; earlier: string[] }): Problem[] {
+  const out: Problem[] = [];
+  const { current, earlier } = lost;
+  if (current.length) {
+    const one = current.length === 1;
+    const them = one ? 'it' : 'them';
+    out.push({
+      id: `lost:${current.join('|')}`,
+      severity: 'critical',
+      title: `Data for ${plural(current.length, 'file')} is missing from storage`,
+      detail:
+        `Storage no longer holds data that ${one ? 'this file needs' : 'these files need'}, so other devices cannot download ${them}. ` +
+        `Run Repair from a device that has ${them} to store ${one ? 'its' : 'their'} data again.\n${named(current)}`,
+      action: 'repair',
+    });
+  }
+  if (earlier.length) {
+    const one = earlier.length === 1;
+    out.push({
+      id: `lost-earlier:${earlier.join('|')}`,
+      severity: 'warning',
+      title: `Earlier versions of ${plural(earlier.length, 'file')} can no longer be restored`,
+      detail:
+        `Storage no longer holds data that earlier versions of ${one ? 'this file need' : 'these files need'}. ` +
+        `${one ? 'Its current version is' : 'Their current versions are'} whole and sync as before.\n${named(earlier)}`,
+    });
+  }
+  return out;
 }
 
 /** A shared folder's problem, told apart from the vault's: its own id, and a title that names the folder, or the notes shared by a property. */
@@ -219,10 +264,31 @@ export interface MemberContext {
   ownerName: string;
 }
 
-/** A sync that threw, described. `member` is set for a shared folder with members. */
-export function describeFailure(e: unknown, member?: MemberContext): Problem {
+/** A sync that threw, described. `member` is set for a shared folder with members, `share` for any shared folder. */
+export function describeFailure(e: unknown, member?: MemberContext, share = false): Problem {
   const message = errorText(e);
   if (e instanceof MissingFolderError) return missingProblem(e.folder);
+  // Also what opening a shared folder with members finds after a restart: the same problem either way.
+  if (e instanceof StorageGoneError) {
+    return share
+      ? {
+          id: 'storage-gone',
+          severity: 'critical',
+          title: "This shared folder's storage is gone",
+          detail:
+            'Sync is stopped. The storage it syncs to no longer holds it: its owner may have stopped sharing it, or the storage was emptied. ' +
+            'The files in the folder stay on this device. If it is not coming back, remove it under Shared folders.',
+          action: 'stop-sharing',
+        }
+      : {
+          id: 'storage-gone',
+          severity: 'critical',
+          title: "The vault's storage is gone",
+          detail:
+            'Sync is stopped. The storage this vault syncs to no longer holds it: its key file, vault.json, is missing, as when the bucket or folder was emptied or deleted. ' +
+            'Do not set up sync again until you know why. Your files on this device are untouched.',
+        };
+  }
   if (e instanceof RemovedError) {
     return {
       id: 'removed',

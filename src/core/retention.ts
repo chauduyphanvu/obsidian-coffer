@@ -411,7 +411,9 @@ export async function keptVersions(
 /**
  * Deletes packs that no kept version uses, and snapshots no longer needed to rebuild the earliest
  * moment. A version is kept when it was current at a kept moment (`Thinning`), or is current now. Packs
- * younger than a day are kept: a device may still be about to commit them. Returns what is left.
+ * younger than a day are kept: a device may still be about to commit them. Returns what is left, and the
+ * packs a kept version uses that storage no longer holds (`missing`), each asked for by name before it is
+ * called missing, since a listing can lag behind what storage holds.
  *
  * The floor it uses is recorded (`Repo.prunedTo`) before anything is deleted, and every device offers
  * history from no earlier than the record, whatever retention it keeps itself. A device that read the record
@@ -426,7 +428,7 @@ export async function collectGarbage(
   st: LocalState,
   cfg: SyncConfig,
   now: number,
-): Promise<{ result: CleanupResult; packs: { id: string; size: number; modified: number }[] }> {
+): Promise<{ result: CleanupResult; packs: { id: string; size: number; modified: number }[]; missing: string[] }> {
   const live = new Set<string>();
   const { floor, pruned, snaps, base } = await keptVersions(repo, st, cfg, now - GC_SKEW, (_, e) => e.chunks.forEach((c) => live.add(c.pack)));
 
@@ -436,6 +438,11 @@ export async function collectGarbage(
   };
   await advance();
   const listing = await repo.listPacks();
+  const listed = new Set(listing.map((o) => o.id));
+  const missing: string[] = [];
+  await pool([...live].filter((id) => !listed.has(id)), cfg.concurrency, async (id) => {
+    if (!(await repo.getPackRange(id, 0, 1))) missing.push(id);
+  });
   const dead = listing.filter((o) => !live.has(o.id) && o.modified < now - GC_GRACE);
   await pool(dead, cfg.concurrency, async (o) => {
     await repo.deletePack(o.id);
@@ -449,5 +456,5 @@ export async function collectGarbage(
   }
   await advance();
   const gone = new Set(dead.map((o) => o.id));
-  return { result, packs: listing.filter((o) => !gone.has(o.id)) };
+  return { result, packs: listing.filter((o) => !gone.has(o.id)), missing: missing.sort() };
 }

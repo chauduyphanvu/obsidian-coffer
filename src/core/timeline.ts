@@ -10,6 +10,8 @@ export interface Moment {
   seq: number;
   time: number;
   device: string;
+  /** In a shared folder with members: the member who signed it. */
+  signer?: string;
 }
 
 export interface PastVault {
@@ -73,7 +75,7 @@ function restorable(k: Kept, next?: number): Thinning {
   return new Thinning(k.floor, k.now, next);
 }
 
-const moment = (c: Moment): Moment => ({ seq: c.seq, time: c.time, device: c.device });
+const moment = (c: Moment): Moment => ({ seq: c.seq, time: c.time, device: c.device, ...(c.signer && { signer: c.signer }) });
 
 function apply(files: Map<string, Entry>, path: string, entry: Entry | null): void {
   if (entry) files.set(path, entry);
@@ -384,8 +386,6 @@ export async function listCommits(
 
 /** One change to the files, or to the members of a shared folder, as `listActivity` lists it. */
 export interface Activity extends Moment {
-  /** In a shared folder with members: the member who signed it. */
-  signer?: string;
   /** The files it added, changed and deleted, by path, each list sorted. */
   added: string[];
   changed: string[];
@@ -430,7 +430,7 @@ export async function listActivity(
     }
     for (const { path, entry } of c.changes) settle(path, entry);
     if (!listed) continue;
-    const a: Activity = { ...moment(c), ...(c.signer && { signer: c.signer }), added: [], changed: [], deleted: [] };
+    const a: Activity = { ...moment(c), added: [], changed: [], deleted: [] };
     if (c.members) {
       const prev = c.members.earlier.at(-1);
       a.members = { before: prev ? ((await reads.get(prev)).members?.members ?? []) : [], after: c.members.members };

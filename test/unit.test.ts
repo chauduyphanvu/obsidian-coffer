@@ -76,8 +76,9 @@ test('merge3: independent edits combine, overlapping edits conflict', () => {
   assert.equal(merge3(base, 'a\nc\nd\ne\n', 'a\nb\nc\nd\ne\nf\n'), 'a\nc\nd\ne\nf\n');
   assert.equal(merge3(base, 'a\nB\nc\nd\ne\n', 'a\nB\nc\nd\ne\n'), 'a\nB\nc\nd\ne\n');
   assert.equal(merge3(base, 'a\nX\nc\nd\ne\n', 'a\nY\nc\nd\ne\n'), null);
-  assert.equal(merge3(base, 'a\nb\nX\nc\nd\ne\n', 'a\nb\nY\nc\nd\ne\n'), null);
-  assert.equal(merge3('', 'x\n', 'y\n'), null);
+  // Lines both added at one place are both kept, theirs first.
+  assert.equal(merge3(base, 'a\nb\nX\nc\nd\ne\n', 'a\nb\nY\nc\nd\ne\n'), 'a\nb\nY\nX\nc\nd\ne\n');
+  assert.equal(merge3('', 'x\n', 'y\n'), 'y\nx\n');
   assert.equal(merge3('a\n', '', 'a\nb\n'), null);
   assert.equal(merge3('one\ntwo', 'one\ntwo\nthree', 'zero\none\ntwo'), 'zero\none\ntwo\nthree');
 });

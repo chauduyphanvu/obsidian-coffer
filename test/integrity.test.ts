@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { HistoryError } from '../src/core/engine.ts';
+import { HistoryError, StorageGoneError } from '../src/core/engine.ts';
 import { Repo } from '../src/core/repo.ts';
 import type { RemoteStore } from '../src/core/types.ts';
 import { describeFailure } from '../src/plugin/status.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
 import { withRetry } from '../src/stores/retry.ts';
 import { rng, SimStore } from '../src/testing/netsim.ts';
-import { Device } from './helpers.ts';
+import { Device, memberShare } from './helpers.ts';
 
 const DAY = 86_400_000;
 const HOUR = 3_600_000;
@@ -353,7 +353,7 @@ test('damage within storage is a plain error, which accepting storage would only
   }
 });
 
-test('checking that the newest commit is still there costs one more read, at start and then hourly', async () => {
+test('checking that the newest commit is still there costs one more read, at start and then hourly, and hourly one more that the key header is', async () => {
   const { devices: [a, b], net, clock } = setup();
   a.fs.put('a.md', 'x\n');
   await a.sync();
@@ -367,7 +367,7 @@ test('checking that the newest commit is still there costs one more read, at sta
   assert.equal(await reads(), 4, 'the key header, the two probes, and the newest commit');
   assert.equal(await reads(), 2);
   clock.now += HOUR;
-  assert.equal(await reads(), 3);
+  assert.equal(await reads(), 4, 'the two probes, the newest commit and the key header');
   assert.equal(await reads(), 2);
 
   // A small edit is committed without looking first, due or not: the commit reads the one before it as it is written.
@@ -808,6 +808,83 @@ test('storage that holds a vault\'s objects but not its vault.json is never give
   assert.equal((await a.sync()).pushed, 1);
   assert.equal((await b.sync()).pulled, 1);
   assert.equal(await Repo.exists(net), true);
+});
+
+test('storage whose key file was deleted under a running device is found at the hourly check, which a sync before then does not pay for: it stops, writes nothing and leaves the files here alone, as after a restart', async () => {
+  const { devices: [a, b], mem, net, clock } = setup(['A', 'B']);
+  a.fs.put('n.md', '1\n');
+  await a.sync();
+  await b.sync();
+  const kept = mem.objects.get('vault.json')!;
+  mem.objects.delete('vault.json');
+  const stored = [...mem.objects.keys()].sort();
+  const files = b.snapshot();
+
+  net.reset();
+  assert.equal((await b.sync()).pulled, 0);
+  assert.deepEqual([net.stats.get, net.stats.put, net.stats.list, net.stats.delete], [2, 0, 0, 0], 'the two probes, as before');
+
+  clock.now += HOUR;
+  net.reset();
+  const e = await failure(b.sync());
+  assert.ok(e instanceof StorageGoneError);
+  assert.equal(e.message, 'The storage this syncs to no longer holds its vault: vault.json is missing');
+  assert.equal(net.stats.get, 4, 'the two probes, the newest commit and the key header');
+  // Found again at every try, and never written back.
+  b.fs.put('n.md', '2\n');
+  await assert.rejects(b.sync(), StorageGoneError);
+  assert.equal(net.stats.put + net.stats.delete, 0);
+  assert.deepEqual([...mem.objects.keys()].sort(), stored);
+  assert.deepEqual(b.snapshot(), { ...files, 'n.md': Buffer.from('2\n').toString('base64') }, 'only the edit made here');
+  const p = describeFailure(e);
+  assert.deepEqual([p.id, p.severity, p.title], ['storage-gone', 'critical', "The vault's storage is gone"]);
+
+  // After a restart, opening refuses as well, and writes nothing either.
+  const running = b.engine;
+  b.restart();
+  await assert.rejects(b.sync(), /vault key file, vault\.json, is missing from storage/);
+  assert.equal(net.stats.put + net.stats.delete, 0);
+  assert.deepEqual([...mem.objects.keys()].sort(), stored);
+
+  // Put back, the engine that found it gone carries on, and sends the edit.
+  mem.objects.set('vault.json', kept);
+  b.engine = running;
+  assert.equal((await b.sync()).pushed, 1);
+});
+
+test('storage emptied under a device that sends a change before the hourly check: its commit is taken back, and it says storage is gone, not rolled back', async () => {
+  const { devices: [a], mem } = setup(['A']);
+  a.fs.put('n.md', '1\n');
+  await a.sync();
+  mem.objects.clear();
+  a.fs.put('n.md', '2\n');
+  const e = await failure(a.sync());
+  assert.ok(e instanceof StorageGoneError, e.message);
+  assert.deepEqual([...mem.objects.keys()].filter((k) => !k.startsWith('pack/')), [], 'no commit and no key file');
+});
+
+test("a shared folder whose storage is gone says so, while it runs and after a restart alike, and nothing is written to it", async () => {
+  const { owner, writer, mem, net, clock } = await memberShare();
+  owner.fs.put('plan.md', 'v1\n');
+  await owner.sync();
+  const lan = await writer('Lan');
+  await lan.sync();
+  mem.objects.delete('vault.json');
+  const stored = [...mem.objects.keys()].sort();
+  clock.now += HOUR;
+  net.reset();
+  const member = { owner: false, ownerName: 'Vu' };
+  const running = describeFailure(await failure(lan.sync()), member, true);
+  assert.deepEqual([running.id, running.severity, running.title, running.action], ['storage-gone', 'critical', "This shared folder's storage is gone", 'stop-sharing']);
+  assert.match(running.detail, /owner may have stopped sharing it, or the storage was emptied.*remove it under Shared folders/);
+
+  lan.restart();
+  const opening = await failure(lan.sync());
+  assert.ok(opening instanceof StorageGoneError);
+  assert.equal(opening.message, 'The shared folder is missing from storage: its key file, vault.json, is gone');
+  assert.deepEqual(describeFailure(opening, member, true), running);
+  assert.equal(net.stats.put + net.stats.delete, 0);
+  assert.deepEqual([...mem.objects.keys()].sort(), stored);
 });
 
 test('storage with no vault at all still gets one, and opening a vault asks for no extra list', async () => {

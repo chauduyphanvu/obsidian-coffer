@@ -854,18 +854,18 @@ const MAX_FILES = 20;
 const KIND_LABEL = { added: 'added', changed: 'changed', deleted: 'deleted' } as const;
 
 /**
- * Who changed what in a shared folder, newest first, grouped by change: by member name (in a folder shared with a
- * passphrase, by device), with the files each change added, changed and deleted, and who joined or was removed.
- * Tapping a file shows its versions, the one that change made picked.
+ * Who changed what in the vault or a shared folder, newest first, grouped by change: by member name in a shared folder
+ * with members, elsewhere by device, with the files each change added, changed and deleted, and who joined or was
+ * removed. Tapping a file shows its versions, the one that change made picked.
  */
 export class ActivityModal extends Modal {
   private plugin: CofferPlugin;
-  private share: Share;
+  private share?: Share;
   private pages: ActivityPages<Look>;
   private error = '';
   private closed = false;
 
-  constructor(app: App, plugin: CofferPlugin, share: Share) {
+  constructor(app: App, plugin: CofferPlugin, share?: Share) {
     super(app);
     this.plugin = plugin;
     this.share = share;
@@ -877,7 +877,7 @@ export class ActivityModal extends Modal {
 
   onOpen(): void {
     this.modalEl.addClass('coffer-modal', 'coffer-past');
-    this.setTitle(`Activity in “${labelOf(this.share)}”`);
+    this.setTitle(this.share ? `Activity in “${labelOf(this.share)}”` : 'Activity in this vault');
     void this.loadMore();
   }
 
@@ -903,13 +903,15 @@ export class ActivityModal extends Modal {
     const c = this.contentEl;
     c.empty();
     const { items, look, loading, more } = this.pages;
-    c.createEl('p', { cls: 'coffer-intro', text: `Changes to ${this.share.property ? `the notes shared in “${this.share.property}”` : 'this shared folder'}, newest first. Tap a file to see its versions.` });
-    const rows = look ? activityRows(items, this.plugin.selfIn(this.share, look.members)) : [];
+    const place = !this.share ? (folderShares(this.plugin.settings.shares).length ? 'this vault, without its shared folders' : 'this vault') : this.share.property ? `the notes shared in “${this.share.property}”` : 'this shared folder';
+    c.createEl('p', { cls: 'coffer-intro', text: `Changes to ${place}, newest first. Tap a file to see its versions.` });
+    // Nobody signs the vault's changes: each is named by the device that made it.
+    const rows = look ? activityRows(items, this.share ? this.plugin.selfIn(this.share, look.members) : { device: this.plugin.settings.deviceName, changes: [] }) : [];
     const list = c.createDiv({ cls: 'coffer-list' });
     days(list, rows, (r) => r.time, (el, r, time) => this.row(el, r, time));
     message(c, this.error);
     if (loading) c.createDiv({ cls: 'coffer-hint', text: 'Loading…' });
-    else if (!rows.length && !this.error && !more) c.createEl('p', { cls: 'coffer-intro', text: 'Nothing has changed in this folder yet.' });
+    else if (!rows.length && !this.error && !more) c.createEl('p', { cls: 'coffer-intro', text: `Nothing has changed in this ${this.share ? 'folder' : 'vault'} yet.` });
     const r = buttonRow(c);
     button(r, 'Close', () => this.close());
     if (more && !loading) button(r, items.length || !this.error ? 'Show earlier changes' : 'Try again', () => this.loadMore());
@@ -925,7 +927,7 @@ export class ActivityModal extends Modal {
     const files = box.createDiv({ cls: 'coffer-activity-files' });
     for (const f of r.files.slice(0, MAX_FILES)) {
       // Notes shared by a property keep their versions in the vault's history, which counts its changes apart.
-      const pick = this.share.property ? undefined : { seq: r.seq, deleted: f.kind === 'deleted' };
+      const pick = this.share?.property ? undefined : { seq: r.seq, deleted: f.kind === 'deleted' };
       const el = row(files, f.path, '', () => new VersionsModal(this.app, this.plugin, vaultPath(this.share, f.path), pick).open());
       el.querySelector('.coffer-row-title')!.createSpan({ cls: 'coffer-tag', text: KIND_LABEL[f.kind] });
       if (f.kind === 'deleted') el.addClass('is-deleted');

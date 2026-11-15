@@ -127,6 +127,26 @@ export async function lostInHistory(
 }
 
 /**
+ * The files that need the packs `missing`, which storage no longer holds, as `verifyRepo` reports them: those whose
+ * current version does (`paths`), and apart from them those whose earlier versions history offers do (`earlier`). Reads
+ * the log as `lostInHistory` does, and only when some pack is missing; when the log cannot be read, `earlier` is empty.
+ */
+export async function missingFiles(
+  repo: Repo, st: Pick<LocalState, 'lastSeq' | 'remote'>, cfg: SyncConfig, now: number, listing: Listing, missing: string[],
+): Promise<{ paths: string[]; earlier: string[] }> {
+  if (!missing.length) return { paths: [], earlier: [] };
+  const gone = new Set(missing);
+  const damaged = chunksIn(st.remote, gone);
+  const paths = affectedBy(st.remote, damaged).sort();
+  // A log that cannot be read is damage a check reports; it must not hide the current files, nor stop the cleanup that asks.
+  const lost = await lostInHistory(repo, st, cfg, now, listing, damaged, new Set(paths)).catch((): Lost => new Map());
+  const earlier = new Set<string>();
+  // Only the packs found missing: one the listing left out though storage holds it, or one cut short, counts there too.
+  for (const [pack, n] of lost) if (gone.has(pack)) for (const path of n.paths) earlier.add(path);
+  return { paths, earlier: [...earlier].sort() };
+}
+
+/**
  * Reports, apart from the problems of the current files, each pack that only earlier versions need and that is missing
  * or too short. A pack in `bad` already has its report, for the current files, and repairing it may bring the earlier
  * versions back too.

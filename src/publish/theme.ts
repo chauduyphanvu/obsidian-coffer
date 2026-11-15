@@ -120,5 +120,9 @@ nav.pages ul { list-style: none; padding-left: 0; margin: 0; }
 nav.pages ul ul { padding-left: 1.1rem; margin: 0.15rem 0 0.4rem; border-left: 1px solid var(--line); }
 nav.pages li { margin: 0.2rem 0; }
 nav.pages span.folder { color: var(--muted); font-weight: 600; }
+nav.backlinks { margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid var(--line); }
+nav.backlinks h2 { margin: 0 0 0.5rem; font-size: 1rem; color: var(--muted); }
+nav.backlinks ul { list-style: none; padding-left: 0; margin: 0; }
+nav.backlinks li { margin: 0.2rem 0; }
 p.empty { color: var(--muted); }
 `;

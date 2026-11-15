@@ -240,13 +240,32 @@ test('a heartbeat is one write, and listing is one list plus one read per record
   assert.deepEqual([net.stats.get, net.stats.put, net.stats.list, net.stats.delete], [3, 0, 1, 0]);
 });
 
-test('a heartbeat is due when none was written this session, and then every 30 minutes', () => {
+test('a heartbeat is due when none was written this session, then every 30 minutes, and 5 minutes after the last once this device has seen commits since', () => {
   const t = 1_800_000_000_000;
-  assert.equal(heartbeatDue(0, t), true);
-  assert.equal(heartbeatDue(t, t), false);
-  assert.equal(heartbeatDue(t, t + 30 * MINUTE), false);
-  assert.equal(heartbeatDue(t, t + 30 * MINUTE + 1), true);
-  assert.equal(heartbeatDue(t, t + DAY), true);
+  const last = { time: t, seq: 7 };
+  assert.equal(heartbeatDue(undefined, t, 7), true);
+  assert.equal(heartbeatDue(last, t, 7), false);
+  assert.equal(heartbeatDue(last, t + 30 * MINUTE, 7), false);
+  assert.equal(heartbeatDue(last, t + 30 * MINUTE + 1, 7), true);
+  assert.equal(heartbeatDue(last, t + DAY, 7), true);
+
+  assert.equal(heartbeatDue(last, t + 5 * MINUTE - 1, 9), false, 'not sooner than 5 minutes, however far it moved');
+  assert.equal(heartbeatDue(last, t + 5 * MINUTE, 9), true);
+  assert.equal(heartbeatDue(last, t + 5 * MINUTE, 8), true);
+  assert.equal(heartbeatDue(last, t + 29 * MINUTE, 7), false, 'not moved: the 30 minutes stand');
+});
+
+test('a heartbeat gives the newest commit this device has seen, which the engine tells without asking storage', async () => {
+  const { devices: [a, b], net } = setup();
+  await commit(a, '1\n', '2\n');
+  assert.equal(b.engine.position(), 0, 'before it has read the log');
+  await b.sync();
+  net.reset();
+  assert.equal(b.engine.position(), 2);
+  assert.deepEqual([net.stats.get, net.stats.list], [0, 0]);
+  await commit(a, '3\n');
+  assert.equal(await beat(b), 3, 'the look before writing it brought the newest in');
+  assert.equal(b.engine.position(), 3);
 });
 
 test('how long ago, in words', () => {
@@ -272,10 +291,12 @@ test('the words and tone for each state', () => {
   assert.equal(statusText(current, now), 'Up to date');
   assert.equal(statusTone(current), 'ok');
 
-  const behind = (n: number) => device({ state: 'behind', behind: n });
-  assert.equal(statusText(behind(1), now), '1 change behind');
-  assert.equal(statusText(behind(2), now), '2 changes behind');
-  assert.equal(statusText(behind(12), now), '12 changes behind');
+  const behind = (n: number, ago = 0) => device({ state: 'behind', behind: n, lastSeen: now - ago });
+  assert.equal(statusText(behind(1), now), '1 change behind just now');
+  assert.equal(statusText(behind(2, 59_000), now), '2 changes behind just now');
+  assert.equal(statusText(behind(12, MINUTE), now), '12 changes behind, as of 1 minute ago');
+  assert.equal(statusText(behind(3, 12 * MINUTE), now), '3 changes behind, as of 12 minutes ago');
+  assert.equal(statusText(behind(3, 2 * DAY), now), '3 changes behind, as of 2 days ago');
   assert.equal(statusTone(behind(1)), 'warning');
 
   const quiet = (days: number) => device({ state: 'quiet', behind: 4, lastSeen: now - days * DAY - HOUR });

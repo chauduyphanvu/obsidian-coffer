@@ -1,17 +1,19 @@
 import { existsSync } from 'node:fs';
-import { readFile, realpath } from 'node:fs/promises';
+import { mkdir, readFile, readdir, realpath } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { pool } from '../core/bytes.ts';
 import { DEFAULT_CONFIG, compileExcludes, resolveConfig, type SyncConfig } from '../core/config.ts';
 import { MIN_PASSPHRASE } from '../core/crypto.ts';
-import { heartbeatDue, writeHeartbeat } from '../core/devices.ts';
-import { HistoryError, PassphraseUnknownError, RemovedError, SafetyError, SyncEngine, UnverifiedError, type SyncOptions, type SyncResult } from '../core/engine.ts';
-import { vaultKey } from '../core/paths.ts';
+import { agoText, heartbeatDue, listDevices, statusText, writeHeartbeat, type Beat } from '../core/devices.ts';
+import { HistoryError, PassphraseUnknownError, RemovedError, SafetyError, SyncEngine, UnverifiedError, type RepoView, type SyncOptions, type SyncResult } from '../core/engine.ts';
+import { conflictOriginal, vaultKey } from '../core/paths.ts';
 import { Repo } from '../core/repo.ts';
 import { errorText, plural } from '../core/text.ts';
-import { TooOldError, listCommits, listDeleted, planRestore, tableAt } from '../core/timeline.ts';
+import { TooOldError, listActivity, listCommits, listDeleted, planRestore, tableAt, type Activity, type PastVault } from '../core/timeline.ts';
 import type { RemoteStore } from '../core/types.ts';
-import { changesOf, preparePublish, publishPrepared, summaryLines } from '../publish/publish.ts';
+import { changesOf, preparePublish, publishPrepared, summaryLines, type Prepared } from '../publish/publish.ts';
+import { activityRows, whoLabel, type Self } from '../plugin/activity.ts';
 import { applyRestore, countSteps, deleteLimitCrossed, keepDeferred, keepOut, leftNote, restoreSteps, sizeLabel, unsent } from '../plugin/restore.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { MemoryStore } from '../stores/memory.ts';
@@ -27,14 +29,22 @@ declare const COFFER_VERSION: string | undefined;
 /** Where a vault is stored or a website goes, with the secrets left out: they come from the environment. */
 type SiteRemote = ({ type: 's3' } & Omit<S3Config, 'accessKey' | 'secretKey'>) | { type: 'webdav'; url: string; username: string } | { type: 'folder'; path: string };
 
+/** Where `publish` puts the website: the notes marked to be published, as pages anyone with the address can read. `home` is the note that is the front page. */
+interface SiteConfig {
+  remote: SiteRemote;
+  title?: string;
+  home?: string;
+  whole?: boolean;
+  exclude?: string[];
+}
+
 interface CliConfig {
   vault: string;
   remote: SiteRemote | { type: 'follow'; url: string };
   /** Set by `join`: the name of a shared folder with members, whose keys are in the state folder's keys file. */
   share?: string;
   sync?: Partial<SyncConfig>;
-  /** Where `publish` puts the website: the notes marked to be published, as pages anyone with the address can read. `home` is the note that is the front page. */
-  site?: { remote: SiteRemote; title?: string; home?: string; whole?: boolean; exclude?: string[] };
+  site?: SiteConfig;
 }
 
 const USAGE = `Usage: node coffer.js <command> [--config=coffer.json]
@@ -54,20 +64,38 @@ const USAGE = `Usage: node coffer.js <command> [--config=coffer.json]
   fetch <path>...        download files that sync.deferAboveMB leaves in storage: set it under "sync" in
                          coffer.json to a size in MB above which files are not downloaded (0, the default,
                          downloads everything); sync lists the ones left, and one fetched syncs like any other
-  watch                  sync, then keep syncing until stopped; --poll=30 seconds between checks for
-                         remote changes, --interval=300 seconds between full syncs
+  watch [--publish]      sync, then keep syncing until stopped; --poll=30 seconds between checks for
+                         remote changes, --interval=300 seconds between full syncs. --publish also publishes
+                         the website, as publish does, after the first sync and after each one that sends or
+                         receives something, with no preview to check first: a note goes public as soon as
+                         it syncs. A publish that fails is said and tried again after the next sync
   check                  test that the remote storage supports everything sync needs
+  status [--json]        say, without syncing or writing anything to storage, whether storage can be reached,
+                         its newest change, how each device keeps up, the files left in storage and the
+                         conflict copies among synced files; exits 1 if storage cannot be reached, a device
+                         disagrees about the sync history, or conflict copies are there. --json prints the
+                         same as one JSON object, whose "ok" says whether all is well
   history <path>         list stored versions of a file
   restore <path> <seq>   write a stored version back into the vault
   deleted [folder]       list deleted files that can still be restored, newest first
   log [--limit=20]       list the times the vault can be restored to, newest first, each after
                          its number
+  activity [--limit=20] [folder]
+                         list the latest changes, newest first: when, who made each (the device, or in a shared
+                         folder with members the member) and the files it added, changed and deleted, and who
+                         was invited, joined or was removed; with a folder, only the changes to files in it
   restore-at <time> [folder] [--dry-run]
                          bring the vault, or one folder, back to how it was at <time> (ISO 8601,
                          like 2026-11-10T14:30, or a number from log, which names that moment even
                          when device clocks disagree); syncs first, prints what changes, changes it,
                          leaving alone any file with changes that sync could not send, and syncs
                          again to send it, no --force needed for the files it removes
+  export <dir> [folder] [--at=<time>]
+                         write every file in storage, or those in one folder, decrypted into <dir> at its path in
+                         the vault and with its modified time, including the files sync.deferAboveMB leaves in
+                         storage; --at takes a time or a number as restore-at does, and writes the files as
+                         they were then. <dir> must be outside the vault and new or empty. Writes nothing to
+                         storage or the vault; exits 1 if some files could not be read, after writing the rest
   verify [--deep]        check the stored data end to end without changing it, including that the data of the
                          earlier versions history offers is still stored; --deep also downloads and checks
                          everything the current files are stored in
@@ -75,7 +103,9 @@ const USAGE = `Usage: node coffer.js <command> [--config=coffer.json]
                          or damaged, so other devices can download those files; --deep also finds
                          damaged data inside packs that are there. Exits 1 if some files could not
                          be repaired, as when this vault does not have them: run it where they are
-  clean                  delete versions older than the retention window from storage
+  clean                  delete versions older than the retention window from storage, and list the files whose
+                         data is missing from storage; exits 1 if the current version of one is: run repair on a
+                         device that has those files
   change-passphrase      re-protect the vault key with COFFER_NEW_PASSPHRASE (8 characters or more), at the
                          cost sync.kdfIterations sets in coffer.json if that is higher than the vault's now
   accept-storage         when sync stops because the history in storage is not the one this device
@@ -101,20 +131,23 @@ its own, never the vault's: COFFER_SITE_ACCESS_KEY and COFFER_SITE_SECRET_KEY fo
 WebDAV; a folder needs none.`;
 
 /** The options that take a value, as `--name=value` or `--name value`; every other option takes none. */
-const VALUED = ['config', 'poll', 'interval', 'limit', 'vault'];
+const VALUED = ['config', 'poll', 'interval', 'limit', 'vault', 'at'];
 
 /** Each command's options besides --config (and --help and --version, which stop any command). */
 const OPTIONS: Record<string, string[]> = {
   join: ['vault'],
   sync: ['force'],
   fetch: [],
-  watch: ['poll', 'interval'],
+  watch: ['poll', 'interval', 'publish'],
   check: [],
+  status: ['json'],
   history: [],
   restore: [],
   deleted: [],
   log: ['limit'],
+  activity: ['limit'],
   'restore-at': ['dry-run'],
+  export: ['at'],
   verify: ['deep'],
   repair: ['deep'],
   clean: [],
@@ -132,6 +165,9 @@ const WRITES: Record<string, string> = {
   'change-passphrase': 'it cannot change the passphrase in storage',
 };
 
+/** What only reads storage and must never write to it, not even the key file of a new vault where storage holds none yet. */
+const LOOKS = new Set(['export', 'status']);
+
 /** What a device that is a member of a shared folder cannot do, as each command's reason. */
 const NOT_FOR_MEMBERS: Record<string, string> = {
   'change-passphrase': 'a device joins it with the keys of an invite and has no passphrase to change',
@@ -148,6 +184,8 @@ const FORCE_HINT = 'to delete them anyway, run sync --force';
 const READ_ONLY_HINT = 'if these keys may only read, set "readOnly": true under "sync" in the config file, so this device only receives';
 const ACCEPT_HINT = 'if storage was put back to a backup or an older copy on purpose, run accept-storage to carry on from it as it is now';
 const WATCH_SETTLE_MS = 3000;
+/** Changes read at a time when activity lists only those in one folder, which may be far apart. */
+const ACTIVITY_PAGE = 100;
 /** Node's names for systems, as the devices list shows them. */
 const SYSTEMS: Record<string, string> = { darwin: 'macOS', win32: 'Windows', linux: 'Linux' };
 
@@ -307,6 +345,23 @@ const didSomething = (r: SyncResult) =>
 const iso = (time: number) => new Date(time).toISOString();
 const STEP = { add: 'bring back', change: 'change', remove: 'remove' } as const;
 
+/** A moment as restore-at and export take it: a number that log prints, or a time in ISO 8601. */
+function momentOf(when: string): number | { seq: number } {
+  const at = /^\d+$/.test(when) ? { seq: Number(when) } : Date.parse(when);
+  if (typeof at === 'number' && Number.isNaN(at)) throw new Error(`"${when}" is not a time; use ISO 8601, like 2026-11-10T14:30, or a number that log prints`);
+  return at;
+}
+
+/** The files in storage at `at`, which `when` was read as. */
+function vaultAt(v: RepoView, at: number | { seq: number }, when: string): Promise<PastVault> {
+  return tableAt(v.repo, v.st.remote, v.st.lastSeq, v.cfg, v.now, at).catch((e: unknown) => {
+    throw e instanceof TooOldError ? new Error(`${when} is too far back; the earliest time that can be restored is ${iso(e.earliest.time)} (number ${e.earliest.seq})`) : e;
+  });
+}
+
+/** The folder `folder` as a prefix of the paths in it, or '' for the whole vault. */
+const prefixOf = (folder: string) => (folder ? `${vaultKey(folder).replace(/\/+$/, '')}/` : '');
+
 /**
  * Brings the vault, or `folder`, back to how it was at `when`: a time, or a moment's number as `log` prints it, which
  * names that moment exactly whatever the clocks of the devices said. Removals first. Syncs first, so edits not yet
@@ -314,8 +369,7 @@ const STEP = { add: 'bring back', change: 'change', remove: 'remove' } as const;
  * that sync could not send is left as it is (see `applyRestore`). With `dry`, only prints the plan.
  */
 async function restoreAt(engine: SyncEngine, fs: NodeFS, when: string, folder: string, dry: boolean): Promise<number> {
-  const at = /^\d+$/.test(when) ? { seq: Number(when) } : Date.parse(when);
-  if (typeof at === 'number' && Number.isNaN(at)) throw new Error(`"${when}" is not a time; use ISO 8601, like 2026-11-10T14:30, or a number that log prints`);
+  const at = momentOf(when);
   if (!dry) {
     const r = await engine.sync();
     report(r, 'synced first: ');
@@ -325,12 +379,10 @@ async function restoreAt(engine: SyncEngine, fs: NodeFS, when: string, folder: s
     }
   }
   const v = await engine.view();
-  const past = await tableAt(v.repo, v.st.remote, v.st.lastSeq, v.cfg, v.now, at).catch((e: unknown) => {
-    throw e instanceof TooOldError ? new Error(`${when} is too far back; the earliest time that can be restored is ${iso(e.earliest.time)} (number ${e.earliest.seq})`) : e;
-  });
+  const past = await vaultAt(v, at, when);
   const kept = await keepDeferred(keepOut(v.cfg.exclude, []), engine);
   const { steps, left } = restoreSteps(planRestore(v.st.remote, past.files, folder), v.st.remote, kept);
-  const scope = folder ? `${vaultKey(folder).replace(/\/+$/, '')}/` : 'the vault';
+  const scope = prefixOf(folder) || 'the vault';
   console.log(`${scope} as of ${iso(past.commit.time)}, synced by ${past.commit.device}:`);
   for (const s of steps) console.log(`  ${STEP[s.kind].padEnd(10)}  ${s.path}`);
   if (left) console.log(leftNote(left));
@@ -395,17 +447,20 @@ const within = (inner: string, outer: string) => {
   return way === '' || (way !== '..' && !way.startsWith(`..${sep}`) && !isAbsolute(way));
 };
 
+/** How the folder `there` stands to the vault `here`, both as `realPath` gives them: that it is the vault, holds it or is inside it, or '' when it is apart. */
+const againstVault = (there: string, here: string) =>
+  within(here, there) ? (there === here ? 'is the vault' : `holds the vault (${here})`) : within(there, here) ? `is inside the vault (${here})` : '';
+
 /**
- * Publishes the notes that say publish: true to the location `cli.site` gives, as the plugin does: shows what would change
- * and, unless `dry`, uploads and deletes as shown. Reads only the vault folder and writes only the location, so no sync key
- * or state is needed or touched, and a folder for a website is never made by a dry run.
+ * Where the website goes, once it is shown to be somewhere it may: not the vault's folder, nor one that holds it or is
+ * inside it, nor where the vault is stored. `dry` never makes a folder that is not there yet.
  */
-async function publish(cli: CliConfig, vault: string, configFile: string, dry: boolean): Promise<number> {
+async function siteLocation(cli: CliConfig, vault: string, configFile: string, dry: boolean): Promise<{ site: SiteConfig; store: RemoteStore }> {
   const { site } = cli;
   if (!site) throw new Error(`config file ${resolve(configFile)} has no "site", which says where the website goes`);
   if (site.remote.type === 'folder') {
     const [there, here] = await Promise.all([realPath(site.remote.path), realPath(vault)]);
-    const how = within(here, there) ? (there === here ? 'is the vault' : `holds the vault (${here})`) : within(there, here) ? `is inside the vault (${here})` : '';
+    const how = againstVault(there, here);
     if (how) throw new Error(`the website's folder must be outside the vault, so nothing was published: ${there} ${how}`);
   }
   // Before the vault's first sync its storage holds no vault.json yet, which is what the upload would refuse it by.
@@ -416,14 +471,29 @@ async function publish(cli: CliConfig, vault: string, configFile: string, dry: b
   if (sameBucket || sameDav || sameFolder) throw new Error('the website must go somewhere other than where the vault is stored, so nothing was published');
   // A folder reads as a location with nothing in it when it is not there yet, and only a real run makes it.
   const store = dry && site.remote.type === 'folder' && !existsSync(resolve(site.remote.path)) ? new MemoryStore() : makeSiteStore(site.remote, !dry);
+  return { site, store };
+}
+
+/** Builds the website from the vault folder and compares it with what `store` holds. Writes nothing. */
+function prepareSite(cli: CliConfig, site: SiteConfig, vault: string, store: RemoteStore): Promise<Prepared> {
   const fs = new NodeFS(vault);
   const configDir = cli.sync?.configDir ?? DEFAULT_CONFIG.configDir;
-  const prepared = await preparePublish({ list: async () => (await fs.list()).map((f) => f.path), read: (path) => fs.read(path) }, store, {
+  return preparePublish({ list: async () => (await fs.list()).map((f) => f.path), read: (path) => fs.read(path) }, store, {
     title: site.title ?? '',
     home: site.home ?? '',
     whole: site.whole ?? false,
     excluded: compileExcludes([...(cli.sync?.exclude ?? DEFAULT_CONFIG.exclude), ...(site.exclude ?? []), `${STATE_DIR}/**`, `${configDir}/**`]),
   });
+}
+
+/**
+ * Publishes the notes that say publish: true to the location `cli.site` gives, as the plugin does: shows what would change
+ * and, unless `dry`, uploads and deletes as shown. Reads only the vault folder and writes only the location, so no sync key
+ * or state is needed or touched, and a folder for a website is never made by a dry run.
+ */
+async function publish(cli: CliConfig, vault: string, configFile: string, dry: boolean): Promise<number> {
+  const { site, store } = await siteLocation(cli, vault, configFile, dry);
+  const prepared = await prepareSite(cli, site, vault, store);
   for (const line of summaryLines(prepared)) console.log(line);
   if (dry) {
     console.log('dry run: nothing was uploaded or deleted');
@@ -433,6 +503,119 @@ async function publish(cli: CliConfig, vault: string, configFile: string, dry: b
   await publishPrepared(store, prepared);
   console.log(`published to ${describeRemote(site.remote)}`);
   return 0;
+}
+
+/**
+ * Writes the files in storage, or those in `folder`, decrypted into `dir` at their paths in the vault, each with its
+ * modified time: as storage holds them now, or with `when`, as they were then. Only into a new or empty folder apart from
+ * the vault, so nothing there or anywhere else is overwritten. A few files at a time, so memory stays flat; one that
+ * cannot be read is named, and the others are written all the same.
+ */
+async function exportTo(engine: SyncEngine, vault: string, dir: string, folder: string, when: string | undefined): Promise<number> {
+  const asked = when === undefined ? undefined : { when, at: momentOf(when) };
+  const [there, here] = await Promise.all([realPath(dir), realPath(vault)]);
+  const how = againstVault(there, here);
+  if (how) throw new Error(`the folder to export to must be outside the vault, so nothing was exported: ${there} ${how}`);
+  const held = await readdir(there).catch((e: NodeJS.ErrnoException) => {
+    if (e.code === 'ENOENT') return [];
+    throw e;
+  });
+  if (held.length) throw new Error(`${there} is not empty, so nothing was exported: export writes only into a new or empty folder`);
+  const v = await engine.view();
+  const past = asked && (await vaultAt(v, asked.at, asked.when));
+  const prefix = prefixOf(folder);
+  const files = [...(past ? past.files : v.st.remote)].filter(([path]) => path.startsWith(prefix));
+  const asOf = past ? ` as of ${iso(past.commit.time)}` : '';
+  if (prefix && !files.length) throw new Error(`no file in storage is in ${prefix}${asOf}, so nothing was exported`);
+  await mkdir(there, { recursive: true });
+  const out = new NodeFS(there);
+  const failed: { path: string; message: string }[] = [];
+  let bytes = 0;
+  await pool(files, v.cfg.concurrency, async ([path, entry]) => {
+    try {
+      // The paths come from storage: one that would lead out of the folder is never written.
+      if (path.split(/[\\/]/).some((part) => !part || part === '.' || part === '..')) throw new Error('not a path inside the folder');
+      const data = await engine.readVersion(entry);
+      await out.write(path, data, entry.mtime);
+      bytes += data.length;
+    } catch (e) {
+      failed.push({ path, message: errorText(e) });
+    }
+  });
+  for (const f of failed.sort((a, b) => (a.path < b.path ? -1 : 1))) console.error(`failed: ${f.path}: ${f.message}`);
+  console.log(`exported ${plural(files.length - failed.length, 'file')} (${sizeLabel(bytes)}) of ${prefix || 'the vault'}${asOf} to ${there}`);
+  return failed.length ? 1 : 0;
+}
+
+/** Who made a change, as history, log, deleted and status say it: where it is signed, as the plugin names people; elsewhere its device. */
+const namer = (self: Self) => (c: { seq: number; device: string; signer?: string }) => (c.signer ? whoLabel(c, self) : c.device);
+
+/**
+ * What an unattended device needs watched, without syncing or writing anything to storage: whether storage can be read,
+ * its newest change, how each device keeps up (as the plugin's Devices list says it, unless `noDevices` says why not),
+ * the files left in storage, and the conflict copies among the files sync sees. 1 when storage cannot be read, a device disagrees
+ * about the sync history, or conflict copies are there; one that is behind or quiet is only reported, as a phone that
+ * is switched off often is.
+ */
+async function status(engine: SyncEngine, fs: NodeFS, where: string, noDevices: string, selfOf: (v: RepoView) => Self, json: boolean): Promise<number> {
+  let read;
+  try {
+    const v = await engine.view();
+    const [newest] = v.st.lastSeq ? await listCommits(v.repo, v.st.lastSeq, v.cfg, v.now, { limit: 1 }) : [];
+    read = { v, newest, devices: noDevices ? undefined : await listDevices(v), left: await engine.deferred() };
+  } catch (e) {
+    const error = errorText(e);
+    if (json) console.log(JSON.stringify({ ok: false, storage: { reachable: false, where, error } }, null, 2));
+    else console.log(`storage: not reachable, ${where}: ${error}`);
+    return 1;
+  }
+  const { v, newest, devices, left } = read;
+  const by = newest && namer(selfOf(v))(newest);
+  // Only those sync would look at: a copy deleted to Obsidian's .trash is done with.
+  const copies = (await fs.list()).map((f) => f.path).filter((path) => conflictOriginal(path) !== path && !engine.ignores(path)).sort();
+  const problems = [
+    ...(devices ?? []).filter((d) => d.state === 'diverged').map((d) => `${d.name} disagrees about the sync history`),
+    ...(copies.length ? [plural(copies.length, 'conflict copy', 'conflict copies')] : []),
+  ];
+  if (json) {
+    const report = {
+      ok: !problems.length,
+      storage: { reachable: true, where },
+      newest: newest ? { seq: newest.seq, time: iso(newest.time), by } : null,
+      devices:
+        devices?.map((d) => ({
+          name: d.name,
+          thisDevice: d.isSelf,
+          platform: d.platform,
+          version: d.version,
+          state: d.state,
+          status: statusText(d, v.now),
+          lastSeen: iso(d.lastSeen),
+          ago: agoText(v.now - d.lastSeen),
+          behind: d.behind,
+        })) ?? null,
+      ...(noDevices && { devicesNote: noDevices }),
+      leftInStorage: left,
+      conflictCopies: copies.map((path) => ({ path, of: conflictOriginal(path) })),
+    };
+    console.log(JSON.stringify(report, null, 2));
+    return problems.length ? 1 : 0;
+  }
+  console.log(`storage: reachable, ${where}`);
+  console.log(`newest change: ${newest ? `number ${newest.seq}, ${iso(newest.time)}, by ${by}` : 'none yet'}`);
+  if (!devices) console.log(`devices: ${noDevices}`);
+  else if (!devices.length) console.log('devices: none has reported yet; each appears after its next sync');
+  else console.log('devices:');
+  for (const d of devices ?? []) {
+    const about = [d.platform, d.version && `v${d.version}`].filter(Boolean).join(' ');
+    console.log(`  ${d.name}${d.isSelf ? ' (this device)' : ''}${about ? `, ${about}` : ''}, last synced ${agoText(v.now - d.lastSeen)}: ${statusText(d, v.now)}`);
+  }
+  console.log(`files left in storage: ${left.length ? `${left.length}, which fetch downloads` : 'none'}`);
+  for (const f of left) console.log(`  ${f.path} (${sizeLabel(f.size)})`);
+  console.log(`conflict copies: ${copies.length || 'none'}`);
+  for (const path of copies) console.log(`  ${path}`);
+  console.log(problems.length ? `needs attention: ${problems.join(', ')}` : 'all is well');
+  return problems.length ? 1 : 0;
 }
 
 async function readStdin(): Promise<string> {
@@ -515,6 +698,9 @@ async function main(): Promise<number> {
   const vault = resolve(cli.vault);
   // Before anything that needs the vault's keys, state or passphrase: publishing has no use for them, and none of it may be made or changed here.
   if (command === 'publish') return publish(cli, vault, configFile, flags.has('dry-run'));
+  // Watching that publishes goes only where publish would, which is known before the first sync.
+  const site = command === 'watch' && flags.has('publish') ? await siteLocation(cli, vault, configFile, false) : undefined;
+  const looks = LOOKS.has(command);
   const stateFile = join(vault, STATE_DIR, STATE_FILE);
   const keysFile = join(vault, STATE_DIR, KEYS_FILE);
   // A shared folder with members: its keys are in a file of their own. A device without a signing key (a reader, a follower) only receives.
@@ -536,7 +722,7 @@ async function main(): Promise<number> {
     console.error(`this device only receives changes, so ${WRITES[command]}; run ${command} from a device that sends them`);
     return 1;
   }
-  let store = makeStore(cli.remote, !existsSync(stateFile), member?.storage);
+  let store = makeStore(cli.remote, !existsSync(stateFile) && !looks, member?.storage);
 
   if (command === 'check') {
     const report = await checkStore(store, receivesOnly);
@@ -546,7 +732,7 @@ async function main(): Promise<number> {
 
   const passphrase = member ? '' : env('COFFER_PASSPHRASE');
   // Opening empty storage makes a vault, so a short passphrase is refused there. Only a short one pays the request to look.
-  if (passphrase.length < MIN_PASSPHRASE && !member && !receivesOnly && !(await Repo.exists(store))) {
+  if (passphrase.length < MIN_PASSPHRASE && !member && !receivesOnly && !looks && !(await Repo.exists(store))) {
     throw new Error(`a new vault needs a passphrase of at least ${MIN_PASSPHRASE} characters, and COFFER_PASSPHRASE has ${passphrase.length}`);
   }
   const fs = new NodeFS(vault);
@@ -560,6 +746,7 @@ async function main(): Promise<number> {
         deviceName: hostname().split('.')[0],
         ...cli.sync,
         ...(member && { readOnly: receivesOnly }),
+        ...(looks && { readOnly: true }),
         // A custom list replaces the defaults, but this device's own state must never sync.
         exclude: [...(cli.sync?.exclude ?? DEFAULT_CONFIG.exclude), `${STATE_DIR}/**`],
       }),
@@ -607,7 +794,8 @@ async function main(): Promise<number> {
     await noteStanding();
     return r;
   };
-  if (command !== 'watch') await switchKeys();
+  // Trying new storage keys writes to storage, which looking never does.
+  if (command !== 'watch' && !looks) await switchKeys();
   // A writing device the owner has not confirmed yet, or has removed, sends nothing: what would write, or would never be sent, is refused as on a device set to only receive.
   if (member?.member.key && WRITES[command] && !(command === 'restore-at' && flags.has('dry-run'))) {
     const standing = await engine.memberStanding();
@@ -619,13 +807,23 @@ async function main(): Promise<number> {
     }
   }
 
-  const heartbeat = async () => {
+  /** Who this device is in the history, to name people as the plugin does: its member in a shared folder with members, and its name. */
+  const selfOf = (v: RepoView): Self => ({ member: member?.member.id, device: v.cfg.deviceName, changes: v.st.members });
+  const limitOf = () => {
+    const limit = flags.has('limit') ? Number(flags.get('limit')) : 20;
+    if (!Number.isInteger(limit) || limit < 1) throw new Error('--limit must be a whole number above 0');
+    return limit;
+  };
+
+  /** Resolves to the newest commit the heartbeat gave, undefined when none was written. */
+  const heartbeat = async (): Promise<number | undefined> => {
     // Nothing is written into a shared folder with members that other people read, as in the plugin.
-    if (receivesOnly || member) return;
+    if (receivesOnly || member) return undefined;
     try {
-      await writeHeartbeat(await engine.view(), { platform: `CLI on ${SYSTEMS[process.platform] ?? process.platform}`, version: await version() });
+      return await writeHeartbeat(await engine.view(), { platform: `CLI on ${SYSTEMS[process.platform] ?? process.platform}`, version: await version() });
     } catch (e) {
       console.error(`could not record this device's heartbeat: ${errorText(e)}`);
+      return undefined;
     }
   };
 
@@ -644,18 +842,36 @@ async function main(): Promise<number> {
     const pollMs = seconds('poll', 30);
     const intervalMs = seconds('interval', 300);
     const stamp = () => new Date().toISOString();
-    let lastBeat = 0;
+    let lastBeat: Beat | undefined;
     let lastLeft = new Set<string>();
     let removed = false;
     let leave = () => {};
+    // Whether the next sync publishes even if it changes nothing: the first does, and the one after a publish failed.
+    let publishDue = true;
+    // What the publish after a sync said, to print after that sync's own lines; `error` lines go to standard error.
+    let published: { line: string; error?: boolean }[] = [];
+    const publishNow = async (to: { site: SiteConfig; store: RemoteStore }) => {
+      try {
+        const prepared = await prepareSite(cli, to.site, vault, to.store);
+        if (!changesOf(prepared).nothing) {
+          published = summaryLines(prepared).map((line) => ({ line }));
+          await publishPrepared(to.store, prepared);
+          published.push({ line: `published to ${describeRemote(to.site.remote)}` });
+        }
+        publishDue = false;
+      } catch (e) {
+        published.push({ line: `publishing failed: ${errorText(e)}; trying again after the next sync`, error: true });
+        publishDue = true;
+      }
+    };
     const loop = new SyncLoop({
       sync: async () => {
         await switchKeys();
         const r = await syncNow();
-        if (heartbeatDue(lastBeat, Date.now())) {
-          lastBeat = Date.now();
-          await heartbeat();
-        }
+        const seq = engine.position();
+        if (heartbeatDue(lastBeat, Date.now(), seq)) lastBeat = { time: Date.now(), seq: (await heartbeat()) ?? seq };
+        // Here, not after: the loop never starts a sync before this returns, so a publish overlaps neither a sync nor another publish.
+        if (site && (publishDue || didSomething(r))) await publishNow(site);
         return r;
       },
       remoteChanged: () => engine.remoteChanged(),
@@ -666,6 +882,8 @@ async function main(): Promise<number> {
         lastLeft = new Set(left);
         if (didSomething(r)) report(r, `${stamp()} `, fresh);
         else for (const line of fresh) console.error(`${stamp()} ${line}`);
+        for (const { line, error } of published) (error ? console.error : console.log)(`${stamp()} ${line}`);
+        published = [];
       },
       onFailure: (e, retryMs) => {
         const message = errorText(e);
@@ -696,6 +914,12 @@ async function main(): Promise<number> {
       `${stamp()} watching ${vault} against ${describeRemote(cli.remote)}${receivesOnly ? ', receive only' : ''}; ` +
         `checking for changes every ${pollMs / 1000}s and syncing everything every ${intervalMs / 1000}s`,
     );
+    if (site) {
+      console.log(
+        `${stamp()} publishing the website to ${describeRemote(site.site.remote)} after the first sync and after each one that changes something, with no preview to check first: ` +
+          (site.site.whole ? 'the whole vault is published, so every note, a new one too, goes public unless it says publish: false' : 'every note that says publish: true goes public'),
+      );
+    }
     loop.start();
     await signalled;
     watcher.close();
@@ -713,14 +937,51 @@ async function main(): Promise<number> {
     report(r);
     return r.errors.length ? 1 : 0;
   }
+  if (command === 'status') {
+    const noDevices =
+      cli.remote.type === 'follow'
+        ? 'not listed for a followed folder, which cannot be listed'
+        : member
+          ? 'not listed for a shared folder with members, where devices do not record how far they have got'
+          : '';
+    return status(engine, fs, describeRemote(cli.remote), noDevices, selfOf, flags.has('json'));
+  }
+  if (command === 'export' && rest[0]) return exportTo(engine, vault, rest[0], rest[1] ?? '', flags.get('at'));
+  if (command === 'activity') {
+    const limit = limitOf();
+    const v = await engine.view();
+    const prefix = prefixOf(rest[0] ?? '');
+    const inside = (path: string) => path.startsWith(prefix);
+    // With a folder, only the changes to files in it, each with those files alone: pages are read until there are enough.
+    const items: Activity[] = [];
+    for (let beforeSeq: number | undefined; items.length < limit; ) {
+      const page = await listActivity(v.repo, v.st.lastSeq, v.cfg, { limit: prefix ? Math.max(limit, ACTIVITY_PAGE) : limit, beforeSeq });
+      for (const a of page.items) {
+        const only = { ...a, added: a.added.filter(inside), changed: a.changed.filter(inside), deleted: a.deleted.filter(inside) };
+        if (!prefix || only.added.length + only.changed.length + only.deleted.length) items.push(only);
+      }
+      if (page.next === undefined) break;
+      beforeSeq = page.next;
+    }
+    for (const r of activityRows(items.slice(0, limit), selfOf(v))) {
+      if (!r.who) {
+        console.log(`${iso(r.time)}  ${r.text}`);
+        continue;
+      }
+      console.log(`${iso(r.time)}  ${r.who.padEnd(16)} ${r.text}`);
+      for (const f of r.files) console.log(`  ${f.kind.padEnd(7)}  ${f.path}`);
+    }
+    return 0;
+  }
   if (command === 'history' && rest[0]) {
     const versions = await engine.history(vaultKey(rest[0]));
     if (!versions.length) {
       console.error(`no stored versions of ${rest[0]}`);
       return 1;
     }
+    const by = namer(selfOf(await engine.view()));
     for (const v of versions) {
-      console.log(`${String(v.seq).padStart(6)}  ${new Date(v.time).toISOString()}  ${v.device.padEnd(16)} ${v.entry ? `${v.entry.size} bytes` : 'deleted'}`);
+      console.log(`${String(v.seq).padStart(6)}  ${new Date(v.time).toISOString()}  ${by(v).padEnd(16)} ${v.entry ? `${v.entry.size} bytes` : 'deleted'}`);
     }
     return 0;
   }
@@ -739,15 +1000,16 @@ async function main(): Promise<number> {
   }
   if (command === 'deleted') {
     const v = await engine.view();
-    for (const d of await listDeleted(v.repo, v.st.lastSeq, v.cfg, v.now, rest[0] ?? '')) console.log(`${iso(d.time)}  ${d.device.padEnd(16)} ${d.path}`);
+    const by = namer(selfOf(v));
+    for (const d of await listDeleted(v.repo, v.st.lastSeq, v.cfg, v.now, rest[0] ?? '')) console.log(`${iso(d.time)}  ${by(d).padEnd(16)} ${d.path}`);
     return 0;
   }
   if (command === 'log') {
-    const limit = flags.has('limit') ? Number(flags.get('limit')) : 20;
-    if (!Number.isInteger(limit) || limit < 1) throw new Error('--limit must be a whole number above 0');
+    const limit = limitOf();
     const v = await engine.view();
+    const by = namer(selfOf(v));
     for (const c of await listCommits(v.repo, v.st.lastSeq, v.cfg, v.now, { limit })) {
-      console.log(`${String(c.seq).padStart(6)}  ${iso(c.time)}  ${c.device.padEnd(16)} ${c.added} added, ${c.changed} changed, ${c.deleted} deleted`);
+      console.log(`${String(c.seq).padStart(6)}  ${iso(c.time)}  ${by(c).padEnd(16)} ${c.added} added, ${c.changed} changed, ${c.deleted} deleted`);
     }
     return 0;
   }
@@ -805,7 +1067,11 @@ async function main(): Promise<number> {
       );
     }
     if (!deleted.length && !r.packsCombined) console.log('nothing to clean: no stored version has expired, and no pack is worth combining');
-    return 0;
+    for (const path of r.missing) console.error(`missing from storage: ${path}`);
+    for (const path of r.missingEarlier) console.log(`earlier versions of ${path} cannot be restored`);
+    if (!r.missing.length) return 0;
+    console.error(`run repair on a device that has ${r.missing.length === 1 ? 'this file' : 'these files'}, to store ${r.missing.length === 1 ? 'its' : 'their'} data again`);
+    return 1;
   }
   if (command === 'accept-storage') {
     await engine.acceptStorage();

@@ -416,11 +416,12 @@ test('site keys: a note becomes its path with .html, a file keeps its path, and 
     'Q&A/Why? #1 100%.md': pub('[[Top]]'),
   });
   assert.deepEqual(keys(site), ['Folder/Side.html', 'Folder/Sub/Note.html', 'Pics/Pic 1.png', 'Q&A/Why? #1 100%.html', 'Top.html', 'index.html', 'site.css']);
+  // Each page's links, then the pages that link to it.
   const note = page(site, 'Folder/Sub/Note.html');
-  assert.deepEqual(hrefs(note), ['../../site.css', '../../index.html', '../../Top.html', '../Side.html', '../../Pics/Pic%201.png', 'Note.html', '#Here', '../../Top.html#A-b']);
-  assert.deepEqual(hrefs(mainOf(page(site, 'Top.html'))), ['Folder/Sub/Note.html']);
+  assert.deepEqual(hrefs(note), ['../../site.css', '../../index.html', '../../Top.html', '../Side.html', '../../Pics/Pic%201.png', 'Note.html', '#Here', '../../Top.html#A-b', '../Side.html', '../../Top.html']);
+  assert.deepEqual(hrefs(mainOf(page(site, 'Top.html'))), ['Folder/Sub/Note.html', 'Folder/Sub/Note.html', 'Q%26A/Why%3F%20%231%20100%25.html']);
   // Side links [[Note]]: no Note.md at the top or beside it, so the one anywhere in the vault.
-  assert.deepEqual(hrefs(mainOf(page(site, 'Folder/Side.html'))), ['Sub/Note.html']);
+  assert.deepEqual(hrefs(mainOf(page(site, 'Folder/Side.html'))), ['Sub/Note.html', 'Sub/Note.html']);
   assert.deepEqual(hrefs(page(site, 'Q&A/Why? #1 100%.html')), ['../site.css', '../index.html', '../Top.html']);
   assert.ok(page(site, 'index.html').includes('<a href="Q%26A/Why%3F%20%231%20100%25.html">Why? #1 100%</a>'));
 });
@@ -669,6 +670,111 @@ test('front page list: folders first, then pages, each by name ignoring letter c
   assert.equal(mainOf(page(empty, 'index.html')), '<h1 class="title">Notes</h1>\n<p class="empty">Nothing has been published here yet.</p>');
   assert.ok(page(empty, 'index.html').includes('<title>Notes</title>'));
   assert.deepEqual(empty.report, { pages: [], attachments: [], unpublished: [], missing: [], whole: false, homeNotFound: '', leftOut: [] });
+});
+
+// What links to a page.
+
+/** The "Linked from" list that ends a page, as [address, title as written in the HTML], in its order; null when the page ends with its article. */
+function linkedFrom(html: string): [string, string][] | null {
+  const main = mainOf(html);
+  const m = /\n<\/article>\n<nav class="backlinks">\n<h2>Linked from<\/h2>\n<ul>\n((?:<li><a href="[^"]*">[^<]*<\/a><\/li>\n)+)<\/ul>\n<\/nav>$/.exec(main);
+  if (m) return [...m[1].matchAll(/<li><a href="([^"]*)">([^<]*)<\/a><\/li>/g)].map((x) => [x[1], x[2]]);
+  assert.ok(main.endsWith('\n</article>') && !main.includes('backlinks'), main);
+  return null;
+}
+
+test('linked from: a page ends with the published pages that link to it or show it, each once, with an address from its folder', async () => {
+  const vault = new MapVault({
+    'Notes/A.md': pub('See [[Projects/Deep/B]], [[B|again]], [the same](../Projects/Deep/B.md#top) and [[B#Bee]].'),
+    'Projects/Deep/B.md': pub('# Bee\n\nHere: [[B]], [[#Bee]], [[Projects/Deep/B#Bee]] and ![[B]].'),
+    'Projects/Shows.md': pub('![[B]] ![[gone.png]]'),
+    'Projects/Commented.md': pub('%%[[B]]%%\n\n<!-- [[B]] ![[B]] -->\n\nNothing else.'),
+    'Notes/Lone.md': pub('No page links here.'),
+    'Private.md': '[[Projects/Deep/B]] [[Notes/Lone]]',
+    'Off.md': '---\npublish: false\n---\n[[Projects/Deep/B]]',
+    'Kept/Out.md': pub('[[Projects/Deep/B]]'),
+    'Notes/A (conflict laptop 20260102-150405).md': pub('[[Projects/Deep/B]] [[Notes/Lone]]'),
+    'gone.png': 'G',
+  });
+  // Shows is rendered again once its picture can not be read: what links to B is taken from that last rendering.
+  vault.broken.add('gone.png');
+  const site = await buildSite(vault, opts({ excluded: (k) => k.startsWith('Kept/') }));
+  assert.deepEqual(site.report.missing, [{ from: 'Projects/Shows.md', link: 'gone.png' }]);
+  // Not the notes that are not on the site, not B itself, not a comment: A by its links, Shows by what it shows.
+  assert.deepEqual(linkedFrom(page(site, 'Projects/Deep/B.html')), [
+    ['../../Notes/A.html', 'A'],
+    ['../Shows.html', 'Shows'],
+  ]);
+  assert.ok(page(site, 'Projects/Commented.html').includes('<p>Nothing else.</p>'));
+  for (const key of ['Notes/A.html', 'Notes/Lone.html', 'Projects/Shows.html', 'Projects/Commented.html']) assert.equal(linkedFrom(page(site, key)), null, key);
+  assert.ok(!page(site, 'index.html').includes('backlinks'));
+  assert.match(THEME, /\nnav\.backlinks h2 \{/);
+});
+
+test('linked from: by title, letter case aside and a number by its value, then by address; every title escaped', async () => {
+  const site = await build({
+    'Target.md': pub('Where they all lead.'),
+    'Note 10.md': pub('[[Target]]'),
+    'Note 2.md': pub('[[Target]]'),
+    'Other/Note 2.md': pub('[[Target]]'),
+    'note 1.md': pub('[[Target]]'),
+    'z.md': pub('[[Target]]', 'title: Note 3\n'),
+    'Sub/alpha.md': pub('[[Target]]'),
+    'Beta.md': pub('[[Target]]', 'title: <Beta> & "co"\n'),
+  });
+  assert.deepEqual(linkedFrom(page(site, 'Target.html')), [
+    ['Beta.html', '&lt;Beta&gt; &amp; &quot;co&quot;'],
+    ['Sub/alpha.html', 'alpha'],
+    ['note%201.html', 'note 1'],
+    ['Note%202.html', 'Note 2'],
+    ['Other/Note%202.html', 'Note 2'],
+    ['z.html', 'Note 3'],
+    ['Note%2010.html', 'Note 10'],
+  ]);
+});
+
+test('linked from: the front page has none of its own, and a page the front page links to lists it as index.html', async () => {
+  const site = await build(
+    {
+      'Home.md': pub('Start at [[Guide]] or [[Deep/Page]].', 'title: Welcome\n'),
+      'Guide.md': pub('Back to [[Home]], on to [[Page]].'),
+      'Deep/Page.md': pub('Back to [[Home]].'),
+    },
+    { home: 'Home' },
+  );
+  assert.ok(!page(site, 'index.html').includes('backlinks'));
+  assert.deepEqual(linkedFrom(page(site, 'Guide.html')), [['index.html', 'Welcome']]);
+  assert.deepEqual(linkedFrom(page(site, 'Deep/Page.html')), [
+    ['../Guide.html', 'Guide'],
+    ['../index.html', 'Welcome'],
+  ]);
+});
+
+test('linked from: the same vault gives the same bytes, whatever order it is listed in and reads finish in', async () => {
+  const entries: [string, string][] = [
+    ['Hub.md', pub('[[A]] [[B]] [[C]]')],
+    ['A.md', pub('[[Hub]] [[B]]')],
+    ['B.md', pub('[[Hub]] ![[A]]', 'title: Same\n')],
+    ['C.md', pub('[[Hub]]', 'title: Same\n')],
+    ['Sub/Same.md', pub('[[Hub]] [[A]]')],
+  ];
+  const first = await buildSite(new MapVault(new Map(entries)), opts());
+  const reversed = new MapVault(new Map([...entries].reverse()));
+  reversed.delay = (path) => (path.length * 7) % 13;
+  const second = await buildSite(reversed, opts());
+  assert.deepEqual(keys(first), keys(second));
+  for (const [key, f] of first.files) assert.deepEqual(second.files.get(key), f, key);
+  assert.deepEqual(linkedFrom(page(first, 'Hub.html')), [
+    ['A.html', 'A'],
+    ['B.html', 'Same'],
+    ['C.html', 'Same'],
+    ['Sub/Same.html', 'Same'],
+  ]);
+  assert.deepEqual(linkedFrom(page(first, 'A.html')), [
+    ['Hub.html', 'Hub'],
+    ['B.html', 'Same'],
+    ['Sub/Same.html', 'Same'],
+  ]);
 });
 
 test('determinism: the same vault gives the same bytes, whatever order it is listed in and reads finish in', async () => {

@@ -16,6 +16,7 @@ import { confirmStopSharing, downloadAgain, renderShares } from './sharing.ts';
 import { SendSuggestionModal } from './inbox.ts';
 import { sentNote } from './suggestions.ts';
 import { isConflictProblem, isUnsentProblem, leftInStorage, passphraseFailure, quietText, type Problem } from './status.ts';
+import { RepairModal } from './timemachine.ts';
 import { button, buttonRow, field, message, openLink, passphraseFields, statusLine } from './ui.ts';
 
 type SecretKey = 'accessKeySecret' | 'secretKeySecret' | 'passphraseSecret' | 'webdavPasswordSecret';
@@ -566,6 +567,10 @@ export class ProblemsModal extends Modal {
       case 'whats-shared':
         if (!share) break;
         button(row, "What's shared", () => new WhatsSharedModal(this.app, plugin, share).open(), 'cta');
+        break;
+      case 'repair':
+        if (plugin.receivesOnly(share)) break;
+        button(row, 'Repair from this device', () => new RepairModal(this.app, plugin, share, false).open(), 'cta');
         break;
     }
     if (share && isUnsentProblem(p) && plugin.canSuggest(share)) {

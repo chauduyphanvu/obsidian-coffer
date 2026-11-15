@@ -38,6 +38,8 @@ export interface Share extends Storage {
   folder: string;
   lastSuccess: number;
   lastCleanup: number;
+  /** What the last cleanup found missing from storage, as paths inside the folder: see `Settings.lost`. */
+  lost: Lost;
   /** Conflict copies made here that still exist, as paths inside the folder. */
   conflictCopies: string[];
   /** Files a restore removed here, by path inside the folder, until a sync deletes them from storage as confirmed. */
@@ -81,6 +83,12 @@ export interface Share extends Storage {
   ask: string[];
 }
 
+/** Files whose data storage no longer holds (`GcResult.missing`, `missingEarlier`): for their current version, or only for earlier ones. */
+export interface Lost {
+  current: string[];
+  earlier: string[];
+}
+
 /** Where this vault's website goes and what it is called. Its location is never the vault's own storage: pages are stored there as they are, readable by anyone. */
 export interface SiteSettings {
   storageType: 's3' | 'webdav';
@@ -119,6 +127,11 @@ export interface Settings extends Storage {
   /** Expired versions are removed this often. 0 leaves it to the manual command. */
   autoCleanDays: number;
   lastCleanup: number;
+  /**
+   * What the last cleanup found missing from storage, kept across restarts so it stays on the problem list until a
+   * cleanup or a repair finds it whole again.
+   */
+  lost: Lost;
   syncConfigDir: boolean;
   exclude: string;
   conflictStrategy: 'merge' | 'copy';
@@ -187,6 +200,7 @@ export function defaultSettings(isMobile: boolean): Settings {
     pollSeconds: 30,
     autoCleanDays: 7,
     lastCleanup: 0,
+    lost: { current: [], earlier: [] },
     syncConfigDir: true,
     exclude: '',
     conflictStrategy: DEFAULT_CONFIG.conflictStrategy,
@@ -224,7 +238,7 @@ const STORAGE_DEFAULTS: Storage = {
 /** A share with every field present, as saved by any version. */
 export function shareWith(fields: Partial<Share> & Pick<Share, 'id' | 'folder'>): Share {
   return {
-    ...STORAGE_DEFAULTS, lastSuccess: 0, lastCleanup: 0, conflictCopies: [], restored: [], missing: false, vaultCopies: [], role: '', memberKeysSecret: '', followUrl: '', offerPending: '', suggested: [],
+    ...STORAGE_DEFAULTS, lastSuccess: 0, lastCleanup: 0, lost: { current: [], earlier: [] }, conflictCopies: [], restored: [], missing: false, vaultCopies: [], role: '', memberKeysSecret: '', followUrl: '', offerPending: '', suggested: [],
     property: '', removed: [], approved: [], ask: [],
     ...fields,
   };

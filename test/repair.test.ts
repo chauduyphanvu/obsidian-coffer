@@ -426,3 +426,98 @@ test('verify\'s look at earlier versions costs a list, a read of the pruned mark
   assert.equal(net.stats.put + net.stats.delete, 0, 'a missing digest is not written back by a check');
   assert.equal(mem.objects.has(digest), false);
 });
+
+test('cleanup names the files whose current version needs data deleted from storage, as verify does', async () => {
+  const { devices: [a], mem } = await twoPacks(setup(['A']));
+  const pack = await packOf(a, 'a.bin');
+  assert.deepEqual(await a.engine.gc(), { packsDeleted: 0, bytesFreed: 0, snapshotsDeleted: 0, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0, missing: [], missingEarlier: [] });
+  mem.objects.delete(pack);
+
+  const r = await a.engine.gc();
+  assert.deepEqual([r.missing, r.missingEarlier], [['a.bin', 'copy of a.bin'], []]);
+  assert.deepEqual((await a.engine.verify()).problems.map((p) => [p.object, p.paths, p.earlier]), [[pack, r.missing, undefined]]);
+  assert.equal(r.packsDeleted, 0, 'what is still stored stays');
+
+  await a.engine.repair();
+  assert.deepEqual((await a.engine.gc()).missing, [], 'once repaired, nothing is missing');
+});
+
+test('cleanup names apart the files only an earlier version of which needs data deleted from storage, and forgets them once history no longer offers it', async () => {
+  const { devices: [a], mem, clock } = setup(['A']);
+  a.fs.put('x', random(3000, 1));
+  await a.sync();
+  const old = await packOf(a, 'x');
+  a.fs.put('x', random(3000, 2));
+  await a.sync();
+  mem.objects.delete(old);
+
+  const r = await a.engine.gc();
+  assert.deepEqual([r.missing, r.missingEarlier], [[], ['x']]);
+  assert.deepEqual((await a.engine.verify()).problems.map((p) => p.earlier), [r.missingEarlier]);
+  clock.now += 40 * DAY;
+  assert.deepEqual((await a.engine.gc()).missingEarlier, []);
+});
+
+test('cleanup whose read of history fails after it has listed the packs still names the current files that need a deleted pack, and finishes', async () => {
+  const env = setup(['A']);
+  const { mem, net, befores } = env;
+  let cleaning = false;
+  let failing = false;
+  let failed = 0;
+  // Once cleanup has listed the packs, every read but of a pack fails, as when the network drops part way through it.
+  befores[0].inner = {
+    get: (k, range) => {
+      if (!failing || k.startsWith('pack/')) return net.get(k, range);
+      failed++;
+      return Promise.reject(new Error('the network is down'));
+    },
+    put: (k, data, opts) => net.put(k, data, opts),
+    delete: (k) => net.delete(k),
+    list: async (prefix, after) => {
+      const out = await net.list(prefix, after);
+      if (cleaning && prefix === 'pack/') failing = true;
+      return out;
+    },
+  };
+  const { devices: [a] } = await twoPacks(env);
+  mem.objects.delete(await packOf(a, 'a.bin'));
+
+  cleaning = true;
+  const r = await a.engine.gc();
+  assert.ok(failed > 0, 'history was read, and failed');
+  assert.deepEqual([r.missing, r.missingEarlier], [['a.bin', 'copy of a.bin'], []]);
+});
+
+test('a pack the listing leaves out is asked for by name, once and for one byte, and is not called missing while storage still holds it', async () => {
+  const clock = { now: 1_800_000_000_000 };
+  const mem = new MemoryStore(() => clock.now);
+  const hidden = new Set<string>();
+  const asked: string[] = [];
+  // A listing that lags behind what storage holds, as an eventually consistent one can.
+  const lagging: RemoteStore = {
+    get: (k, range) => {
+      if (k.startsWith('pack/')) asked.push(`${k} ${range ? `${range.start}-${range.end}` : 'whole'}`);
+      return mem.get(k, range);
+    },
+    put: (k, data, opts) => mem.put(k, data, opts),
+    delete: (k) => mem.delete(k),
+    list: async (prefix, after) => (await mem.list(prefix, after)).filter((o) => !hidden.has(o.key)),
+  };
+  const a = new Device('A', lagging, clock);
+  a.fs.put('a.bin', random(3000, 1));
+  await a.sync();
+  a.fs.put('b.bin', random(3000, 2));
+  await a.sync();
+  const pack = await packOf(a, 'a.bin');
+  hidden.add(pack);
+
+  asked.length = 0;
+  const r = await a.engine.gc();
+  assert.deepEqual([r.missing, r.missingEarlier, r.packsDeleted], [[], [], 0]);
+  assert.deepEqual(asked, [`${pack} 0-1`]);
+  assert.ok(mem.objects.has(pack));
+
+  // Once storage no longer holds it either, it is missing.
+  mem.objects.delete(pack);
+  assert.deepEqual((await a.engine.gc()).missing, ['a.bin']);
+});

@@ -99,7 +99,7 @@ function mergeTokens(
   A: string[],
   B: string[],
   weak?: (token: string) => boolean,
-  inner?: (base: string, ours: string, theirs: string) => string | null,
+  inner?: (base: string[], ours: string[], theirs: string[]) => string | null,
 ): string | null {
   const ids = new Map<string, number>();
   const intern = (ts: string[]) => Int32Array.from(ts, (t) => ids.get(t) ?? (ids.set(t, ids.size), ids.size - 1));
@@ -122,7 +122,7 @@ function mergeTokens(
     if (sliceEq(a, ia, ea, o, io, i)) out.push(B.slice(ib, eb).join(''));
     else if (sliceEq(b, ib, eb, o, io, i) || sliceEq(a, ia, ea, b, ib, eb)) out.push(A.slice(ia, ea).join(''));
     else {
-      const both = inner?.(O.slice(io, i).join(''), A.slice(ia, ea).join(''), B.slice(ib, eb).join(''));
+      const both = inner?.(O.slice(io, i), A.slice(ia, ea), B.slice(ib, eb));
       if (both == null) return null;
       out.push(both);
     }
@@ -141,20 +141,84 @@ export const words = (s: string) => s.match(WORDS) ?? [];
 const isSpace = (token: string) => /^\s/.test(token);
 
 /**
- * Words of a region both sides changed. Whitespace never anchors, so two edits merge only with an unchanged word
+ * Words of lines both sides changed. Whitespace never anchors, so two edits merge only with an unchanged word
  * between them: "I like cats" edited to "I love cats" and "I like dogs" must not quietly become "I love dogs".
  */
-const mergeWords = (base: string, ours: string, theirs: string) => mergeTokens(words(base), words(ours), words(theirs), isSpace);
+const mergeWords = (base: string[], ours: string[], theirs: string[]) =>
+  mergeTokens(words(base.join('')), words(ours.join('')), words(theirs.join('')), isSpace);
 
 /**
- * Three-way merge by lines; a line both sides changed is merged by words. Returns null when both sides changed the
- * same words differently.
+ * Lines both sides changed between the same two unchanged ones, merged by words. Where neither side removed any, as
+ * when two devices add to the end of one daily note, both sides' new lines stay, theirs first; when one side's begin
+ * or end with the other's, the longer stand for both.
+ */
+function mergeLines(base: string[], ours: string[], theirs: string[]): string | null {
+  if (base.length) return mergeWords(base, ours, theirs);
+  const within = (short: string[], long: string[]) =>
+    short.length <= long.length && [0, long.length - short.length].some((at) => short.every((line, k) => line === long[at + k]));
+  if (within(ours, theirs)) return theirs.join('');
+  if (within(theirs, ours)) return ours.join('');
+  return theirs.join('') + ours.join('');
+}
+
+const lines = (s: string) => (s ? splitLines(s) : []);
+/** The last line has no line break. */
+const unended = (s: string) => s !== '' && !s.endsWith('\n');
+
+/** The break of the last line that has one, in the first of `texts` with any. */
+function lineBreak(...texts: string[]): string {
+  for (const s of texts) {
+    const at = s.lastIndexOf('\n');
+    if (at >= 0) return s[at - 1] === '\r' ? '\r\n' : '\n';
+  }
+  return '\n';
+}
+
+/**
+ * Three-way merge by lines; a line both sides changed is merged by words, and lines both added at one place are all
+ * kept (`mergeLines`). Returns null when both sides changed the same words differently.
  */
 export function merge3(base: string, ours: string, theirs: string): string | null {
   if (ours === theirs) return ours;
   if (base === ours) return theirs;
   if (base === theirs) return ours;
+  // A last line with no break is the same line once a side adds text after it, so each text is merged with a break
+  // there, and whether the result ends without one is merged apart.
+  const eol = lineBreak(theirs, ours, base);
+  const closed = (s: string) => lines(unended(s) ? s + eol : s);
+  const merged = mergeTokens(closed(base), closed(ours), closed(theirs), undefined, mergeLines);
+  if (merged === null) return null;
+  const cut = merged.replace(/\r?\n$/, '');
+  // A blank last line keeps its break, without which it would be gone.
+  if (!cut || cut.endsWith('\n')) return merged;
+  return (unended(ours) === unended(base) ? unended(theirs) : unended(ours)) ? cut : merged;
+}
+
+/**
+ * `merge3` where lines both sides added at one place conflict, for properties: there they may be two values for one
+ * key, or text put above the properties block.
+ */
+function mergeStrict(base: string, ours: string, theirs: string): string | null {
+  if (ours === theirs) return ours;
+  if (base === ours) return theirs;
+  if (base === theirs) return ours;
   return mergeTokens(splitLines(base), splitLines(ours), splitLines(theirs), undefined, mergeWords);
+}
+
+/**
+ * What stands in for the version two texts started from when they have none, as one daily note made from a template
+ * on two devices before either synced: the lines both have. Undefined when those are fewer than half the lines with
+ * text in the shorter one, as for two notes that only happen to share a name.
+ */
+export function sharedBase(a: string, b: string): string | undefined {
+  const eol = lineBreak(a, b);
+  const closed = (s: string) => (unended(s) ? s + eol : s);
+  const regions = lineDiff(closed(a), closed(b));
+  if (!regions) return undefined;
+  const shared = regions.flatMap((r) => (r.kind === 'same' ? r.lines : []));
+  const solid = (ls: string[]) => ls.filter((l) => l.trim()).length;
+  if (2 * solid(shared) < Math.min(solid(lines(a)), solid(lines(b)))) return undefined;
+  return shared.join('');
 }
 
 /** A note's properties block, cut so that `open + props + close + body` is the whole text. */
@@ -259,14 +323,14 @@ function mergeEntry(base: string | undefined, ours: string | undefined, theirs: 
     const text = t.render(items);
     if (text !== undefined) return text;
   }
-  return merge3(base ?? '', ours, theirs);
+  return mergeStrict(base ?? '', ours, theirs);
 }
 
 function mergeProperties(base: string, ours: string, theirs: string): string | null {
   const b = entries(base);
   const o = entries(ours);
   const t = entries(theirs);
-  if (!b || !o || !t) return merge3(base, ours, theirs);
+  if (!b || !o || !t) return mergeStrict(base, ours, theirs);
   let out = '';
   // Theirs' keys in their order, then what only ours added; what precedes the first key stays first.
   for (const key of new Set(['', ...t.keys(), ...o.keys()])) {
@@ -279,7 +343,7 @@ function mergeProperties(base: string, ours: string, theirs: string): string | n
 
 /**
  * Three-way merge of a note: the properties block key by key, the text below it as `merge3`. A side with no
- * properties block merges the whole text as one.
+ * properties block merges the whole text as one, by `mergeStrict` when the other side has one.
  */
 export function mergeNote(base: string, ours: string, theirs: string): string | null {
   if (ours === theirs) return ours;
@@ -287,7 +351,7 @@ export function mergeNote(base: string, ours: string, theirs: string): string | 
   if (base === theirs) return ours;
   const o = frontmatter(ours);
   const t = frontmatter(theirs);
-  if (!o || !t) return merge3(base, ours, theirs);
+  if (!o || !t) return (o || t ? mergeStrict : merge3)(base, ours, theirs);
   const b = frontmatter(base) ?? { props: '', body: base };
   const props = mergeProperties(b.props, o.props, t.props);
   const body = merge3(b.body, o.body, t.body);
@@ -321,7 +385,6 @@ export type DiffRegion = SameLines | ChangedLines;
  * side's lines joined give that text back byte for byte. Null when the texts differ too much, as for `merge3`.
  */
 export function lineDiff(a: string, b: string): DiffRegion[] | null {
-  const lines = (s: string) => (s ? splitLines(s) : []);
   const ids = new Map<string, number>();
   const intern = (ls: string[]) => Int32Array.from(ls, (l) => ids.get(l) ?? (ids.set(l, ids.size), ids.size - 1));
   const A = lines(a);

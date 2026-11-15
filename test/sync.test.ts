@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { SafetyError, SyncEngine, deleteLimit } from '../src/core/engine.ts';
+import { LocalState } from '../src/core/state.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
 import { rng, SimStore } from '../src/testing/netsim.ts';
 import { Device, lossy } from './helpers.ts';
@@ -177,6 +178,64 @@ test('overlapping edits keep both versions', async () => {
   assert.equal(a.fs.text('n.md'), 'from A\n');
   assert.equal(a.fs.text(r.conflictCopies[0]), 'from B\n');
   assert.match(r.conflictCopies[0], /^n \(conflict B \d{8}-\d{6}\)\.md$/);
+});
+
+for (const [ending, name] of [['\n', 'with'], ['', 'without']]) {
+  test(`lines two devices add to the end of one daily note are both kept, storage's first (${name} a final line break)`, async () => {
+    const { devices: [a, b] } = setup();
+    const day = (...lines: string[]) => lines.join('\n') + ending;
+    a.fs.put('Daily/2026-11-14.md', day('# 2026-11-14', '', '- coffee'));
+    await a.sync();
+    await b.sync();
+    a.fs.put('Daily/2026-11-14.md', day('# 2026-11-14', '', '- coffee', '- from A'));
+    b.fs.put('Daily/2026-11-14.md', day('# 2026-11-14', '', '- coffee', '- from B'));
+    await a.sync();
+    const r = await b.sync();
+    assert.equal(r.merged, 1);
+    assert.deepEqual(r.conflictCopies, []);
+    await a.sync();
+    assert.equal(a.fs.text('Daily/2026-11-14.md'), day('# 2026-11-14', '', '- coffee', '- from A', '- from B'));
+    assert.deepEqual(b.snapshot(), a.snapshot());
+  });
+}
+
+test('one note made from a template on two devices before either synced merges', async () => {
+  const { devices: [a, b] } = setup();
+  a.fs.put('other.md', 'x\n');
+  await a.sync();
+  await b.sync();
+  const day = (tasks: string[], notes: string[]) =>
+    `---\ntags: [daily]\n---\n# 2026-11-14\n\n## Tasks\n${tasks.map((t) => `- ${t}\n`).join('')}\n## Notes\n${notes.map((t) => `- ${t}\n`).join('')}`;
+  a.fs.put('Daily/2026-11-14.md', day(['buy milk'], []));
+  b.fs.put('Daily/2026-11-14.md', day(['call Sam'], ['an idea']));
+  await a.sync();
+  const r = await b.sync();
+  assert.equal(r.merged, 1);
+  assert.deepEqual(r.conflictCopies, []);
+  await a.sync();
+  assert.equal(a.fs.text('Daily/2026-11-14.md'), day(['buy milk', 'call Sam'], ['an idea']));
+  assert.deepEqual(b.snapshot(), a.snapshot());
+});
+
+test('two unrelated notes or canvases made apart under one name still keep both', async () => {
+  const { devices: [a, b] } = setup();
+  a.fs.put('other.md', 'x\n');
+  await a.sync();
+  await b.sync();
+  const canvas = (id: string) => `{\n\t"nodes":[\n\t\t{"id":"${id}","type":"text","text":"${id}","x":0,"y":0,"width":250,"height":60}\n\t],\n\t"edges":[]\n}`;
+  a.fs.put('Untitled.md', 'Shopping\n- milk\n- eggs\n');
+  b.fs.put('Untitled.md', 'Meeting with Sam\n- agenda\n- budget\n');
+  a.fs.put('Untitled.canvas', canvas('a'));
+  b.fs.put('Untitled.canvas', canvas('b'));
+  await a.sync();
+  const r = await b.sync();
+  assert.equal(r.merged, 0);
+  assert.equal(r.conflictCopies.length, 2);
+  await a.sync();
+  assert.deepEqual(b.snapshot(), a.snapshot());
+  assert.equal(a.fs.text('Untitled.md'), 'Shopping\n- milk\n- eggs\n');
+  assert.equal(a.fs.text(r.conflictCopies.find((p) => p.endsWith('.md'))!), 'Meeting with Sam\n- agenda\n- budget\n');
+  assert.equal(a.fs.text('Untitled.canvas'), canvas('a'));
 });
 
 test('binary files and the copy strategy never merge', async () => {
@@ -870,4 +929,171 @@ test('a commit whose reply is lost is taken as this device\'s own at once, with 
   assert.deepEqual([r.rounds, r.commits, r.pushed, r.conflictCopies], [1, 1, 1, []]);
   await b.sync();
   assert.equal(b.fs.text('n.md'), 'one\ntwo\n');
+});
+
+test('a download writes notes first, then the other files smallest first', async () => {
+  const { devices: [a, b] } = setup();
+  a.fs.put('big.png', random(300_000, 1));
+  a.fs.put('small.pdf', random(5_000, 2));
+  for (let i = 0; i < 5; i++) a.fs.put(`n${i}.md`, `note ${i}\n`);
+  a.fs.put('board.canvas', '{}');
+  await a.sync();
+  const order: string[] = [];
+  const write = b.fs.write.bind(b.fs);
+  b.fs.write = (path, data, mtime) => {
+    order.push(path);
+    return write(path, data, mtime);
+  };
+  assert.equal((await b.sync()).pulled, 8);
+  assert.deepEqual(order, ['board.canvas', 'n0.md', 'n1.md', 'n2.md', 'n3.md', 'n4.md', 'small.pdf', 'big.png']);
+});
+
+/** Notes, and attachments enough for more than one batch to download: mostly zeros, so storage holds little of them. */
+function fillForBatches(d: Device): void {
+  for (let i = 0; i < 20; i++) d.fs.put(`notes/n${i}.md`, `note ${i}\n`);
+  for (let i = 0; i < 9; i++) {
+    const data = new Uint8Array(4 << 20);
+    data[0] = i + 1;
+    d.fs.put(`att/${i}.bin`, data);
+  }
+}
+
+/**
+ * Syncs `d` until it writes the last attachment, where the app is suspended for good, as iOS may; each file before it
+ * takes a second to write. Then restarts `d` on the state it saved.
+ */
+async function cutShort(d: Device, clock: { now: number }): Promise<void> {
+  const write = d.fs.write.bind(d.fs);
+  let suspended!: () => void;
+  const stopped = new Promise<void>((resolve) => (suspended = resolve));
+  d.fs.write = (path, data, mtime) => {
+    clock.now += 1000;
+    if (path !== 'att/8.bin') return write(path, data, mtime);
+    suspended();
+    return new Promise(() => {});
+  };
+  void d.sync();
+  await stopped;
+  d.fs.write = write;
+  d.restart();
+}
+
+test('a download cut short resumes where it stopped, without reading back or downloading again what it wrote', async () => {
+  const { devices: [a, b], clock } = setup();
+  fillForBatches(a);
+  await a.sync();
+  await cutShort(b, clock);
+
+  const { read, write } = { read: b.fs.read.bind(b.fs), write: b.fs.write.bind(b.fs) };
+  const seen: string[] = [];
+  b.fs.read = (path) => {
+    seen.push(`read ${path}`);
+    return read(path);
+  };
+  b.fs.write = (path, data, mtime) => {
+    seen.push(`write ${path}`);
+    return write(path, data, mtime);
+  };
+  const r = await b.sync();
+  assert.deepEqual(seen, ['write att/8.bin']);
+  assert.deepEqual([r.pulled, r.merged, r.conflictCopies, r.errors], [1, 0, [], []]);
+  assert.deepEqual(b.snapshot(), a.snapshot());
+});
+
+// A new device opening an existing folder nearly always has files storage has too, so its download is saved as it goes
+// all the same: the state it saves says the device is still new, which keeps the note it had from being merged.
+test('a new device whose first download is cut short resumes it, and still keeps both versions of a note it already had', async () => {
+  const { devices: [a, b], clock } = setup();
+  fillForBatches(a);
+  a.fs.put('plan.md', 'one\ntwo\nthree\n');
+  await a.sync();
+  b.fs.put('plan.md', 'one\ntwo\nthree\nfour\n');
+  await cutShort(b, clock);
+  const cut = LocalState.parse(await b.state.load());
+  assert.deepEqual([cut.synced.size, cut.fresh], [28, true]);
+
+  const read = b.fs.read.bind(b.fs);
+  const seen: string[] = [];
+  b.fs.read = (path) => {
+    seen.push(path);
+    return read(path);
+  };
+  const r = await b.sync();
+  assert.equal(r.merged, 0);
+  assert.equal(r.conflictCopies.length, 1);
+  assert.deepEqual(seen, ['plan.md', r.conflictCopies[0]], 'nothing written before the cut is read back');
+  assert.equal(b.fs.text('plan.md'), 'one\ntwo\nthree\n');
+  assert.equal(b.fs.text(r.conflictCopies[0]), 'one\ntwo\nthree\nfour\n');
+  assert.ok(b.fs.files.has('att/8.bin'));
+  assert.equal(LocalState.parse(await b.state.load()).fresh, false);
+});
+
+for (const [how, upset] of [
+  ['reading it fails', (_: Device, read: Device['fs']['read']) => (path: string) => (path === 'plan.md' ? Promise.reject(new Error('the disk is busy')) : read(path))],
+  [
+    'it is edited as the sync reads it',
+    (d: Device, read: Device['fs']['read']) => async (path: string) => {
+      const data = await read(path);
+      if (path === 'plan.md') d.fs.put('plan.md', 'one\ntwo\nthree\nfour\nfive\n');
+      return data;
+    },
+  ],
+] as const) {
+  test(`a new device whose first sync leaves a note it already had unsettled, as when ${how}, still keeps both versions of it next time`, async () => {
+    const { devices: [a, b] } = setup();
+    a.fs.put('plan.md', 'one\ntwo\nthree\n');
+    a.fs.put('other.md', 'x\n');
+    await a.sync();
+    // An old copy of the note, from before "four" was taken out.
+    b.fs.put('plan.md', 'one\ntwo\nthree\nfour\n');
+    const read = b.fs.read.bind(b.fs);
+    b.fs.read = upset(b, read);
+    const first = await b.sync();
+    b.fs.read = read;
+    assert.equal(first.errors.length + first.skipped, 1);
+    assert.deepEqual(first.conflictCopies, []);
+    const st = LocalState.parse(await b.state.load());
+    assert.deepEqual([st.synced.has('other.md'), st.fresh], [true, true]);
+
+    b.restart();
+    const mine = b.fs.text('plan.md');
+    const r = await b.sync();
+    assert.equal(r.merged, 0);
+    assert.equal(r.conflictCopies.length, 1);
+    assert.equal(b.fs.text('plan.md'), 'one\ntwo\nthree\n');
+    assert.equal(b.fs.text(r.conflictCopies[0]), mine);
+    assert.equal(LocalState.parse(await b.state.load()).fresh, false);
+    await a.sync();
+    assert.equal(a.fs.text('plan.md'), 'one\ntwo\nthree\n', 'what was taken out stays out');
+  });
+}
+
+test('a state saved without the mark for a new device is new only with no synced files, and one with it reads back as new', async () => {
+  const { devices: [a] } = setup(['A']);
+  a.fs.put('n.md', 'x\n');
+  await a.sync();
+  const saved = JSON.parse(a.state.data!) as Record<string, unknown>;
+  assert.equal('n' in saved, false);
+  assert.equal(LocalState.parse(JSON.stringify(saved)).fresh, false);
+  assert.equal(LocalState.parse(JSON.stringify({ ...saved, f: [] })).fresh, true);
+  const marked = LocalState.parse(JSON.stringify({ ...saved, n: 1 }));
+  assert.deepEqual([marked.fresh, marked.synced.size, marked.remote.size], [true, 1, 1]);
+  assert.equal(LocalState.parse(marked.serialize()).fresh, true);
+});
+
+test('a device stops being new once a sync settles every file it had, and then merges a note made on two devices apart', async () => {
+  const { devices: [a, b] } = setup();
+  a.fs.put('Daily/2026-11-14.md', '# 2026-11-14\n\n## Tasks\n- buy milk\n');
+  await a.sync();
+  b.fs.put('Daily/2026-11-14.md', '# 2026-11-14\n\n## Tasks\n- buy milk\n- old task\n');
+  assert.equal((await b.sync()).conflictCopies.length, 1);
+  assert.equal(LocalState.parse(await b.state.load()).fresh, false);
+  await a.sync();
+
+  a.fs.put('Daily/2026-11-15.md', '# 2026-11-15\n\n## Tasks\n- call Sam\n');
+  b.fs.put('Daily/2026-11-15.md', '# 2026-11-15\n\n## Tasks\n- water plants\n');
+  await a.sync();
+  b.restart();
+  const r = await b.sync();
+  assert.deepEqual([r.merged, r.conflictCopies], [1, []]);
 });

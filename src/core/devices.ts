@@ -9,6 +9,8 @@ import { plural } from './text.ts';
 const PREFIX = 'dev/';
 const QUIET_AFTER = 7 * DAY;
 const HEARTBEAT_EVERY = 30 * 60_000;
+/** Sooner than `HEARTBEAT_EVERY` once this device has seen commits since its last heartbeat, so others' count of how far behind it is stays fresh. */
+const MOVED_EVERY = 5 * 60_000;
 
 /** What a device writes about itself. */
 interface Heartbeat {
@@ -53,12 +55,13 @@ function parse(v: unknown): Heartbeat | null {
   return ok ? (r as Heartbeat) : null;
 }
 
-/** Costs one write. */
-export async function writeHeartbeat(view: RepoView, info: { platform: string; version: string }): Promise<void> {
+/** Costs one write. Resolves to the newest commit it says this device has seen, for `heartbeatDue`. */
+export async function writeHeartbeat(view: RepoView, info: { platform: string; version: string }): Promise<number> {
   const { repo, st, cfg, now } = view;
   const record: Heartbeat = { name: cfg.deviceName, platform: info.platform, version: info.version, time: now, seq: st.lastSeq };
   if (st.head) record.head = st.head;
   await repo.writeDoc(await deviceKey(repo, cfg.deviceName), record);
+  return record.seq;
 }
 
 /** Costs one list and one read per record, the reads in parallel. */
@@ -92,8 +95,18 @@ export async function forgetDevice(view: RepoView, name: string): Promise<void> 
   await view.repo.deleteDoc(await deviceKey(view.repo, name));
 }
 
-/** `lastWritten` is when this app session last wrote one, 0 when it has not. */
-export const heartbeatDue = (lastWritten: number, now: number): boolean => !lastWritten || now - lastWritten > HEARTBEAT_EVERY;
+/** The heartbeat an app session last wrote: when, and the newest commit it gave. */
+export interface Beat {
+  time: number;
+  seq: number;
+}
+
+/**
+ * Due when this app session has written none (`last` undefined), every 30 minutes, and 5 minutes after the last one once
+ * this device has seen commits since it (`seq`, the newest it has seen now, differs from the one it gave).
+ */
+export const heartbeatDue = (last: Beat | undefined, now: number, seq: number): boolean =>
+  !last || now - last.time > HEARTBEAT_EVERY || (seq !== last.seq && now - last.time >= MOVED_EVERY);
 
 /** How long ago, in words. Another device's clock can run ahead of this one, so a negative span reads as now. */
 export function agoText(ms: number): string {
@@ -108,8 +121,11 @@ export function statusText(d: DeviceStatus, now: number): string {
   switch (d.state) {
     case 'current':
       return 'Up to date';
-    case 'behind':
-      return `${plural(d.behind, 'change')} behind`;
+    case 'behind': {
+      // Counted from the other device's last record, so it says how old that is.
+      const ago = agoText(now - d.lastSeen);
+      return `${plural(d.behind, 'change')} behind${ago === 'just now' ? ' just now' : `, as of ${ago}`}`;
+    }
     case 'quiet':
       return `Not seen for ${plural(Math.floor((now - d.lastSeen) / DAY), 'day')}`;
     case 'diverged':

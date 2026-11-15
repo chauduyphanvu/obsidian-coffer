@@ -1,7 +1,7 @@
 // What a restore does, and how the past reads to a person. No Obsidian import, so it runs under plain Node tests.
 import { pool } from '../core/bytes.ts';
 import { compileExcludes, type SyncConfig } from '../core/config.ts';
-import { deleteLimit, type GcResult, type RepairReport, type SyncEngine } from '../core/engine.ts';
+import { deleteLimit, type GcCounts, type RepairReport, type SyncEngine } from '../core/engine.ts';
 import { diffCounts, lineDiff, type DiffRegion } from '../core/merge.ts';
 import { ext, vaultKey } from '../core/paths.ts';
 import { DAY } from '../core/retention.ts';
@@ -481,7 +481,7 @@ export function describeRepair(r: RepairReport, deep = false): { ok: boolean; ti
 }
 
 /** What a clean-up of storage did, in plain words, including when there was nothing to do. */
-export function describeCleanup(r: GcResult): string {
+export function describeCleanup(r: GcCounts): string {
   const said: string[] = [];
   if (r.packsDeleted || r.snapshotsDeleted) {
     const objects = r.packsDeleted ? `${plural(r.packsDeleted, 'storage object')} (${sizeLabel(r.bytesFreed)})` : '';

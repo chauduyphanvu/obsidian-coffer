@@ -1,13 +1,14 @@
 import { Notice, Platform, Plugin, TFile, TFolder, TextFileView, debounce, setIcon, type SecretStorage } from 'obsidian';
 import { pool } from '../core/bytes.ts';
 import { DEFAULT_CONFIG, compileExcludes, type SyncConfig } from '../core/config.ts';
-import { forgetDevice, heartbeatDue, writeHeartbeat } from '../core/devices.ts';
+import { forgetDevice, heartbeatDue, writeHeartbeat, type Beat } from '../core/devices.ts';
 import {
   PassphraseUnknownError,
   RemovedError,
+  StorageGoneError,
   UnverifiedError,
   type Arrival,
-  type GcResult,
+  type GcCounts,
   type MemberStanding,
   type MemberStatus,
   type RepairOptions,
@@ -107,6 +108,7 @@ import {
   inShare,
   keptNote,
   keysMissingProblem,
+  lostProblems,
   missingProblem,
   resultProblems,
   RunProgress,
@@ -226,7 +228,7 @@ export default class CofferPlugin extends Plugin {
   private pollDue = 0;
   private polling = false;
   private retryTimer?: number;
-  private lastHeartbeat = 0;
+  private lastHeartbeat?: Beat;
   /** The device name this session's last heartbeat went under. */
   private heartbeatName = '';
   /** When something last suggested another device may be involved; see nextPollDelay. */
@@ -304,10 +306,10 @@ export default class CofferPlugin extends Plugin {
     });
     this.addCommand({
       id: 'activity',
-      name: 'Show recent changes in a shared folder',
+      name: 'Show recent changes',
       checkCallback: (checking) => {
-        if (!this.configured() || !this.targets().some((share) => share)) return false;
-        if (!checking) pickTarget(this, 'Show recent changes in', (share) => share && new ActivityModal(this.app, this, share).open(), (share) => !!share);
+        if (!this.configured()) return false;
+        if (!checking) pickTarget(this, 'Show recent changes in', (share) => new ActivityModal(this.app, this, share).open());
         return true;
       },
     });
@@ -693,7 +695,8 @@ export default class CofferPlugin extends Plugin {
     if (share && !isConfigured(share, this.lookup)) return [keysMissingProblem(share)];
     const t = this.tracked(share);
     const rec = share ?? this.settings;
-    return targetProblems({ failure: t.failure, found: t.found, conflictCopies: this.conflictCopies(share), lastSuccess: rec.lastSuccess, readOnly: this.receivesOnly(share) }, Date.now());
+    const lost = lostProblems({ current: rec.lost.current.map((p) => vaultPath(share, p)), earlier: rec.lost.earlier.map((p) => vaultPath(share, p)) });
+    return targetProblems({ failure: t.failure, found: [...t.found, ...lost], conflictCopies: this.conflictCopies(share), lastSuccess: rec.lastSuccess, readOnly: this.receivesOnly(share) }, Date.now());
   }
 
   /** Whether the last sync of any place could not reach its storage. */
@@ -814,24 +817,25 @@ export default class CofferPlugin extends Plugin {
   }
 
   /**
-   * Tells the vault's other devices where this one is: once per session, then every 30 minutes. Runs under the sync
-   * lock. Never in a shared folder, whose storage other people may read.
+   * Tells the vault's other devices where this one is: once per session, then every 30 minutes, or after 5 once it has
+   * seen commits since (`heartbeatDue`). Runs under the sync lock. Never in a shared folder, whose storage other people may read.
    */
   private async heartbeat(look: () => Promise<RepoView>): Promise<void> {
     if (this.settings.readOnly) return;
     const name = this.settings.deviceName;
     // Renamed since the last one: the record goes under the new name now, and the one under the old name goes.
     const renamed = this.heartbeatName && this.heartbeatName !== name ? this.heartbeatName : '';
-    if (!renamed && !heartbeatDue(this.lastHeartbeat, Date.now())) return;
-    this.lastHeartbeat = Date.now();
+    const seq = this.getEngine().position();
+    if (!renamed && !heartbeatDue(this.lastHeartbeat, Date.now(), seq)) return;
+    const beat = (this.lastHeartbeat = { time: Date.now(), seq });
     try {
       const platform = Platform.isIosApp ? 'iOS' : Platform.isAndroidApp ? 'Android' : Platform.isMacOS ? 'macOS' : Platform.isWin ? 'Windows' : Platform.isLinux ? 'Linux' : 'Unknown';
       const view = await look();
-      await writeHeartbeat(view, { platform, version: this.manifest.version });
+      beat.seq = await writeHeartbeat(view, { platform, version: this.manifest.version });
       this.heartbeatName = name;
       if (renamed) await forgetDevice(view, renamed);
     } catch {
-      // Storage may be down or refuse the write; the next try is in 30 minutes.
+      // Storage may be down or refuse the write; it is tried again when the next one is due.
     }
   }
 
@@ -1010,8 +1014,9 @@ export default class CofferPlugin extends Plugin {
     t.found.push(...shared);
     // Only a device that just committed asks for an early cleanup, so the one whose commit tipped the count does it.
     if (!r.errors.length && cleanupDue({ autoCleanDays: this.settings.autoCleanDays, lastCleanup: rec.lastCleanup }, Date.now(), r.commits > 0 && (await engine.compactionDue()))) {
-      await engine.gc();
+      const cleaned = await engine.gc();
       rec.lastCleanup = Date.now();
+      rec.lost = { current: cleaned.missing, earlier: cleaned.missingEarlier };
     }
     if (!share) await this.vaultChores();
     // A followed folder has no storage keys to change.
@@ -1079,13 +1084,15 @@ export default class CofferPlugin extends Plugin {
 
   private failed(share: Share | undefined, e: unknown): Problem {
     const t = this.tracked(share);
-    t.failure = describeFailure(e, this.memberContext(share));
+    t.failure = describeFailure(e, this.memberContext(share), !!share);
     this.changes.failed(share);
     if (pausesOn(e)) {
       this.pauses.pause(keyOf(share));
       this.retries.reset(keyOf(share));
     } else {
-      this.engines.delete(keyOf(share));
+      // Storage found gone is asked again by the same engine: a new one would open it afresh, and in storage emptied
+      // altogether start a new vault.
+      if (!(e instanceof StorageGoneError)) this.engines.delete(keyOf(share));
       this.retries.failed(keyOf(share), Date.now());
     }
     return t.failure;
@@ -1812,7 +1819,7 @@ export default class CofferPlugin extends Plugin {
   /** Cleans up the vault's storage and every shared folder's. Syncs, and changes to shared folders, wait meanwhile. */
   private async cleanUp(): Promise<void> {
     if (!this.configured()) return;
-    const total: GcResult = { packsDeleted: 0, bytesFreed: 0, snapshotsDeleted: 0, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0 };
+    const total: GcCounts = { packsDeleted: 0, bytesFreed: 0, snapshotsDeleted: 0, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0 };
     const failed: string[] = [];
     const targets = this.targets().filter((share) => !(share ?? this.settings).readOnly);
     if (!targets.length) {
@@ -1823,19 +1830,31 @@ export default class CofferPlugin extends Plugin {
       for (const share of targets) {
         try {
           const r = await this.getEngine(share).gc();
-          for (const k of Object.keys(total) as (keyof GcResult)[]) total[k] += r[k];
+          for (const k of Object.keys(total) as (keyof GcCounts)[]) total[k] += r[k];
+          (share ?? this.settings).lost = { current: r.missing, earlier: r.missingEarlier };
         } catch (e) {
           failed.push(`${share ? `“${labelOf(share)}”` : 'This vault'}: ${errorText(e)}`);
         }
       }
     });
+    await this.saveData(this.settings);
+    this.report();
     if (failed.length < targets.length) new Notice(describeCleanup(total), 10_000);
     if (failed.length) new Notice(`Clean-up failed.\n${failed.join('\n')}`, 10_000);
   }
 
-  /** Stores again, from this device's files, the data `share`'s storage (the vault's when none) lost. Syncs wait meanwhile. */
-  repair(share: Share | undefined, deep: boolean, onProgress?: RepairOptions['onProgress']): Promise<RepairReport> {
-    return this.exclusive('Repairing synced data…', () => this.getEngine(share).repair({ deep, onProgress }));
+  /**
+   * Stores again, from this device's files, the data `share`'s storage (the vault's when none) lost. Syncs wait meanwhile.
+   * What the last cleanup found missing stays on the problem list only as far as the repair still finds it so.
+   */
+  async repair(share: Share | undefined, deep: boolean, onProgress?: RepairOptions['onProgress']): Promise<RepairReport> {
+    const r = await this.exclusive('Repairing synced data…', () => this.getEngine(share).repair({ deep, onProgress }));
+    const rec = share ?? this.settings;
+    const still = (paths: string[], found: string[]) => paths.filter((p) => found.includes(p));
+    rec.lost = { current: still(rec.lost.current, r.unrepaired), earlier: still(rec.lost.earlier, r.historyOnly) };
+    await this.saveData(this.settings);
+    this.report();
+    return r;
   }
 
   /** The file table is copied before anything else is awaited: a sync waiting on the engine may change it from then on. */

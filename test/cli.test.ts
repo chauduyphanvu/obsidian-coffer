@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -252,6 +252,38 @@ test('cli: clean says what it did, including when there was nothing to do', () =
     const r = t.run('clean');
     assert.equal(r.status, 0, r.stderr);
     assert.equal(r.stdout, 'nothing to clean: no stored version has expired, and no pack is worth combining\n');
+  } finally {
+    t.done();
+  }
+});
+
+test('cli: clean names the files whose data is missing from storage: exit 1 and a hint to repair for a current version, exit 0 for earlier versions only', () => {
+  const t = setup({});
+  try {
+    const packs = () => readdirSync(join(t.dir, 'remote', 'pack'));
+    put(t.vault, 'a.md', 'a\n');
+    t.cli('sync');
+    const [first] = packs();
+    put(t.vault, 'a.md', 'a, again\n');
+    put(t.vault, 'b.md', 'b\n');
+    t.cli('sync');
+    const [second] = packs().filter((p) => p !== first);
+    const nothing = 'nothing to clean: no stored version has expired, and no pack is worth combining\n';
+
+    rmSync(join(t.dir, 'remote', 'pack', first));
+    const earlier = t.run('clean');
+    assert.equal(earlier.status, 0, earlier.stderr);
+    assert.equal(earlier.stdout, `${nothing}earlier versions of a.md cannot be restored\n`);
+    assert.equal(earlier.stderr, '');
+
+    rmSync(join(t.dir, 'remote', 'pack', second));
+    const missing = t.run('clean');
+    assert.equal(missing.status, 1);
+    assert.equal(missing.stdout, nothing, 'a.md is named for its current version, not again for its earlier one');
+    assert.equal(missing.stderr, 'missing from storage: a.md\nmissing from storage: b.md\nrun repair on a device that has these files, to store their data again\n');
+
+    assert.equal(t.run('repair').status, 0);
+    assert.equal(t.run('clean').status, 0, 'repaired, nothing is missing');
   } finally {
     t.done();
   }
@@ -2322,6 +2354,395 @@ test('cli publish: with "whole" every note is published except those that say pu
     t.withSite({ remote: { type: 'folder', path: t.folder }, exclude: 'Private/' });
     assert.match(t.publish().stderr, /needs "site.exclude" to be a list of texts/);
   } finally {
+    t.done();
+  }
+});
+
+/** Every object in a storage folder, to show a command wrote nothing there. */
+const stored = (remote: string) => (readdirSync(remote, { recursive: true }) as string[]).sort();
+
+test('cli export: writes every file in storage decrypted into a new folder with its modified time, as it was at a number log prints, or one folder, and changes nothing else', () => {
+  const t = setup({ deviceName: 'laptop' });
+  try {
+    put(t.vault, 'notes/a.md', 'one\n');
+    put(t.vault, 'b.md', 'b\n');
+    const then = new Date('2024-05-06T07:08:09Z');
+    utimesSync(join(t.vault, 'notes', 'a.md'), then, then);
+    t.cli('sync');
+    put(t.vault, 'notes/a.md', 'two\n');
+    put(t.vault, 'c.md', 'c\n');
+    t.cli('sync');
+    const remote = join(t.dir, 'remote');
+    const before = { remote: stored(remote), vault: files(t.vault) };
+    const real = realpathSync(t.dir);
+
+    const r = t.run('export', join(t.dir, 'now'));
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stdout, `exported 3 files (8 bytes) of the vault to ${join(real, 'now')}\n`);
+    assert.equal(r.stderr, '');
+    assert.deepEqual(files(join(t.dir, 'now')), { 'b.md': 'b\n', 'c.md': 'c\n', 'notes/a.md': 'two\n' });
+    assert.ok(Math.abs(statSync(join(t.dir, 'now', 'b.md')).mtimeMs - statSync(join(t.vault, 'b.md')).mtimeMs) < 1, 'the time it was last changed');
+
+    const old = t.run('export', join(t.dir, 'then'), '--at=1');
+    assert.equal(old.status, 0, old.stderr);
+    assert.match(old.stdout, new RegExp(`^exported 2 files \\(6 bytes\\) of the vault as of \\S+Z to ${escaped(join(real, 'then'))}\\n$`));
+    assert.deepEqual(files(join(t.dir, 'then')), { 'b.md': 'b\n', 'notes/a.md': 'one\n' });
+    assert.equal(statSync(join(t.dir, 'then', 'notes', 'a.md')).mtimeMs, then.getTime());
+
+    const folder = t.run('export', join(t.dir, 'notes only'), 'notes/', '--at', new Date().toISOString());
+    assert.equal(folder.status, 0, folder.stderr);
+    assert.match(folder.stdout, /^exported 1 file \(4 bytes\) of notes\/ as of \S+Z to /);
+    assert.deepEqual(files(join(t.dir, 'notes only')), { 'notes/a.md': 'two\n' });
+
+    mkdirSync(join(t.dir, 'empty'));
+    assert.equal(t.run('export', join(t.dir, 'empty')).status, 0, 'an empty folder that is there already');
+    assert.deepEqual(files(join(t.dir, 'empty')), files(join(t.dir, 'now')));
+    assert.deepEqual({ remote: stored(remote), vault: files(t.vault) }, before);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli export: refuses a folder that is not empty, is inside the vault or holds it, a folder of the vault with no file, and a time it cannot read, and writes nothing', () => {
+  const t = setup({});
+  try {
+    put(t.vault, 'notes/a.md', 'a\n');
+    t.cli('sync');
+    const remote = join(t.dir, 'remote');
+    const before = { remote: stored(remote), vault: files(t.vault) };
+    const refused = (args: string[], why: RegExp) => {
+      const r = t.run('export', ...args);
+      assert.equal(r.status, 1, args.join(' '));
+      assert.equal(r.stdout, '');
+      assert.match(r.stderr, why);
+    };
+    put(t.dir, 'full/mine.txt', 'mine\n');
+    refused([join(t.dir, 'full')], /^\S+full is not empty, so nothing was exported: export writes only into a new or empty folder\n$/);
+    assert.deepEqual(files(join(t.dir, 'full')), { 'mine.txt': 'mine\n' });
+    refused([join(t.vault, 'out')], /^the folder to export to must be outside the vault, so nothing was exported: \S+out is inside the vault \(/);
+    assert.equal(existsSync(join(t.vault, 'out')), false);
+    refused([t.vault], /: \S+vault is the vault\n$/);
+    refused([t.dir], / holds the vault \(/);
+    refused([join(t.dir, 'out'), 'nowhere'], /^no file in storage is in nowhere\/, so nothing was exported\n$/);
+    refused([join(t.dir, 'out'), '--at=yesterday'], /^"yesterday" is not a time; use ISO 8601/);
+    refused([join(t.dir, 'out'), '--at=2000-01-01T00:00:00Z'], /too far back; the earliest time that can be restored is /);
+    assert.equal(existsSync(join(t.dir, 'out')), false);
+    assert.equal(t.run('export').status, 2, 'a folder to export to is needed');
+    assert.deepEqual({ remote: stored(remote), vault: files(t.vault) }, before);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli export: works on a device that only receives, includes the files left in storage, and writes the files it can read when one cannot be', () => {
+  const a = setup({ deviceName: 'laptop' });
+  const b = setup({ deviceName: 'phone', deferAboveMB: 1, readOnly: true }, a);
+  try {
+    put(a.vault, 'a.md', 'a\n');
+    big(a.vault, 'big.bin', 1);
+    a.cli('sync');
+    assert.match(b.cli('sync'), /^sent 0, received 1,/);
+    assert.equal(existsSync(join(b.vault, 'big.bin')), false);
+    const out = join(a.dir, 'out');
+    const r = b.run('export', out);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /^exported 2 files \(1\.3 MB\) of the vault to /);
+    assert.deepEqual(readFileSync(join(out, 'big.bin')), readFileSync(join(a.vault, 'big.bin')));
+
+    const packs = () => readdirSync(join(a.dir, 'remote', 'pack'));
+    const earlier = packs();
+    put(a.vault, 'later.md', 'later\n');
+    a.cli('sync');
+    rmSync(join(a.dir, 'remote', 'pack', packs().find((p) => !earlier.includes(p))!));
+    const part = b.run('export', join(a.dir, 'part'));
+    assert.equal(part.status, 1);
+    assert.match(part.stderr, /^failed: later\.md: /);
+    assert.equal(part.stderr.split('\n').filter(Boolean).length, 1);
+    assert.match(part.stdout, /^exported 2 files \(1\.3 MB\) of the vault to /);
+    assert.deepEqual(Object.keys(files(join(a.dir, 'part'))).sort(), ['a.md', 'big.bin']);
+  } finally {
+    a.done();
+  }
+});
+
+/** An activity listing with the times taken out, for comparing. */
+const untimed = (text: string) => text.replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z {2}/gm, '');
+
+test('cli activity: lists the changes newest first, who made each and the files, in a vault each by its device, with --limit and for one folder', () => {
+  const a = setup({ deviceName: 'laptop' });
+  const b = setup({ deviceName: 'phone' }, a);
+  try {
+    put(a.vault, 'notes/a.md', 'a\n');
+    put(a.vault, 'b.md', 'b\n');
+    a.cli('sync');
+    b.cli('sync');
+    put(b.vault, 'b.md', 'b, by the phone\n');
+    rmSync(join(b.vault, 'notes', 'a.md'));
+    put(b.vault, 'notes/new.md', 'new\n');
+    b.cli('sync');
+
+    const r = a.run('activity');
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /^\d{4}-\d\d-\d\dT[\d:.]+Z {2}phone/);
+    assert.equal(
+      untimed(r.stdout),
+      'phone            1 added, 1 changed, 1 deleted\n  changed  b.md\n  added    notes/new.md\n  deleted  notes/a.md\n' +
+        'This device      2 added\n  added    b.md\n  added    notes/a.md\n',
+    );
+    assert.equal(untimed(b.cli('activity')).split('\n').filter((l) => l && !l.startsWith(' ')).join('|'), 'This device      1 added, 1 changed, 1 deleted|laptop           2 added');
+    assert.equal(untimed(a.cli('activity', '--limit=1')), untimed(r.stdout).split('This device')[0]);
+    assert.equal(untimed(a.cli('activity', 'notes', '--limit', '1')), 'phone            1 added, 1 deleted\n  added    notes/new.md\n  deleted  notes/a.md\n');
+    assert.equal(untimed(a.cli('activity', 'notes/')), 'phone            1 added, 1 deleted\n  added    notes/new.md\n  deleted  notes/a.md\nThis device      1 added\n  added    notes/a.md\n');
+    assert.equal(a.cli('activity', 'nowhere'), '');
+    assert.match(a.run('activity', '--limit=0').stderr, /--limit must be a whole number above 0/);
+  } finally {
+    a.done();
+  }
+});
+
+test('cli status: says storage is reachable, its newest change, each device and the files left in storage, as text and as JSON, writes nothing to storage, and exits 1 for a conflict copy or storage it cannot reach', () => {
+  const a = setup({ deviceName: 'laptop' });
+  const b = setup({ deviceName: 'phone', deferAboveMB: 1 }, a);
+  try {
+    put(a.vault, 'note.md', 'hello\n');
+    big(a.vault, 'big.bin', 1);
+    a.cli('sync');
+    b.cli('sync');
+    const remote = join(a.dir, 'remote');
+    const before = stored(remote);
+    const system = { darwin: 'macOS', win32: 'Windows', linux: 'Linux' }[process.platform as string] ?? process.platform;
+    const { version } = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url), 'utf8')) as { version: string };
+
+    const r = b.run('status');
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.equal(r.stderr, '');
+    const lines = r.stdout.split('\n');
+    assert.equal(lines[0], `storage: reachable, folder ${remote}`);
+    assert.match(lines[1], /^newest change: number 1, \d{4}-\d\d-\d\dT[\d:.]+Z, by laptop$/);
+    assert.deepEqual(lines.slice(2), [
+      'devices:',
+      `  phone (this device), CLI on ${system} v${version}, last synced just now: Up to date`,
+      `  laptop, CLI on ${system} v${version}, last synced just now: Up to date`,
+      'files left in storage: 1, which fetch downloads',
+      '  big.bin (1.3 MB)',
+      'conflict copies: none',
+      'all is well',
+      '',
+    ]);
+
+    const json = b.run('status', '--json');
+    assert.equal(json.status, 0, json.stderr);
+    const got = JSON.parse(json.stdout) as Record<string, any>;
+    assert.equal(got.ok, true);
+    assert.deepEqual(got.storage, { reachable: true, where: `folder ${remote}` });
+    assert.deepEqual({ ...got.newest, time: undefined }, { seq: 1, time: undefined, by: 'laptop' });
+    assert.deepEqual(got.devices.map((d: Record<string, unknown>) => [d.name, d.thisDevice, d.state, d.status, d.ago]), [['phone', true, 'current', 'Up to date', 'just now'], ['laptop', false, 'current', 'Up to date', 'just now']]);
+    assert.deepEqual(got.leftInStorage, [{ path: 'big.bin', size: 1_300_000 }]);
+    assert.deepEqual(got.conflictCopies, []);
+
+    const copy = 'note (conflict laptop 20260102-150405).md';
+    put(b.vault, copy, 'the other side\n');
+    const bad = b.run('status');
+    assert.equal(bad.status, 1);
+    assert.match(bad.stdout, new RegExp(`\\nconflict copies: 1\\n  ${escaped(copy)}\\nneeds attention: 1 conflict copy\\n$`));
+    const badJson = JSON.parse(b.run('status', '--json').stdout) as Record<string, any>;
+    assert.equal(badJson.ok, false);
+    assert.deepEqual(badJson.conflictCopies, [{ path: copy, of: 'note.md' }]);
+    assert.deepEqual(stored(remote), before, 'status wrote nothing to storage');
+
+    renameSync(remote, join(a.dir, 'away'));
+    const gone = a.run('status');
+    assert.equal(gone.status, 1);
+    assert.match(gone.stdout, new RegExp(`^storage: not reachable, folder ${escaped(remote)}: The storage folder ${escaped(remote)} is missing`));
+    const goneJson = a.run('status', '--json');
+    assert.equal(goneJson.status, 1);
+    assert.deepEqual(Object.keys(JSON.parse(goneJson.stdout)), ['ok', 'storage']);
+    assert.equal(JSON.parse(goneJson.stdout).storage.reachable, false);
+    assert.equal(existsSync(remote), false, 'never made again');
+    assert.match(a.run('status', '--jsn').stderr, /^unknown option for status: --jsn$/m);
+  } finally {
+    a.done();
+  }
+});
+
+test('cli status: a conflict copy where sync does not look, as one deleted to .trash, is not counted', () => {
+  const t = setup({});
+  try {
+    put(t.vault, 'note.md', 'hello\n');
+    t.cli('sync');
+    for (const dir of ['.trash', '.git', '.coffer']) put(t.vault, `${dir}/note (conflict laptop 20260102-150405).md`, 'the other side\n');
+    const r = t.run('status');
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /\nconflict copies: none\nall is well\n$/);
+    const json = JSON.parse(t.run('status', '--json').stdout) as { ok: boolean; conflictCopies: unknown[] };
+    assert.deepEqual([json.ok, json.conflictCopies], [true, []]);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli status: a device that is behind says how old its count is, and does not fail the status', () => {
+  const a = setup({ deviceName: 'laptop' });
+  const b = setup({ deviceName: 'phone' }, a);
+  try {
+    put(a.vault, 'note.md', 'one\n');
+    a.cli('sync');
+    b.cli('sync');
+    put(a.vault, 'note.md', 'two\n');
+    a.cli('sync');
+    const r = a.run('status');
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^ {2}phone, CLI on .+, last synced just now: 1 change behind just now$/m);
+    const json = JSON.parse(a.run('status', '--json').stdout) as { devices: Record<string, unknown>[] };
+    assert.deepEqual(json.devices.map((d) => [d.name, d.state, d.status]), [['laptop', 'current', 'Up to date'], ['phone', 'behind', '1 change behind just now']]);
+  } finally {
+    a.done();
+  }
+});
+
+test('cli status and export: looking at storage before the first sync makes neither its folder nor a vault in it', () => {
+  const t = setup({});
+  try {
+    const r = t.run('status');
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /^storage: not reachable, folder \S+: The storage folder \S+ is missing/);
+    assert.equal(existsSync(join(t.dir, 'remote')), false);
+    mkdirSync(join(t.dir, 'remote'));
+    const empty = t.run('status');
+    assert.equal(empty.status, 1);
+    assert.match(empty.stdout, /: Storage holds no synced vault yet, and this device only reads from it\n$/);
+    assert.equal(t.run('export', join(t.dir, 'out')).status, 1);
+    assert.deepEqual(readdirSync(join(t.dir, 'remote')), []);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli: in a shared folder with members, activity, log, history and deleted name people as the plugin does, and status and export work for a member and a follower', async () => {
+  const h = await memberHarness();
+  try {
+    h.owner.fs.put('plan.md', 'v1\n');
+    h.owner.fs.put('old.md', 'old\n');
+    await h.owner.sync();
+    const lan = h.device('lan');
+    assert.equal((await lan.join(await h.link('Lan', 'write'))).status, 0);
+    await h.owner.engine.confirmJoins();
+    put(lan.vault, 'lan.md', 'by lan\n');
+    assert.match((await lan.run(['sync'])).stdout, /^sent 1,/);
+    await h.owner.sync();
+    h.owner.fs.put('plan.md', 'v2\n');
+    h.owner.fs.remove('old.md');
+    await h.owner.sync();
+    assert.match((await lan.run(['sync'])).stdout, /^sent 0, received 1, deleted 1 here/);
+
+    const activity = await lan.run(['activity']);
+    assert.equal(activity.status, 0, activity.stderr);
+    const text = untimed(activity.stdout);
+    assert.ok(text.startsWith('Vu               1 changed, 1 deleted\n  changed  plan.md\n  deleted  old.md\n'), text);
+    for (const line of ['You              1 added\n  added    lan.md', 'Lan joined', 'Lan was invited to edit', 'Vu               2 added\n  added    old.md\n  added    plan.md', 'Vu started sharing this folder']) {
+      assert.ok(text.includes(`${line}\n`), `${line} in\n${text}`);
+    }
+    assert.ok(text.indexOf('Lan joined') < text.indexOf('Lan was invited') && text.indexOf('Lan was invited') < text.indexOf('Vu started'), 'newest first');
+    assert.deepEqual(untimed((await lan.run(['log'])).stdout.replace(/^ +\d+ {2}/gm, '')).trim().split('\n'), [
+      'Vu               0 added, 1 changed, 1 deleted',
+      'You              1 added, 0 changed, 0 deleted',
+      'Vu               2 added, 0 changed, 0 deleted',
+    ]);
+    assert.deepEqual((await lan.run(['history', 'plan.md'])).stdout.trim().split('\n').map((l) => l.trim().split(/\s+/)[2]), ['Vu', 'Vu']);
+    assert.match((await lan.run(['deleted'])).stdout, /^\S+Z {2}Vu {15}old\.md\n$/);
+
+    const status = await lan.run(['status']);
+    assert.equal(status.status, 0, status.stdout + status.stderr);
+    assert.match(status.stdout, /^storage: reachable, WebDAV http:\/\/127\.0\.0\.1:\d+\/dav\nnewest change: number \d+, \S+Z, by Vu\ndevices: not listed for a shared folder with members, where devices do not record how far they have got\n/);
+    const out = join(h.dir, 'lan-copy');
+    const exported = await lan.run(['export', out]);
+    assert.equal(exported.status, 0, exported.stderr);
+    assert.deepEqual(files(out), { 'lan.md': 'by lan\n', 'plan.md': 'v2\n' });
+
+    h.dav.state.publicRead = true;
+    const fan = h.device('fan');
+    assert.equal((await fan.join(await h.followLink('Fan'))).status, 0);
+    assert.equal((await fan.run(['sync'])).status, 0);
+    const followed = await fan.run(['status', '--json']);
+    assert.equal(followed.status, 0, followed.stdout + followed.stderr);
+    assert.equal(JSON.parse(followed.stdout).devices, null);
+    assert.match(JSON.parse(followed.stdout).devicesNote, /followed folder/);
+    // The newest change is the follow link's own member event.
+    assert.match(untimed((await fan.run(['activity', '--limit=2'])).stdout), /^Fan was invited to read\nVu {15}1 changed, 1 deleted\n/);
+    const fanOut = join(h.dir, 'fan-copy');
+    assert.equal((await fan.run(['export', fanOut])).status, 0);
+    assert.deepEqual(files(fanOut), files(out));
+    assert.deepEqual([...new Set(h.dav.seen.filter((r) => r.user === '').map((r) => r.method))], ['GET'], 'a follower only ever reads, by name');
+  } finally {
+    h.done();
+  }
+});
+
+test('cli watch --publish: needs a site it may publish to, said before watching starts', () => {
+  const t = setup({});
+  try {
+    const r = t.run('watch', '--publish');
+    assert.equal(r.status, 1);
+    assert.equal(r.stdout, '');
+    assert.equal(r.stderr, `config file ${t.config} has no "site", which says where the website goes\n`);
+    writeFileSync(t.config, JSON.stringify({ ...JSON.parse(readFileSync(t.config, 'utf8')), site: { remote: { type: 'folder', path: join(t.vault, 'web') } } }));
+    const inside = t.run('watch', '--publish');
+    assert.equal(inside.status, 1);
+    assert.equal(inside.stdout, '');
+    assert.match(inside.stderr, /^the website's folder must be outside the vault, so nothing was published: /);
+    assert.equal(existsSync(join(t.dir, 'remote')), false, 'nothing synced');
+    assert.match(t.run('sync', '--publish').stderr, /^unknown option for sync: --publish$/m);
+  } finally {
+    t.done();
+  }
+});
+
+test('cli watch --publish: says so at startup, publishes after the first sync and after each that changes something, says what changed after the sync, and tries a failed publish again after the next sync', async () => {
+  const t = siteSetup();
+  siteNotes(t.vault);
+  const w = watching(['--publish', '--poll=0.2', '--interval=1', `--config=${t.config}`], { COFFER_PASSPHRASE: PASSPHRASE });
+  const count = (what: string) => w.out().split(what).length - 1;
+  try {
+    await eventually(() => count('published to') === 1);
+    const [start, publishing, ...rest] = w.out().split('\n').filter(Boolean);
+    assert.match(start, /^\S+Z watching /);
+    assert.equal(publishing.replace(/^\S+Z /, ''), `publishing the website to folder ${t.folder} after the first sync and after each one that changes something, with no preview to check first: every note that says publish: true goes public`);
+    assert.ok(rest.every((l) => /^\d{4}-\d\d-\d\dT[\d:.]+Z /.test(l)), rest.join('\n'));
+    const sent = rest.findIndex((l) => / sent \d+, received 0,/.test(l));
+    const site = rest.findIndex((l) => / The website has 3 pages and 2 other files, published here for the first time\.$/.test(l));
+    assert.ok(sent >= 0 && site > sent, 'what the sync did, then what the publish did');
+    assert.ok(rest.some((l) => / New page: Trip$/.test(l)));
+    assert.ok(existsSync(join(t.folder, 'Trip.html')));
+
+    // The syncs every second change nothing, so they publish nothing.
+    await sleep(2500);
+    assert.equal(count('The website has'), 1);
+
+    rmSync(t.folder, { recursive: true });
+    put(t.vault, 'Trip.md', '# Trip\n\nno longer published\n');
+    await eventually(() => w.err().includes('publishing failed: '));
+    assert.match(w.err(), /^\S+Z publishing failed: .*; trying again after the next sync$/m);
+    mkdirSync(t.folder);
+    await eventually(() => count('published to') === 2);
+    assert.ok(!existsSync(join(t.folder, 'Trip.html')) && existsSync(join(t.folder, 'Home.html')));
+    w.child.kill('SIGTERM');
+    assert.equal(await w.exited, 0);
+  } finally {
+    w.child.kill('SIGKILL');
+    t.done();
+  }
+});
+
+test('cli watch --publish: with the whole vault published, says at startup that every new note goes public', async () => {
+  const t = siteSetup({}, { whole: true });
+  const w = watching(['--publish', '--poll=0.2', '--interval=60', `--config=${t.config}`], { COFFER_PASSPHRASE: PASSPHRASE });
+  try {
+    await eventually(() => w.out().split('\n').length > 2);
+    assert.match(w.out().split('\n')[1], /: the whole vault is published, so every note, a new one too, goes public unless it says publish: false$/);
+    w.child.kill('SIGTERM');
+    assert.equal(await w.exited, 0);
+  } finally {
+    w.child.kill('SIGKILL');
     t.done();
   }
 });

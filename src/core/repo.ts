@@ -18,6 +18,16 @@ const reserved = (key: string) => key === HEADER_KEY || key === PRUNED_KEY || ke
 /** Commits asked for at once by a reader that cannot list, until one is missing. */
 const PROBE_WINDOW = 6;
 
+/**
+ * Storage no longer holds the vault's key file: the vault or shared folder was deleted under this device, or its storage
+ * emptied. Nothing is written: a new key file there would start another vault.
+ */
+export class StorageGoneError extends Error {
+  constructor(message = 'The storage this syncs to no longer holds its vault: vault.json is missing') {
+    super(message);
+  }
+}
+
 /** A new passphrase was sent to storage and the connection failed before storage could say whether it took. */
 export class PassphraseUnknownError extends Error {
   constructor(cause: unknown) {
@@ -262,7 +272,7 @@ export class Repo {
    */
   static async openMember(store: RemoteStore, keys: { repo: string; master: Uint8Array }): Promise<Repo> {
     const header = await Repo.header(store);
-    if (!header) throw new Error('The shared folder is missing from storage: its key file, vault.json, is gone');
+    if (!header) throw new StorageGoneError('The shared folder is missing from storage: its key file, vault.json, is gone');
     if (header.format < MEMBER_FORMAT) {
       throw new Error(`Storage now says this shared folder has no members (format ${header.format}), which the owner never does: it was tampered with, so nothing was synced`);
     }
@@ -439,6 +449,11 @@ export class Repo {
     } catch {
       return stale;
     }
+  }
+
+  /** Whether storage still holds this vault's key file. One read. */
+  async hasHeader(): Promise<boolean> {
+    return (await this.store.get(HEADER_KEY)) !== null;
   }
 
   /**

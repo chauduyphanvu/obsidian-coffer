@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { merge3, mergeCanvas, mergeNote, words } from '../src/core/merge.ts';
+import { merge3, mergeCanvas, mergeNote, sharedBase, words } from '../src/core/merge.ts';
 import { rng } from '../src/testing/netsim.ts';
 
 test('merge3 by words: different sentences of one paragraph merge', () => {
@@ -98,6 +98,117 @@ test('merge3 by words: fuzz against an independent oracle', () => {
     assert.equal(merge3(b, ours, b), ours);
     assert.equal(merge3(b, ours, ours), ours);
   }
+});
+
+test('merge3: lines two devices add at one place are both kept, storage\'s first', () => {
+  // `merge3(base, mine, storage's)`: appended to the end of a daily note on two devices.
+  assert.equal(mergeNote('# Day\n\n- a\n', '# Day\n\n- a\n- from mac\n', '# Day\n\n- a\n- from phone\n'), '# Day\n\n- a\n- from phone\n- from mac\n');
+  assert.equal(merge3('# Day\n\n- a\n', '# Day\n\n- a\n- one\n- two\n', '# Day\n\n- a\n- three\n'), '# Day\n\n- a\n- three\n- one\n- two\n');
+  // An item added at the same spot in the middle of a list, alone and beside edits elsewhere.
+  const list = (items: string[], end = 'end') => `# List\n\n${items.map((x) => `- ${x}\n`).join('')}\n${end}\n`;
+  assert.equal(merge3(list(['a', 'b', 'c']), list(['a', 'mac', 'b', 'c']), list(['a', 'phone', 'b', 'c'])), list(['a', 'phone', 'mac', 'b', 'c']));
+  assert.equal(merge3(list(['a', 'b', 'c']), list(['a', 'mac', 'b', 'c'], 'END'), list(['a', 'phone', 'b', 'C'])), list(['a', 'phone', 'mac', 'b', 'C'], 'END'));
+  // An item edited where the other side added one is not an addition on both sides.
+  assert.equal(merge3(list(['a', 'b']), list(['A', 'mac', 'b']), list(['a', 'phone', 'b'])), null);
+  // Into an empty text, and with Windows line endings.
+  assert.equal(merge3('', 'mine\n', 'theirs\n'), 'theirs\nmine\n');
+  assert.equal(merge3('# Day\r\n- a\r\n', '# Day\r\n- a\r\n- mac\r\n', '# Day\r\n- a\r\n- phone\r\n'), '# Day\r\n- a\r\n- phone\r\n- mac\r\n');
+});
+
+test('merge3: appending to a text whose last line has no line break', () => {
+  assert.equal(mergeNote('# Day\n\n- a', '# Day\n\n- a\n- from mac', '# Day\n\n- a\n- from phone'), '# Day\n\n- a\n- from phone\n- from mac');
+  assert.equal(merge3('a\r\nb', 'a\r\nb\r\nmac', 'a\r\nb\r\nphone'), 'a\r\nb\r\nphone\r\nmac');
+  assert.equal(merge3('one line', 'one line\nmac', 'one line\nphone'), 'one line\nphone\nmac');
+  // One side appends after the last line and the other edits further up.
+  assert.equal(merge3('top\nlast', 'TOP\nlast', 'top\nlast\nmore'), 'TOP\nlast\nmore');
+  assert.equal(merge3('top\nlast', 'top\nlast\nmore', 'TOP\nlast'), 'TOP\nlast\nmore');
+  // Whether the text ends with a line break merges like any other change.
+  assert.equal(merge3('top\nlast', 'top\nlast\n', 'TOP\nlast'), 'TOP\nlast\n');
+  assert.equal(merge3('top\nlast\n', 'top\nlast', 'TOP\nlast\n'), 'TOP\nlast');
+  assert.equal(merge3('top\nlast\n', 'top\nlast\nmac', 'top\nlast\nphone\n'), 'top\nlast\nphone\nmac');
+  // The last line edited differently on both sides is still a conflict.
+  assert.equal(merge3('top\nlast', 'top\nLAST', 'top\nLast'), null);
+});
+
+test('merge3: of two additions at one place where one begins or ends with the other, the longer is kept; the same one, once', () => {
+  const base = '- a\n- z\n';
+  const add = (...items: string[]) => `- a\n${items.map((x) => `- ${x}\n`).join('')}- z\n`;
+  assert.equal(merge3(base, add('x'), add('x', 'y')), add('x', 'y'));
+  assert.equal(merge3(base, add('x', 'y'), add('x')), add('x', 'y'));
+  assert.equal(merge3(base, add('y'), add('x', 'y')), add('x', 'y'));
+  assert.equal(merge3(base, add('x', 'y'), add('y')), add('x', 'y'));
+  assert.equal(merge3(`${base}tail\n`, `${add('x', 'y')}tail\n`, `${add('x', 'y')}TAIL\n`), `${add('x', 'y')}TAIL\n`);
+  // Whole lines only: "- x" does not end "- the x".
+  assert.equal(merge3(base, add('x'), add('the x')), add('the x', 'x'));
+  // Overlapping, but neither inside the other.
+  assert.equal(merge3(base, add('x', 'y'), add('y', 'w')), add('y', 'w', 'x', 'y'));
+});
+
+test('merge3: fuzz, lines only added on both sides, with or without final line breaks, always merge and keep each side\'s lines in order', () => {
+  const r = rng(13);
+  const pick = (n: number) => (r() * n) | 0;
+  // Few distinct lines, so additions often repeat a line already there.
+  const common = ['', '- a', '- b', '# H', 'text'];
+  const lineList = (s: string) => (s ? s.replace(/\n$/, '').split('\n') : []);
+  const inOrder = (part: string[], whole: string[]) => {
+    let k = 0;
+    for (const line of whole) if (k < part.length && line === part[k]) k++;
+    return k === part.length;
+  };
+  for (let iter = 0; iter < 3000; iter++) {
+    const base = Array.from({ length: pick(8) }, () => common[pick(common.length)]);
+    const add = (tag: string) => {
+      const out = [...base];
+      for (let n = 1 + pick(3); n > 0; n--) out.splice(pick(out.length + 1), 0, r() < 0.5 ? common[pick(common.length)] : `${tag} ${n}`);
+      return out;
+    };
+    // A blank last line can only be written with its line break.
+    const text = (ls: string[]) => ls.join('\n') + (ls.length && (ls.at(-1) === '' || r() < 0.5) ? '\n' : '');
+    const [b, ours, theirs] = [text(base), text(add('mine')), text(add('theirs'))];
+    const m = merge3(b, ours, theirs);
+    const what = JSON.stringify({ b, ours, theirs, m });
+    assert.notEqual(m, null, what);
+    assert.ok(inOrder(lineList(ours), lineList(m!)) && inOrder(lineList(theirs), lineList(m!)), what);
+  }
+});
+
+test('merge3: additions inside one line, and lines one side replaced, still conflict', () => {
+  assert.equal(merge3('I like cats\n', 'I love cats\n', 'I like dogs\n'), null);
+  assert.equal(merge3('alpha beta gamma\n', 'alpha beta gamma X\n', 'alpha beta gamma Y\n'), null);
+  assert.equal(merge3('- a\n- b\n- c\n', '- a\n- x\n- c\n', '- a\n- b\n- y\n- c\n'), null);
+});
+
+test('mergeNote: properties do not keep both sides\' additions at one place; the text below does', () => {
+  const note = (props: string, body: string) => `---\n${props}---\n${body}`;
+  // One key added with two values, or lines added to one value on both sides.
+  assert.equal(mergeNote(note('a: 1\n', 'x\n'), note('a: 1\nb: 2\n', 'x\n'), note('a: 1\nb: 3\n', 'x\n')), null);
+  assert.equal(mergeNote(note('d: |\n  one\n', 'x\n'), note('d: |\n  one\n  mac\n', 'x\n'), note('d: |\n  one\n  phone\n', 'x\n')), null);
+  assert.equal(mergeNote(note('a: 1\n', 'x\n'), note('a: 1\n', 'x\nmac\n'), note('a: 2\n', 'x\nphone\n')), note('a: 2\n', 'x\nphone\nmac\n'));
+  // A properties block one side added stays at the top, or the note conflicts.
+  assert.equal(mergeNote('text\n', note('a: 1\n', 'text\n'), 'new top\ntext\n'), null);
+  assert.equal(mergeNote('text\n', note('a: 1\n', 'text\n'), 'text\nmore\n'), note('a: 1\n', 'text\nmore\n'));
+});
+
+test('sharedBase: the lines two versions made apart share, when they are enough to be one note', () => {
+  const mac = '# 2026-11-14\n\n## Tasks\n- buy milk\n\n## Notes\n';
+  const phone = '# 2026-11-14\n\n## Tasks\n\n## Notes\n- an idea\n';
+  const base = sharedBase(mac, phone);
+  assert.equal(base, '# 2026-11-14\n\n## Tasks\n\n## Notes\n');
+  assert.equal(mergeNote(base!, mac, phone), '# 2026-11-14\n\n## Tasks\n- buy milk\n\n## Notes\n- an idea\n');
+  // A last line without a line break is still shared.
+  assert.equal(sharedBase('# Day\n- a', '# Day\n- a\n- b'), '# Day\n- a\n');
+  assert.equal(merge3('# Day\n- a\n', '# Day\n- a', '# Day\n- a\n- b'), '# Day\n- a\n- b');
+
+  // Two notes that only share a name, or share fewer than half the lines with text of the shorter: none.
+  assert.equal(sharedBase('Shopping\n- milk\n- eggs\n', 'Meeting\n- agenda\n'), undefined);
+  assert.equal(sharedBase('# Plan\n\none\ntwo\nthree\n', '# Plan\n\nfour\nfive\nsix\n'), undefined);
+  // Blank lines count for nothing.
+  assert.equal(sharedBase('\n\n\nmac\n', '\n\n\nphone\n'), undefined);
+  // Half is enough.
+  assert.equal(sharedBase('# Plan\none\n', '# Plan\ntwo\nthree\n'), '# Plan\n');
+  // An empty version has nothing to lose.
+  assert.equal(sharedBase('', 'text\n'), '');
+  assert.equal(merge3('', '', 'text\n'), 'text\n');
 });
 
 test('mergeNote: properties merge key by key and the text below merges as before', () => {

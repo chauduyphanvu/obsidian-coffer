@@ -24,13 +24,19 @@ export class LocalState {
   members: MemberChange[] = [];
   /** A shared folder with members: when each member's newest commit this device has taken was made, by member id. */
   lastBy = new Map<string, number>();
+  /**
+   * This device began syncing with no synced files (it is new, lost its state or accepted storage as it is) and has not
+   * yet finished a sync that settled every file both sides had: its files may be old copies, so none is merged without
+   * a common version (`SyncEngine.resolve`). A state saved before this was kept is fresh only with no synced files.
+   */
+  fresh = true;
 
   static parse(json: string | null): LocalState {
     const st = new LocalState();
     if (!json) return st;
     const w = JSON.parse(json) as {
       id: string; seq: number; h?: string; p: string[]; f: [string, WireEntry | 0, 0 | [number, number] | [number, number, WireEntry]][]; c?: string[];
-      m?: MemberChange[]; b?: [string, number][];
+      m?: MemberChange[]; b?: [string, number][]; n?: 1;
     };
     st.vaultId = w.id;
     st.lastSeq = w.seq;
@@ -43,6 +49,7 @@ export class LocalState {
     st.confirmed = new Set(w.c);
     st.members = w.m ?? [];
     st.lastBy = new Map(w.b);
+    st.fresh = !!w.n || !st.synced.size;
     return st;
   }
 
@@ -95,7 +102,8 @@ export class LocalState {
     const confirmed = this.confirmed.size ? `,"c":${JSON.stringify([...this.confirmed])}` : '';
     const members = this.members.length ? `,"m":${JSON.stringify(this.members)}` : '';
     const lastBy = this.lastBy.size ? `,"b":${JSON.stringify([...this.lastBy])}` : '';
-    return `{"id":${JSON.stringify(this.vaultId)},"seq":${this.lastSeq}${head},"p":${JSON.stringify(pt.list)},"f":[${out.join(',')}]${confirmed}${members}${lastBy}}`;
+    const fresh = this.fresh ? ',"n":1' : '';
+    return `{"id":${JSON.stringify(this.vaultId)},"seq":${this.lastSeq}${head},"p":${JSON.stringify(pt.list)},"f":[${out.join(',')}]${confirmed}${members}${lastBy}${fresh}}`;
   }
 }
 

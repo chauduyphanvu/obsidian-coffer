@@ -3,7 +3,7 @@ import { WrongPassphraseError, digest } from './crypto.ts';
 import { worthCompressing } from './compress.ts';
 import { copyChunks, fragmented, placeKey, planCompaction } from './compact.ts';
 import { compileExcludes, type SyncConfig } from './config.ts';
-import { merge3, mergeCanvas, mergeJson, mergeNote } from './merge.ts';
+import { merge3, mergeCanvas, mergeJson, mergeNote, sharedBase } from './merge.ts';
 import { Packer, packRanges } from './packer.ts';
 import { conflictCopyName, ext, vaultKey } from './paths.ts';
 import { nothingToDo, planChanges, type Local, type Plan } from './plan.ts';
@@ -13,18 +13,18 @@ import {
   type RekeyOffer, type Role,
 } from './members.ts';
 import { findDamage, repairReport, storeAgain, type RepairOptions, type RepairReport } from './repair.ts';
-import { Repo } from './repo.ts';
+import { Repo, StorageGoneError } from './repo.ts';
 import { INBOX, INBOX_OPENED, MAX_SEALED, SUGGEST_MAX_FILE, SUGGEST_MAX_TOTAL, inboxKey, openSuggestion, parseInboxKey, sealSuggestion, suggestKind, type SuggestedFile, type Suggestion } from './suggest.ts';
 import { collectGarbage, listVersions, type CleanupResult } from './retention.ts';
 import { LocalState } from './state.ts';
 import { errorText } from './text.ts';
 import { ReadOnlyError, hasChunks, putNew, readOnlyStore, sameContent, type Change, type ChunkRef, type Commit, type Entry, type FileStat, type Held, type LocalFS, type RemoteStore, type StateStore, type Version } from './types.ts';
-import { affectedBy, verifyRepo, type VerifyOptions, type VerifyReport } from './verify.ts';
+import { affectedBy, missingFiles, verifyRepo, type VerifyOptions, type VerifyReport } from './verify.ts';
 
 export type { VerifyOptions, VerifyProblem, VerifyReport } from './verify.ts';
 export type { RepairOptions, RepairReport } from './repair.ts';
 export { RemovedError, UnverifiedError } from './members.ts';
-export { PassphraseUnknownError } from './repo.ts';
+export { PassphraseUnknownError, StorageGoneError } from './repo.ts';
 
 /** What a device of a shared folder with members holds (`members.ts`). */
 export interface MemberOptions {
@@ -235,7 +235,8 @@ export interface MemberStatus {
   suggest?: true;
 }
 
-export interface GcResult extends CleanupResult {
+/** What a cleanup did, in counts. */
+export interface GcCounts extends CleanupResult {
   /** Packs whose current data was copied into fewer, fuller ones. */
   packsCombined: number;
   /** New packs that data went into. */
@@ -246,6 +247,13 @@ export interface GcResult extends CleanupResult {
    * no kept moment does: at the latest when the moments before the move have left the retention window.
    */
   bytesFreedLater: number;
+}
+
+export interface GcResult extends GcCounts {
+  /** Files whose current version needs data that storage no longer holds, as `VerifyProblem.paths`. */
+  missing: string[];
+  /** Files whose current version is whole, but an earlier version history offers needs such data, as `VerifyProblem.earlier`. */
+  missingEarlier: string[];
 }
 
 /**
@@ -301,6 +309,8 @@ const ORPHAN_SLOT_AGE = 3_600_000;
 /** For reads checked otherwise: in order (`Repo.checkInOrder`), or only by their digest. */
 const UNCHECKED = { unchecked: true };
 const PULL_BATCH = 32 << 20;
+/** A download saves the state after a batch once this long has passed since it began or last saved. */
+const PULL_SAVE_EVERY = 10_000;
 const MAX_RANGE = 8 << 20;
 const MOVE_CACHE = 64 << 20;
 const OPTIMISTIC_BYTES = 256 << 10;
@@ -370,6 +380,14 @@ interface Run {
   unsettled: Set<string>;
   /** See `SyncOptions.suggested`, by key. */
   suggested?: Map<string, string>;
+  /**
+   * This device's files may be old copies (`LocalState.fresh`), so one that differs from storage's with no common
+   * version keeps both versions, rather than merging as a note made on two devices apart (`tryMerge`) would, which
+   * brings back what either removed.
+   */
+  fresh: boolean;
+  /** Every path planned as changed on both sides, by key. */
+  conflicts: Set<string>;
 }
 
 /** The local files a pass works with. */
@@ -411,6 +429,10 @@ export class SyncEngine {
   private uploaded = new Map<string, ChunkRef>();
   /** When the log was last seen to continue from this device's newest commit. */
   private headSeen = -Infinity;
+  /** When storage was last seen to hold the vault's key file: on opening, then at the hourly check (`fetchRemote`). */
+  private headerSeen = -Infinity;
+  /** Storage was found without the vault's key file: nothing is committed without looking, and every look asks for it, until it is back. */
+  private gone = false;
   /** Undefined until a sync of this engine has listed the vault and finished, and again after one fails. */
   private known?: Known;
   /** Paths the next sync looks at even when told only of others: changed remotely since a sync planned them, or left unfinished. */
@@ -512,6 +534,7 @@ export class SyncEngine {
         }
         if (next) this.o.onPassphrase?.(this.o.passphrase);
       }
+      this.headerSeen = this.now();
     }
     if (!this.st) {
       const saved = await this.o.stateStore.load();
@@ -689,12 +712,24 @@ export class SyncEngine {
       // Two probes at once: "nothing new" and "exactly one new commit" both finish in a single round trip.
       // "Nothing new" cannot tell a quiet log from one cut back under this device, so at start and then
       // hourly a third read in the same round trip checks that this device's newest commit is still there.
+      // Nor from storage deleted under it: hourly, though not at start, which opening just did, a fourth
+      // checks that the vault's key file is still there.
       const checkHead = this.headDue(st);
-      const [first, second, head] = await Promise.all([
+      const checkHeader = this.gone || (checkHead && this.now() - this.headerSeen >= HEAD_CHECK_EVERY);
+      const [first, second, head, header] = await Promise.all([
         repo.readCommit(st.lastSeq + 1, UNCHECKED),
         repo.readCommit(st.lastSeq + 2, UNCHECKED),
         checkHead ? repo.readCommit(st.lastSeq, UNCHECKED) : undefined,
+        checkHeader ? repo.hasHeader() : undefined,
       ]);
+      if (header === false) {
+        this.gone = true;
+        throw new StorageGoneError();
+      }
+      if (header) {
+        this.headerSeen = this.now();
+        this.gone = false;
+      }
       if (head !== undefined) this.checkHead(st, head, first ?? second);
       if (!first) return settle(true) ? touched : again();
       await add(first);
@@ -978,11 +1013,12 @@ export class SyncEngine {
       conflictCopies: [], skipped: 0, tooLarge: [], deferred: [], unsent: [], arrived: [], errors: [], commits: 0, rounds: 0,
     };
     const { st } = await this.open();
+    if (!st.synced.size) st.fresh = true;
     const allow = new Set([...(opts.allowDeletes ?? [])].map(vaultKey));
     const known = this.known;
     const fetch = new Set([...(opts.fetch ?? [])].map(vaultKey));
     const suggested = opts.suggested && new Map([...opts.suggested].map(([path, sum]) => [vaultKey(path), sum]));
-    const run: Run = { force: !!opts.force, allow, fetch, known: known ?? { tooLarge: new Set(), paths: new Map() }, unsettled: new Set(), suggested };
+    const run: Run = { force: !!opts.force, allow, fetch, known: known ?? { tooLarge: new Set(), paths: new Map() }, unsettled: new Set(), suggested, fresh: st.fresh, conflicts: new Set() };
     if (opts.changed && known) {
       run.hint = new Map();
       for (const p of opts.changed) run.hint.set(vaultKey(p), p);
@@ -1004,6 +1040,12 @@ export class SyncEngine {
         this.known = run.known;
         this.recheck = new Set([...res.errors.map((e) => e.path), ...run.unsettled]);
         this.unplanned = false;
+        // Every file this device had apart from storage now has a version both agreed on: a difference from here on is an edit.
+        if (st.fresh && ![...run.conflicts].some((k) => this.recheck.has(k))) {
+          st.fresh = false;
+          this.unsaved = true;
+          await this.save();
+        }
       }
       this.stuck = false;
       if (this.book) {
@@ -1033,7 +1075,7 @@ export class SyncEngine {
     // itself fails if it did, and the next pass sorts it out. Saves a round trip on the common case.
     // The commit also checks that storage still holds the commit before it (`put`), so it need not wait for the hourly check.
     const optimistic =
-      first && st.lastSeq > 0 && st.head !== undefined && this.adopted?.st !== st &&
+      first && !this.gone && st.lastSeq > 0 && st.head !== undefined && this.adopted?.st !== st &&
       p.pushes.length + p.pushDeletes.length > 0 && !p.pulls.length && !p.pullDeletes.length && !p.conflicts.length &&
       p.pushes.reduce((n, f) => n + f.size, 0) <= OPTIMISTIC_BYTES && !this.readOnly();
     if (!optimistic && (await this.fetchRemote()).size) {
@@ -1051,10 +1093,15 @@ export class SyncEngine {
 
     const pass: Pass = { repo, st, local: v.local, keys: v.keys, run, res, pulls: p.pulls.length + p.conflicts.length, downloaded: 0 };
     const moved = await this.deleteLocal(pass, p);
+    // Notes first, so a long first download shows them early, then the smallest files.
+    const text = (key: string) => (this.cfg.mergeExtensions.includes(ext(key)) ? 0 : 1);
+    const size = (key: string) => st.remote.get(key)!.size;
+    p.pulls.sort((x, y) => text(x) - text(y) || size(x) - size(y) || (x < y ? -1 : x > y ? 1 : 0));
     await this.pull(pass, p.pulls, moved);
     await this.save();
 
     for (const key of p.conflicts) {
+      run.conflicts.add(key);
       try {
         const extra = await this.resolve(pass, key, v.local.get(key)!);
         if (extra) p.pushes.push(extra);
@@ -1208,10 +1255,11 @@ export class SyncEngine {
     this.o.onProgress?.({ phase: 'download', done: ++pass.downloaded, total: pass.pulls });
   }
 
-  /** Downloads remote changes in batches. `moved` holds the bytes of files a move already has here. */
+  /** Downloads remote changes in batches, saving the state now and then between them. `moved` holds the bytes of files a move already has here. */
   private async pull(pass: Pass, pulls: string[], moved: Map<string, Uint8Array>): Promise<void> {
     const { repo, st, local, res } = pass;
     const fs = this.o.fs;
+    let saved = this.now();
     for (let i = 0; i < pulls.length; ) {
       const batch: string[] = [];
       for (let bytes = 0; i < pulls.length && (bytes < PULL_BATCH || !batch.length); i++) {
@@ -1283,6 +1331,12 @@ export class SyncEngine {
           recordError(res, key, err);
         }
       });
+      // So that a download cut short, as when iOS suspends the app, need not read back what it wrote. A file not
+      // written yet keeps the version it last agreed on, which differs from the remote table, so it is pulled again.
+      if (this.now() - saved >= PULL_SAVE_EVERY) {
+        await this.save();
+        saved = this.now();
+      }
     }
   }
 
@@ -1320,7 +1374,7 @@ export class SyncEngine {
     const settings = key.startsWith(`${this.cfg.configDir}/`);
     const merged = settings
       ? await this.mergeSettings(key, base, mine, r)
-      : this.cfg.conflictStrategy === 'merge' && base && this.cfg.mergeExtensions.includes(ext(key))
+      : this.cfg.conflictStrategy === 'merge' && (base || !run.fresh) && this.cfg.mergeExtensions.includes(ext(key))
         ? await this.tryMerge(key, base, mine, r)
         : null;
     if (merged) {
@@ -1372,13 +1426,20 @@ export class SyncEngine {
     }
   }
 
-  private async tryMerge(key: string, base: Entry, mine: Uint8Array, remote: Entry): Promise<Uint8Array | null> {
+  /**
+   * With no common version, as for one note made from a template on two devices before either synced, the lines both
+   * have stand in for it (`sharedBase`). Not for a canvas: its lines are mostly layout, which any two canvases share.
+   */
+  private async tryMerge(key: string, base: Entry | undefined, mine: Uint8Array, remote: Entry): Promise<Uint8Array | null> {
+    const kind = ext(key);
+    if (!base && kind === 'canvas') return null;
     try {
       const text = (data: Uint8Array) => new TextDecoder('utf-8', { fatal: true }).decode(data);
-      const [theirBase, theirs] = await Promise.all([this.readVersion(base), this.readVersion(remote)]);
-      const kind = ext(key);
+      const [theirBase, theirs] = await Promise.all([base && this.readVersion(base), this.readVersion(remote)]);
       const merge = kind === 'canvas' ? mergeCanvas : kind === 'md' || kind === 'markdown' ? mergeNote : merge3;
-      const merged = merge(text(theirBase), text(mine), text(theirs));
+      const [ours, t] = [text(mine), text(theirs)];
+      const ancestor = theirBase ? text(theirBase) : sharedBase(ours, t);
+      const merged = ancestor === undefined ? null : merge(ancestor, ours, t);
       return merged === null ? null : new TextEncoder().encode(merged);
     } catch {
       // Not text, or the base version is no longer stored: fall back to keeping both.
@@ -1528,6 +1589,11 @@ export class SyncEngine {
     ]);
     if (!hash || before === undefined) return hash;
     try {
+      // The newest commit gone along with the key file is storage deleted, not rolled back.
+      if (!before && !(await repo.hasHeader())) {
+        this.gone = true;
+        throw new StorageGoneError();
+      }
       this.checkHead(st, before, null);
     } catch (e) {
       await repo.retractCommit(c.seq, hash).catch((x) => this.log(`Could not take back commit ${c.seq}: ${errorText(x)}`));
@@ -1610,7 +1676,7 @@ export class SyncEngine {
     return this.exclusive(async () => {
       const { st } = await this.open();
       await this.fetchRemote();
-      const run: Run = { force: false, allow: new Set(), fetch: new Set(), known: { tooLarge: new Set(), paths: new Map() }, unsettled: new Set() };
+      const run: Run = { force: false, allow: new Set(), fetch: new Set(), known: { tooLarge: new Set(), paths: new Map() }, unsettled: new Set(), fresh: st.fresh, conflicts: new Set() };
       const { local, tooLarge } = await this.scan(run, st);
       let kept = 0;
       for (const key of [...st.synced.keys()]) {
@@ -1769,6 +1835,16 @@ export class SyncEngine {
     return refs;
   }
 
+  /** True when sync leaves the file at `path` alone, as its scan of this device's files does: excluded, or not one it accepts (`only`). */
+  ignores(path: string): boolean {
+    return this.excluded(vaultKey(path));
+  }
+
+  /** The newest commit this device has seen, as far as it last read the log: what its heartbeat gives. Asks storage nothing. */
+  position(): number {
+    return this.st?.lastSeq ?? 0;
+  }
+
   /** True when the current files are spread over so many small packs that cleanup would save a new device many requests. */
   async compactionDue(): Promise<boolean> {
     const { st } = await this.open();
@@ -1779,16 +1855,18 @@ export class SyncEngine {
    * Deletes stored data that no kept version needs, then copies the current data of small or mostly
    * dead packs into fuller ones, at most `compactMaxBytes` a run. Every version keeps reading its data
    * where it was recorded, so the packs it came from stay until no kept moment reads them: no reader,
-   * older plugin versions included, has to know about the move.
+   * older plugin versions included, has to know about the move. Also says which files need data that
+   * storage no longer holds, found from the same listing (`collectGarbage`).
    */
   gc(): Promise<GcResult> {
     return this.exclusive(async () => {
-      const none = { packsDeleted: 0, bytesFreed: 0, snapshotsDeleted: 0, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0 };
+      const none = { packsDeleted: 0, bytesFreed: 0, snapshotsDeleted: 0, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0, missing: [], missingEarlier: [] };
       if (this.cfg.readOnly) return none;
       const { repo, st, cfg, now } = await this.refresh();
       if (this.readOnly()) return none;
-      const { result, packs } = await collectGarbage(repo, st, cfg, now);
-      const out: GcResult = { ...result, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0 };
+      const { result, packs, missing } = await collectGarbage(repo, st, cfg, now);
+      const lost = await missingFiles(repo, st, cfg, now, packs, missing);
+      const out: GcResult = { ...result, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0, missing: lost.paths, missingEarlier: lost.earlier };
       const plan = planCompaction(packs, st.remote, cfg, now);
       if (!plan) return out;
       const moved = await copyChunks(repo, plan, cfg);

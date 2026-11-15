@@ -108,6 +108,21 @@ const kindOf = (key: string) => (isAttachment(key) ? KINDS.get(ext(key)) : undef
 const byText = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 /** Ignoring letter case first, for lists a person reads; then exactly, so the order never depends on where it runs. */
 const byName = (a: string, b: string) => byText(a.toLowerCase(), b.toLowerCase()) || byText(a, b);
+/** As `byName`, but a run of digits counts by the number it is: "Note 2" before "Note 10". */
+function byNumbers(a: string, b: string): number {
+  const runs = (s: string) => s.toLowerCase().match(/\d+|\D+/g) ?? [];
+  const x = runs(a);
+  const y = runs(b);
+  for (let i = 0; i < x.length && i < y.length; i++) {
+    if (x[i] === y[i]) continue;
+    if (!/^\d/.test(x[i]) || !/^\d/.test(y[i])) return byText(x[i], y[i]);
+    const m = x[i].replace(/^0+/, '');
+    const n = y[i].replace(/^0+/, '');
+    const d = m.length - n.length || byText(m, n);
+    if (d) return d;
+  }
+  return x.length - y.length || byName(a, b);
+}
 const oneLine = (s: string) => s.replace(/\s+/g, ' ').trim();
 
 /** Whether a note's text says `publish: true` in its properties. False for anything else, and when the properties can not be read. */
@@ -307,10 +322,11 @@ interface Page {
   found?: Found;
 }
 
-/** What rendering a page met: links to nothing, links to notes not on the site, and the files it shows or links. */
+/** What rendering a page met: links to nothing, links to notes not on the site, the pages it links or shows, and the files it shows or links. */
 interface Found {
   missing: Set<string>;
   unpublished: Set<string>;
+  pages: Set<Page>;
   shows: Set<string>;
 }
 
@@ -386,6 +402,14 @@ function navHtml(pages: Page[]): string {
     return `<ul>\n${[...folders, ...pages].join('\n')}\n</ul>`;
   };
   return `<nav class="pages">\n${list(root)}\n</nav>`;
+}
+
+/** The list at the foot of `page` of the pages `from` that link to it or show it, by title. */
+function linkedFromHtml(page: Page, from: Page[]): string {
+  const items = from
+    .sort((a, b) => byNumbers(a.title!, b.title!) || byText(a.site, b.site))
+    .map((p) => `<li><a href="${escapeHtml(relativeHref(page.site, p.site))}">${escapeHtml(p.title!)}</a></li>`);
+  return `<nav class="backlinks">\n<h2>Linked from</h2>\n<ul>\n${items.join('\n')}\n</ul>\n</nav>`;
 }
 
 /**
@@ -472,7 +496,10 @@ export async function buildSite(vault: VaultReader, o: SiteOptions): Promise<Sit
       return null;
     }
     const to = pages.get(key);
-    if (to) return to;
+    if (to) {
+      found.pages.add(to);
+      return to;
+    }
     if (isNote(key)) {
       if (!outNotes.has(key)) found.unpublished.add(target);
       return null;
@@ -490,7 +517,7 @@ export async function buildSite(vault: VaultReader, o: SiteOptions): Promise<Sit
   };
 
   const render = (page: Page) => {
-    const found: Found = { missing: new Set(), unpublished: new Set(), shows: new Set() };
+    const found: Found = { missing: new Set(), unpublished: new Set(), pages: new Set(), shows: new Set() };
     const href = (to: Page | string) => relativeHref(page.site, typeof to === 'string' ? to : to.site);
     const r = renderMarkdown(page.body, {
       link: (target) => {
@@ -535,9 +562,25 @@ export async function buildSite(vault: VaultReader, o: SiteOptions): Promise<Sit
   // Rendering again only takes away: a page that showed a dropped file now shows it as missing or not at all.
   if (dropped.size) for (const p of order) if ([...p.found!.shows].some((k) => dropped.has(k))) render(p);
 
+  // What links to a page is taken from what the pages showed, as files are: a link in a comment counts for nothing. The
+  // front page lists every page already, so it gets no list of its own, but it is on the list of each page it links to.
+  const linkedFrom = new Map<Page, Page[]>();
+  for (const p of order) {
+    for (const to of p.found!.pages) {
+      if (to === p) continue;
+      const from = linkedFrom.get(to);
+      if (from) from.push(p);
+      else linkedFrom.set(to, [p]);
+    }
+  }
+
   const files = new Map<string, SiteFile>();
   const html = (s: string): SiteFile => ({ data: encoder.encode(s), type: HTML_TYPE });
-  for (const p of order) if (p !== home) files.set(p.site, html(documentHtml(p.site, `${p.title} – ${siteTitle}`, siteTitle, p.article!)));
+  for (const p of order) {
+    if (p === home) continue;
+    const from = linkedFrom.get(p);
+    files.set(p.site, html(documentHtml(p.site, `${p.title} – ${siteTitle}`, siteTitle, from ? `${p.article!}\n${linkedFromHtml(p, from)}` : p.article!)));
+  }
   const others = order.filter((p) => p !== home);
   const front = [
     home ? home.article! : `<h1 class="title">${escapeHtml(siteTitle)}</h1>`,

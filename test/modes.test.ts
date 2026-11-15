@@ -715,7 +715,7 @@ test('cleanup, a passphrase change and the history of a device that only reads w
   await b.sync();
   const header = Buffer.from(mem.objects.get('vault.json')!.data).toString();
   netB.reset();
-  assert.deepEqual(await b.engine.gc(), { packsDeleted: 0, bytesFreed: 0, snapshotsDeleted: 0, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0 });
+  assert.deepEqual(await b.engine.gc(), { packsDeleted: 0, bytesFreed: 0, snapshotsDeleted: 0, packsCombined: 0, packsWritten: 0, bytesMoved: 0, bytesFreedLater: 0, missing: [], missingEarlier: [] });
   assert.deepEqual(netB.stats, { get: 0, put: 0, list: 0, delete: 0, up: 0, down: 0 }, 'no request at all');
 
   await assert.rejects(b.engine.changePassphrase('another passphrase'), ReadOnlyError);

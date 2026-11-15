@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { WrongPassphraseError } from '../src/core/crypto.ts';
-import { HistoryError, SafetyError, type SyncResult } from '../src/core/engine.ts';
+import { HistoryError, SafetyError, StorageGoneError, type SyncResult } from '../src/core/engine.ts';
 import { MissingFolderError } from '../src/core/scopedfs.ts';
 import { plural } from '../src/core/text.ts';
-import { connectError, describeFailure, inShare, isConflictProblem, keptNote, keysMissingProblem, leftInStorage, missingProblem, passphraseFailure, quietText, resultProblems, RunProgress, staleProblem, statusText, summarize, targetProblems, type Problem } from '../src/plugin/status.ts';
+import { connectError, describeFailure, inShare, isConflictProblem, keptNote, keysMissingProblem, leftInStorage, lostProblems, missingProblem, passphraseFailure, quietText, resultProblems, RunProgress, staleProblem, statusText, summarize, targetProblems, type Problem } from '../src/plugin/status.ts';
 
 const result = (over: Partial<SyncResult> = {}): SyncResult => ({
   pushed: 0, pulled: 0, deletedLocal: 0, deletedRemote: 0, merged: 0, conflictCopies: [], skipped: 0, tooLarge: [], deferred: [], unsent: [], arrived: [], errors: [], commits: 0, rounds: 1, ...over,
@@ -16,6 +16,43 @@ test('summaries count in words that read right for one', () => {
   assert.equal(summarize(result({ conflictCopies: ['a', 'b'], errors: [{ path: 'x', message: 'y' }] })), '2 conflict copies, 1 failed');
   assert.equal(plural(1, 'file'), '1 file');
   assert.equal(plural(1200, 'file'), '1,200 files');
+});
+
+test('a summary says how many files the sync left in storage, also when it did nothing else', () => {
+  assert.equal(summarize(result({ deferred: ['a.mov'] })), 'everything is up to date · 1 file left in storage');
+  assert.equal(summarize(result({ deferred: ['a.mov', 'b.mov'] })), 'everything is up to date · 2 files left in storage');
+  assert.equal(summarize(result({ pulled: 3, deferred: ['a.mov', 'b.mov'] })), '3 received, 2 left in storage');
+});
+
+test('what a cleanup found missing from storage: the current version of a file is critical and offers a repair, an earlier version only is a warning', () => {
+  assert.deepEqual(lostProblems({ current: [], earlier: [] }), []);
+  const [one] = lostProblems({ current: ['Notes/a.md'], earlier: [] });
+  assert.deepEqual([one.severity, one.title, one.action], ['critical', 'Data for 1 file is missing from storage', 'repair']);
+  assert.equal(
+    one.detail,
+    'Storage no longer holds data that this file needs, so other devices cannot download it. Run Repair from a device that has it to store its data again.\nNotes/a.md',
+  );
+
+  const many = Array.from({ length: 12 }, (_, i) => `n${String(i).padStart(2, '0')}.md`);
+  const [current, earlier] = lostProblems({ current: many, earlier: ['old.md', 'x.md'] });
+  assert.equal(current.title, 'Data for 12 files is missing from storage');
+  assert.match(current.detail, /^Storage no longer holds data that these files need, so other devices cannot download them\. Run Repair from a device that has them to store their data again\.\n/);
+  assert.deepEqual(current.detail.split('\n').slice(1), [...many.slice(0, 10), 'and 2 more']);
+  assert.deepEqual([earlier.severity, earlier.title, earlier.action], ['warning', 'Earlier versions of 2 files can no longer be restored', undefined]);
+  assert.equal(earlier.detail, 'Storage no longer holds data that earlier versions of these files need. Their current versions are whole and sync as before.\nold.md\nx.md');
+  assert.notEqual(lostProblems({ current: ['a.md'], earlier: [] })[0].id, lostProblems({ current: ['a.md', 'b.md'], earlier: [] })[0].id, 'more files missing is told anew');
+});
+
+test('storage that no longer holds the vault is told apart for the vault and for a shared folder, also as opening a shared folder with members finds it', () => {
+  const vault = describeFailure(new StorageGoneError());
+  assert.deepEqual([vault.id, vault.severity, vault.title, vault.action], ['storage-gone', 'critical', "The vault's storage is gone", undefined]);
+  assert.match(vault.detail, /Do not set up sync again until you know why\. Your files on this device are untouched\.$/);
+  const share = describeFailure(new StorageGoneError(), undefined, true);
+  assert.deepEqual([share.id, share.severity, share.title, share.action], ['storage-gone', 'critical', "This shared folder's storage is gone", 'stop-sharing']);
+  assert.match(share.detail, /its owner may have stopped sharing it, or the storage was emptied\. .*remove it under Shared folders\.$/);
+  const opening = new StorageGoneError('The shared folder is missing from storage: its key file, vault.json, is gone');
+  assert.deepEqual(describeFailure(opening, { owner: false, ownerName: 'Vu' }, true), share);
+  assert.notEqual(describeFailure(new Error(opening.message), { owner: false, ownerName: 'Vu' }, true).id, 'storage-gone', 'told by its type, not its words');
 });
 
 test('failures are described by what the user can do about them', () => {
