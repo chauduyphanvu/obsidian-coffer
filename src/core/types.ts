@@ -150,6 +150,8 @@ export interface LocalFS {
   write(path: string, data: Uint8Array, mtime?: number): Promise<FileStat>;
   remove(path: string): Promise<void>;
   stat(path: string): Promise<FileStat | null>;
+  /** Moves a file, creating the folders `to` needs, and keeps its time. Without it the engine writes `to` and removes `from`. */
+  rename?(from: string, to: string): Promise<FileStat>;
 }
 
 export interface StateStore {

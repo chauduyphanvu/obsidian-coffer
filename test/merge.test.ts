@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { merge3, mergeCanvas, mergeNote, words } from '../src/core/merge.ts';
+import { merge3, mergeAdded, mergeCanvas, mergeNote, words } from '../src/core/merge.ts';
 import { rng } from '../src/testing/netsim.ts';
 
 test('merge3 by words: different sentences of one paragraph merge', () => {
@@ -470,4 +470,17 @@ test('mergeCanvas: a result equal to one side is that side\'s bytes, any other i
   // Other top-level keys merge like settings.
   const keyed = JSON.parse(mergeCanvas('{"nodes":[],"edges":[],"v":1,"k":{"a":1}}', '{"nodes":[],"edges":[],"v":2,"k":{"a":1}}', '{"nodes":[{"id":"n"}],"edges":[],"v":1,"k":{"a":1,"b":2}}')!);
   assert.deepEqual(keyed, { nodes: [{ id: 'n' }], edges: [], v: 2, k: { a: 1, b: 2 } });
+});
+
+test('mergeAdded keeps the version that holds all of the other, and nothing when neither does', () => {
+  const template = '## Tasks\n- [ ] \n\n## Notes\n';
+  const filled = '## Tasks\n- [ ] Call the plumber\n- [ ] Buy milk\n\n## Notes\nSlept well.\n';
+  assert.equal(mergeAdded(template, filled), filled);
+  assert.equal(mergeAdded(filled, template), filled);
+  // A task ticked on one side only, a line changed, lines in another order: neither holds the other.
+  assert.equal(mergeAdded('- [ ] buy milk\n', '- [x] buy milk\n'), null);
+  assert.equal(mergeAdded('Created 09:01\n', 'Created 09:03\n'), null);
+  assert.equal(mergeAdded('a\nb\n', 'b\na\n'), null);
+  // Trailing spaces and a missing last newline do not matter.
+  assert.equal(mergeAdded('one  \ntwo', 'one\ntwo\nthree\n'), 'one\ntwo\nthree\n');
 });

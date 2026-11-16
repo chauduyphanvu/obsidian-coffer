@@ -3,7 +3,7 @@ import { WrongPassphraseError, digest } from './crypto.ts';
 import { worthCompressing } from './compress.ts';
 import { copyChunks, fragmented, placeKey, planCompaction } from './compact.ts';
 import { compileExcludes, type SyncConfig } from './config.ts';
-import { merge3, mergeCanvas, mergeJson, mergeNote, mergeStrict } from './merge.ts';
+import { merge3, mergeAdded, mergeByLines, mergeCanvas, mergeJson, mergeNote, mergeStrict } from './merge.ts';
 import { Packer, packRanges } from './packer.ts';
 import { conflictCopyName, ext, vaultKey } from './paths.ts';
 import { nothingToDo, planChanges, type Local, type Plan } from './plan.ts';
@@ -391,6 +391,8 @@ interface Run {
   unsettled: Set<string>;
   /** See `SyncOptions.suggested`, by key. */
   suggested?: Map<string, string>;
+  /** This device held no version agreed with storage when the run began: its first sync, or the first after `acceptStorage`. */
+  first?: boolean;
 }
 
 /** The local files a pass works with. */
@@ -1020,7 +1022,7 @@ export class SyncEngine {
     const known = this.known;
     const fetch = new Set([...(opts.fetch ?? [])].map(vaultKey));
     const suggested = opts.suggested && new Map([...opts.suggested].map(([path, sum]) => [vaultKey(path), sum]));
-    const run: Run = { force: !!opts.force, allow, fetch, known: known ?? { tooLarge: new Set(), paths: new Map() }, unsettled: new Set(), suggested };
+    const run: Run = { force: !!opts.force, allow, fetch, known: known ?? { tooLarge: new Set(), paths: new Map() }, unsettled: new Set(), suggested, first: st.synced.size === 0 };
     if (opts.changed && known) {
       run.hint = new Map();
       for (const p of opts.changed) run.hint.set(vaultKey(p), p);
@@ -1081,6 +1083,7 @@ export class SyncEngine {
     if (this.book?.removed(st.members)) throw new RemovedError();
     res.tooLarge = this.tooLarge(st, v.tooLarge);
     res.deferred = this.deferredKeys(st, v, defer);
+    if (await this.followMoves(repo, st, v.local, v.keys, p, res)) p = planChanges(v.local, st, this.excluded, maxSize, v.tooLarge, v.keys, defer);
 
     if (nothingToDo(p)) return false;
     if (this.o.sendOnly) this.sendAgain(p, v.local, st, run);
@@ -1116,6 +1119,91 @@ export class SyncEngine {
     await this.save();
     // An optimistic pass that ended up committing nothing has not looked at the remote at all yet.
     return again || (optimistic && res.commits === commitsBefore);
+  }
+
+  /**
+   * A file moved on one device and edited on another before they synced. Left to the plan, the edit wins at the old
+   * name and the move brings an unedited copy to the new one. Here the edit goes to the new name instead, in both
+   * directions. Paired only by content, when the side that moved the file did not change it and exactly one file on
+   * each side fits, so two files that merely look alike are never joined. Returns true when the plan must be made again.
+   */
+  private async followMoves(repo: Repo, st: LocalState, local: Map<string, Local>, keys: Set<string> | undefined, p: Plan, res: SyncResult): Promise<boolean> {
+    if (this.readOnly() || this.o.sendOnly) return false;
+    const fs = this.o.fs;
+    const add = <T>(m: Map<string, T[]>, k: string, v: T) => m.set(k, [...(m.get(k) ?? []), v]);
+    const only = <T>(m: Map<string, T[]>, k: string) => (m.get(k)?.length === 1 ? m.get(k)![0] : undefined);
+    let followed = 0;
+
+    // Moved in storage, edited here: what storage has under the new name is the version both last agreed on.
+    const editedHere = new Map<string, string[]>();
+    for (const l of p.pushes) {
+      const s = st.synced.get(l.key);
+      if (s && s.entry.size > 0 && !st.remote.has(l.key)) add(editedHere, contentKey(s.entry), l.key);
+    }
+    if (editedHere.size) {
+      const arrived = new Map<string, string[]>();
+      for (const key of p.pulls) if (!local.has(key) && !st.synced.has(key)) add(arrived, contentKey(st.remote.get(key)!), key);
+      for (const [ck, from] of editedHere) {
+        const to = only(arrived, ck);
+        if (from.length !== 1 || !to) continue;
+        const l = local.get(from[0])!;
+        try {
+          if (!unchanged(await fs.stat(l.path), l) || (await fs.stat(to))) continue;
+          const stat = fs.rename ? await fs.rename(l.path, to) : await fs.write(to, await fs.read(l.path), l.mtime);
+          if (!fs.rename) await fs.remove(l.path);
+          st.synced.delete(from[0]);
+          // As if this device had taken the move and then made its edit: the edit is sent under the new name.
+          st.synced.set(to, { entry: st.remote.get(to)!, lsize: -1, lmtime: -1 });
+          local.delete(from[0]);
+          local.set(to, { key: to, path: to, ...stat });
+          keys?.add(to);
+          followed++;
+        } catch (e) {
+          recordError(res, from[0], e);
+        }
+      }
+    }
+
+    // Moved here, edited in storage: the file under the new name still holds the version both last agreed on.
+    const editedThere = new Map<string, string[]>();
+    for (const key of p.pulls) {
+      const s = st.synced.get(key);
+      if (s && s.entry.size > 0 && !local.has(key)) add(editedThere, contentKey(s.entry), key);
+    }
+    if (editedThere.size) {
+      const sizes = new Set([...editedThere.values()].map((k) => st.synced.get(k[0])!.entry.size));
+      const movedHere = new Map<string, Local[]>();
+      for (const l of p.pushes) {
+        if (st.synced.has(l.key) || st.remote.has(l.key) || !sizes.has(l.size)) continue;
+        try {
+          add(movedHere, (await repo.split(await fs.read(l.path))).ids.join(','), l);
+        } catch {
+          // Unreadable now: the push reports it.
+        }
+      }
+      for (const [ck, from] of editedThere) {
+        const l = only(movedHere, ck);
+        if (from.length !== 1 || !l) continue;
+        const r = st.remote.get(from[0])!;
+        try {
+          const data = await this.readVersion(r);
+          if (!unchanged(await fs.stat(l.path), l)) continue;
+          const stat = await fs.write(l.path, data, r.mtime);
+          // The old name agrees with storage and is gone here, so its deletion is sent; the new name is sent with the edit.
+          st.synced.set(from[0], { entry: r, lsize: -1, lmtime: -1 });
+          st.synced.set(l.key, { entry: r, lsize: -1, lmtime: -1 });
+          local.set(l.key, { ...l, ...stat });
+          keys?.add(from[0]);
+          followed++;
+        } catch (e) {
+          recordError(res, l.key, e);
+        }
+      }
+    }
+    if (!followed) return false;
+    res.merged += followed;
+    this.unsaved = true;
+    return true;
   }
 
   /**
@@ -1367,11 +1455,14 @@ export class SyncEngine {
 
     // A copy in the settings folder would never be read or shown, so settings are always combined.
     const settings = key.startsWith(`${this.cfg.configDir}/`);
+    const mergeable = this.cfg.conflictStrategy === 'merge' && this.cfg.mergeExtensions.includes(ext(key));
     const merged = settings
       ? await this.mergeSettings(key, base, mine, r)
-      : this.cfg.conflictStrategy === 'merge' && base && this.cfg.mergeExtensions.includes(ext(key))
+      : mergeable && base
         ? await this.tryMerge(key, base, mine, r)
-        : null;
+        : mergeable && !run.first && ext(key) !== 'canvas'
+          ? await this.tryAdded(mine, r)
+          : null;
     if (merged) {
       // Fetching the other versions took a moment; do not write over an edit made meanwhile.
       if (!unchanged(await fs.stat(l.path), l)) {
@@ -1427,13 +1518,28 @@ export class SyncEngine {
     }
   }
 
+  /**
+   * The same note made on two devices before either synced, as a daily note opened on both (`mergeAdded`). Never on a
+   * device's first sync or after accepting older storage: an old copy could hold lines deleted elsewhere since.
+   */
+  private async tryAdded(mine: Uint8Array, remote: Entry): Promise<Uint8Array | null> {
+    try {
+      const text = (data: Uint8Array) => new TextDecoder('utf-8', { fatal: true }).decode(data);
+      const merged = mergeAdded(text(mine), text(await this.readVersion(remote)));
+      return merged === null ? null : new TextEncoder().encode(merged);
+    } catch {
+      return null;
+    }
+  }
+
   /** `merge` replaces the merge `key`'s kind of file takes. */
   private async tryMerge(key: string, base: Entry, mine: Uint8Array, remote: Entry, merge?: typeof merge3): Promise<Uint8Array | null> {
     try {
       const text = (data: Uint8Array) => new TextDecoder('utf-8', { fatal: true }).decode(data);
       const [theirBase, theirs] = await Promise.all([this.readVersion(base), this.readVersion(remote)]);
       const kind = ext(key);
-      const merged = (merge ?? (kind === 'canvas' ? mergeCanvas : kind === 'md' || kind === 'markdown' ? mergeNote : merge3))(text(theirBase), text(mine), text(theirs));
+      const byKind = kind === 'canvas' ? mergeCanvas : kind === 'md' || kind === 'markdown' ? mergeNote : kind === 'base' ? mergeByLines : merge3;
+      const merged = (merge ?? byKind)(text(theirBase), text(mine), text(theirs));
       return merged === null ? null : new TextEncoder().encode(merged);
     } catch {
       // Not text, or the base version is no longer stored: fall back to keeping both.

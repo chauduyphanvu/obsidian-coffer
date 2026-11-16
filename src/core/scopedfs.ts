@@ -45,10 +45,13 @@ export class ScopedFS implements LocalFS {
    * `folder` is read on every call, so a folder renamed while a sync runs is followed at once. `mounts` are all the
    * shared folders; those inside this scope belong to other engines and are neither listed nor written.
    */
+  rename?: (from: string, to: string) => Promise<FileStat>;
+
   constructor(inner: FolderFS, folder: () => string, mounts: () => string[] = () => []) {
     this.inner = inner;
     this.at = folder;
     this.mounts = mounts;
+    if (inner.rename) this.rename = (from, to) => inner.rename!(this.pathOf(from), this.pathOf(to));
   }
 
   get folder(): string {

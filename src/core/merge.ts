@@ -206,6 +206,17 @@ export function mergeStrict(base: string, ours: string, theirs: string): string 
   return mergeTokens(splitLines(base), splitLines(ours), splitLines(theirs), undefined, mergeWords);
 }
 
+/**
+ * Three-way merge by whole lines, where anything both sides changed at one place conflicts: for a base, whose YAML
+ * holds settings, so two edits to one line or one spot are two values for the same thing.
+ */
+export function mergeByLines(base: string, ours: string, theirs: string): string | null {
+  if (ours === theirs) return ours;
+  if (base === ours) return theirs;
+  if (base === theirs) return ours;
+  return mergeTokens(splitLines(base), splitLines(ours), splitLines(theirs));
+}
+
 /** A note's properties block, cut so that `open + props + close + body` is the whole text. */
 export interface Front {
   open: string;
@@ -324,6 +335,26 @@ function mergeProperties(base: string, ours: string, theirs: string): string | n
     out += merged ?? '';
   }
   return out;
+}
+
+/**
+ * Two versions of a note made apart, with no common version: the one that holds all of the other, in order, where a
+ * line of the other may only have been carried on (a task filled in, a heading typed after). Null when neither holds
+ * the other. One whole version is kept, so nothing either side wrote is lost and nothing is spliced: a task ticked on
+ * one side and not on the other holds neither way.
+ */
+export function mergeAdded(ours: string, theirs: string): string | null {
+  const content = (line: string) => line.replace(/\s+$/, '');
+  const holds = (big: string[], small: string[]) => {
+    let i = 0;
+    // The earliest place for each line is never worse than a later one, so a single pass decides.
+    for (const line of big) if (i < small.length && content(line).startsWith(content(small[i]))) i++;
+    return i === small.length;
+  };
+  const [o, t] = [splitLines(ours), splitLines(theirs)];
+  if (holds(t, o)) return theirs;
+  if (holds(o, t)) return ours;
+  return null;
 }
 
 /**

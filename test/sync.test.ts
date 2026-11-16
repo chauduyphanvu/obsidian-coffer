@@ -222,6 +222,38 @@ test('one note made on two devices before either synced keeps both versions', as
   assert.equal(a.fs.text('Untitled.canvas'), canvas('a'));
 });
 
+test('one note made on two devices before either synced needs no copy when one version holds all of the other', async () => {
+  const { devices: [a, b] } = setup();
+  a.fs.put('other.md', 'x\n');
+  await a.sync();
+  await b.sync();
+  const template = '## Tasks\n- [ ] \n\n## Notes\n';
+  // A opened today's note and wrote in it; B only opened it. Then the reverse for another day.
+  a.fs.put('Daily/2026-11-15.md', '## Tasks\n- [ ] Call the plumber\n- [ ] Buy milk\n\n## Notes\nSlept well.\n');
+  b.fs.put('Daily/2026-11-15.md', template);
+  a.fs.put('Daily/2026-11-16.md', template);
+  b.fs.put('Daily/2026-11-16.md', '## Tasks\n- [ ] Book the dentist\n\n## Notes\n');
+  await a.sync();
+  const r = await b.sync();
+  await a.sync();
+  assert.deepEqual(r.conflictCopies, []);
+  assert.equal(r.merged, 2);
+  assert.deepEqual(b.snapshot(), a.snapshot());
+  assert.equal(a.fs.text('Daily/2026-11-15.md'), '## Tasks\n- [ ] Call the plumber\n- [ ] Buy milk\n\n## Notes\nSlept well.\n');
+  assert.equal(a.fs.text('Daily/2026-11-16.md'), '## Tasks\n- [ ] Book the dentist\n\n## Notes\n');
+});
+
+test('a device joining with its own copy of a note keeps both versions even when one holds the other', async () => {
+  const { devices: [a, b] } = setup();
+  a.fs.put('note.md', 'one\n');
+  await a.sync();
+  // B was copied from A long ago and joins now; A has since removed a line B still has.
+  b.fs.put('note.md', 'one\ntwo\n');
+  const r = await b.sync();
+  assert.equal(r.conflictCopies.length, 1);
+  assert.equal(b.fs.text('note.md'), 'one\n');
+});
+
 test('binary files and the copy strategy never merge', async () => {
   const { devices: [a, b] } = setup(['A', 'B'], { conflictStrategy: 'copy' });
   a.fs.put('n.md', 'a\nb\nc\n');
@@ -313,6 +345,79 @@ test('an edit beats a delete, in both directions', async () => {
   assert.equal(a.fs.text('x.md'), 'x\nedited on B\n');
   assert.equal(b.fs.text('y.md'), 'y\nedited on A\n');
   assert.deepEqual(b.snapshot(), a.snapshot());
+});
+
+test('a file deleted on one device stays deleted when the other only touched it, but an edit still brings it back', async () => {
+  const { devices: [a, b] } = setup();
+  a.fs.put('touched.md', 'kept as it was\n');
+  a.fs.put('edited.md', 'will change\n');
+  await a.sync();
+  await b.sync();
+  a.fs.files.delete('touched.md');
+  a.fs.files.delete('edited.md');
+  await a.sync();
+  // On B, something rewrites one file with the same bytes (a new time only) and really edits the other.
+  b.fs.put('touched.md', 'kept as it was\n');
+  b.fs.put('edited.md', 'will change\nand did, on B\n');
+  const r = await b.sync();
+  await a.sync();
+  assert.equal(r.deletedLocal, 1);
+  assert.equal(b.fs.text('touched.md'), undefined);
+  assert.equal(a.fs.text('touched.md'), undefined);
+  assert.equal(a.fs.text('edited.md'), 'will change\nand did, on B\n');
+  assert.deepEqual(b.snapshot(), a.snapshot());
+});
+
+test('a note moved on one device and edited on the other ends up edited under its new name, whichever side moved it', async () => {
+  const { devices: [a, b] } = setup();
+  const note = (name: string) => `# ${name}\n\nSome text.\n`;
+  a.fs.put('Notes/one.md', note('one'));
+  a.fs.put('Notes/two.md', note('two'));
+  await a.sync();
+  await b.sync();
+  const move = (d: Device, from: string, to: string) => {
+    d.fs.files.set(to, d.fs.files.get(from)!);
+    d.fs.files.delete(from);
+  };
+  // one.md: moved on A, edited on B. two.md: moved on B, edited on A.
+  move(a, 'Notes/one.md', 'Inbox/one.md');
+  b.fs.put('Notes/one.md', note('one') + 'Edited on B.\n');
+  move(b, 'Notes/two.md', 'Archive/two.md');
+  a.fs.put('Notes/two.md', note('two') + 'Edited on A.\n');
+  await a.sync();
+  const r = await b.sync();
+  await a.sync();
+  assert.deepEqual(r.conflictCopies, []);
+  assert.equal(r.merged, 2);
+  assert.deepEqual(b.snapshot(), a.snapshot());
+  assert.deepEqual(Object.keys(a.snapshot()).sort(), ['Archive/two.md', 'Inbox/one.md']);
+  assert.equal(a.fs.text('Inbox/one.md'), note('one') + 'Edited on B.\n');
+  assert.equal(a.fs.text('Archive/two.md'), note('two') + 'Edited on A.\n');
+});
+
+test('a move is not followed when it cannot be told which file the note went to, or the move also changed it', async () => {
+  const { devices: [a, b] } = setup();
+  a.fs.put('x.md', 'same text\n');
+  a.fs.put('y.md', 'other text\n');
+  await a.sync();
+  await b.sync();
+  // x.md copied to two places and removed on A; y.md moved and changed on A. B edits both at their old names.
+  a.fs.put('copy 1.md', 'same text\n');
+  a.fs.put('copy 2.md', 'same text\n');
+  a.fs.files.delete('x.md');
+  a.fs.files.set('z.md', { data: new TextEncoder().encode('other text, changed\n'), mtime: (a.fs.clock += 1000) });
+  a.fs.files.delete('y.md');
+  b.fs.put('x.md', 'same text\nedited on B\n');
+  b.fs.put('y.md', 'other text\nedited on B\n');
+  await a.sync();
+  const r = await b.sync();
+  await a.sync();
+  assert.equal(r.merged, 0);
+  assert.deepEqual(b.snapshot(), a.snapshot());
+  // As before: the edits win at the old names and the other files arrive as they are.
+  assert.equal(a.fs.text('x.md'), 'same text\nedited on B\n');
+  assert.equal(a.fs.text('y.md'), 'other text\nedited on B\n');
+  assert.deepEqual(Object.keys(a.snapshot()).sort(), ['copy 1.md', 'copy 2.md', 'x.md', 'y.md', 'z.md']);
 });
 
 test('a moved folder is applied on the other device without downloading it again', async () => {
@@ -1003,4 +1108,24 @@ test('a state saved with a key this version does not know still loads', async ()
   const saved = JSON.parse(a.state.data!) as Record<string, unknown>;
   const st = LocalState.parse(JSON.stringify({ ...saved, n: 1 }));
   assert.deepEqual([st.synced.size, st.remote.size, st.lastSeq], [1, 1, LocalState.parse(a.state.data!).lastSeq]);
+});
+
+test('a base edited on two devices merges by lines, and the same line changed on both keeps both versions', async () => {
+  const { devices: [a, b] } = setup();
+  const base = 'filters:\n  and:\n    - file.inFolder("Projects")\nviews:\n  - type: table\n    name: Table\n';
+  a.fs.put('Projects.base', base);
+  a.fs.put('Other.base', base);
+  await a.sync();
+  await b.sync();
+  a.fs.put('Projects.base', base.replace('name: Table', 'name: Projects table'));
+  b.fs.put('Projects.base', base.replace('file.inFolder("Projects")', 'file.inFolder("Work")'));
+  a.fs.put('Other.base', base.replace('name: Table', 'name: Mine'));
+  b.fs.put('Other.base', base.replace('name: Table', 'name: Yours'));
+  await a.sync();
+  const r = await b.sync();
+  await a.sync();
+  assert.equal(r.merged, 1);
+  assert.equal(r.conflictCopies.length, 1);
+  assert.equal(a.fs.text('Projects.base'), base.replace('name: Table', 'name: Projects table').replace('file.inFolder("Projects")', 'file.inFolder("Work")'));
+  assert.deepEqual(b.snapshot(), a.snapshot());
 });

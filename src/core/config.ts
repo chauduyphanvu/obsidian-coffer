@@ -46,7 +46,7 @@ export const DEFAULT_CONFIG: SyncConfig = {
   deferAboveMB: 0,
   readOnly: false,
   conflictStrategy: 'merge',
-  mergeExtensions: ['md', 'markdown', 'txt', 'canvas'],
+  mergeExtensions: ['md', 'markdown', 'txt', 'canvas', 'base'],
   compression: true,
   packTargetBytes: 4 << 20,
   packMaxBlobBytes: 64 << 10,

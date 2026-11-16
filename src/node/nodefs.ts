@@ -120,7 +120,27 @@ export class NodeFS implements LocalFS {
     await unlink(abs).catch((e) => {
       if (!missing(e)) throw e;
     });
-    for (let dir = dirname(abs); dir.length > this.root.length && dir.startsWith(this.root + sep); dir = dirname(dir)) {
+    await this.tidy(dirname(abs));
+  }
+
+  rename(from: string, to: string): Promise<FileStat> {
+    const done = this.move(from, to);
+    this.track(from, done);
+    this.track(to, done);
+    return done;
+  }
+
+  private async move(from: string, to: string): Promise<FileStat> {
+    const [a, b] = [this.abs(from), this.abs(to)];
+    await mkdir(dirname(b), { recursive: true });
+    await rename(a, b);
+    await this.tidy(dirname(a));
+    return toStat(await stat(b));
+  }
+
+  /** Removes `dir` and the folders above it while they are empty. */
+  private async tidy(dir: string): Promise<void> {
+    for (; dir.length > this.root.length && dir.startsWith(this.root + sep); dir = dirname(dir)) {
       try {
         await rmdir(dir);
       } catch {

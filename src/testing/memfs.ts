@@ -22,6 +22,13 @@ export class MemFS implements LocalFS {
   async remove(path: string): Promise<void> {
     this.files.delete(path);
   }
+  async rename(from: string, to: string): Promise<FileStat> {
+    const f = this.files.get(from);
+    if (!f) throw new Error(`ENOENT ${from}`);
+    this.files.delete(from);
+    this.files.set(to, f);
+    return { size: f.data.length, mtime: f.mtime };
+  }
   async stat(path: string): Promise<FileStat | null> {
     const f = this.files.get(path);
     return f ? { size: f.data.length, mtime: f.mtime } : null;

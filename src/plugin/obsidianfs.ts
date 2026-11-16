@@ -92,13 +92,18 @@ export class ObsidianFS implements FolderFS {
     return new Uint8Array(await this.app.vault.adapter.readBinary(path));
   }
 
-  async write(path: string, data: Uint8Array, mtime?: number): Promise<FileStat> {
+  private async makeFolders(path: string): Promise<void> {
     const adapter = this.app.vault.adapter;
     const parts = path.split('/');
     for (let i = 1; i < parts.length; i++) {
       const dir = parts.slice(0, i).join('/');
       if (!(await adapter.exists(dir))) await adapter.mkdir(dir);
     }
+  }
+
+  async write(path: string, data: Uint8Array, mtime?: number): Promise<FileStat> {
+    const adapter = this.app.vault.adapter;
+    await this.makeFolders(path);
     await adapter.writeBinary(path, toBuffer(data), mtime === undefined ? undefined : { mtime });
     const s = await adapter.stat(path);
     if (!s) throw new Error(`Could not write ${path}`);
@@ -111,8 +116,28 @@ export class ObsidianFS implements FolderFS {
     // Goes wherever the user's "Deleted files" setting says: system trash, the vault's .trash, or gone.
     if (file) await this.app.fileManager.trashFile(file);
     else if (await adapter.exists(path)) await adapter.remove(path);
-    // Tidy up folders this left empty, so a folder moved elsewhere does not linger as a husk. A shared folder stays:
-    // without it the share would look deleted.
+    await this.tidy(path);
+  }
+
+  /** Through the vault, so a tab showing the file follows it; links to it are left as they are, since the device that moved it updates them. */
+  async rename(from: string, to: string): Promise<FileStat> {
+    const adapter = this.app.vault.adapter;
+    await this.makeFolders(to);
+    const file = lookup(this.app, from);
+    if (file instanceof TFile) await this.app.vault.rename(file, to);
+    else await adapter.rename(from, to);
+    await this.tidy(from);
+    const s = await adapter.stat(to);
+    if (!s) throw new Error(`Could not move ${from} to ${to}`);
+    return { size: s.size, mtime: s.mtime };
+  }
+
+  /**
+   * Tidies up the folders that `path` going away left empty, so a folder moved elsewhere does not linger as a husk. A
+   * shared folder stays: without it the share would look deleted.
+   */
+  private async tidy(path: string): Promise<void> {
+    const adapter = this.app.vault.adapter;
     try {
       const mounts = new Set(this.mounts().map(vaultKey));
       for (let dir = path.slice(0, path.lastIndexOf('/')); dir && !mounts.has(vaultKey(dir)); dir = dir.slice(0, dir.lastIndexOf('/'))) {
