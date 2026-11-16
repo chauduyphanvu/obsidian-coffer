@@ -1,7 +1,11 @@
 // Rules about vault paths that every part of the engine must agree on.
 
+// No character below U+0300 changes under NFC or combines with one before it (Unicode's NFC quick check starts there),
+// so most paths can skip `normalize`, which costs more than the rest of the scan's work on a path.
+const MAY_CHANGE_UNDER_NFC = /[^\u0000-˿]/;
+
 /** Paths are compared in NFC so the same name typed on macOS and elsewhere is one file. */
-export const vaultKey = (path: string) => path.normalize('NFC');
+export const vaultKey = (path: string) => (MAY_CHANGE_UNDER_NFC.test(path) ? path.normalize('NFC') : path);
 
 /** Index of the dot that starts the file name's extension, or `path.length` when there is none. */
 function extensionDot(path: string): number {
