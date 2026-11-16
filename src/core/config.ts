@@ -112,8 +112,15 @@ export function compileExcludes(patterns: string[]): (path: string) => boolean {
   const anyOf = (sources: string[]) => sources.length ? new RegExp(`^(?:${sources.map((s) => `(?:${s})`).join('|')})$`) : undefined;
   const fullRe = anyOf(full);
   const baseRe = anyOf(base);
+  const test = (path: string) => exact.has(path) || !!fullRe?.test(path) || (!!baseRe && baseRe.test(path.slice(path.lastIndexOf('/') + 1)));
+  // Each sync asks again for every path, and the answer for a path never changes.
+  const seen = new Map<string, boolean>();
   return (path) => {
-    if (exact.has(path) || fullRe?.test(path)) return true;
-    return !!baseRe && baseRe.test(path.slice(path.lastIndexOf('/') + 1));
+    let hit = seen.get(path);
+    if (hit === undefined) {
+      if (seen.size >= 1 << 17) seen.clear();
+      seen.set(path, (hit = test(path)));
+    }
+    return hit;
   };
 }
