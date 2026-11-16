@@ -95,11 +95,9 @@ function globSource(glob: string): string {
   return re;
 }
 
-const globToRegExp = (glob: string) => new RegExp(`^${globSource(glob)}$`);
-
 export function compileExcludes(patterns: string[]): (path: string) => boolean {
-  const full: RegExp[] = [];
-  const base: RegExp[] = [];
+  const full: string[] = [];
+  const base: string[] = [];
   // Whole paths without wildcards, which can come by the thousand, are looked up rather than matched one by one, also
   // untrimmed: a file name may end with a space.
   const exact = new Set<string>();
@@ -108,12 +106,14 @@ export function compileExcludes(patterns: string[]): (path: string) => boolean {
     if (!p) continue;
     if (p.endsWith('/')) p += '**';
     if (p.includes('/') && !/[*?]|!\(/.test(p)) exact.add(p).add(raw);
-    else (p.includes('/') ? full : base).push(globToRegExp(p));
+    else (p.includes('/') ? full : base).push(globSource(p));
   }
+  // One regular expression per kind: every path of every sync is tested, and a call costs more than a failed match.
+  const anyOf = (sources: string[]) => sources.length ? new RegExp(`^(?:${sources.map((s) => `(?:${s})`).join('|')})$`) : undefined;
+  const fullRe = anyOf(full);
+  const baseRe = anyOf(base);
   return (path) => {
-    if (exact.has(path) || full.some((r) => r.test(path))) return true;
-    if (!base.length) return false;
-    const name = path.slice(path.lastIndexOf('/') + 1);
-    return base.some((r) => r.test(name));
+    if (exact.has(path) || fullRe?.test(path)) return true;
+    return !!baseRe && baseRe.test(path.slice(path.lastIndexOf('/') + 1));
   };
 }
