@@ -75,22 +75,23 @@ export class LocalState {
       this.rows = new Map();
     }
     const pt = this.packs;
-    const before = this.rows;
-    const rows = new Map<string, Row>();
+    const rows = this.rows;
+    const fresh = rows.size === 0;
     const out: string[] = [];
     const row = (path: string, r: Entry | undefined, s: Synced | undefined) => {
-      let w = before.get(path);
+      let w = rows.get(path);
       if (!w || w.r !== r || w.s !== s?.entry || w.lsize !== s?.lsize || w.lmtime !== s?.lmtime) {
         const synced = !s ? 0 : r && (s.entry === r || (sameContent(s.entry, r) && s.entry.mtime === r.mtime)) ? [s.lsize, s.lmtime] : [s.lsize, s.lmtime, encEntry(s.entry, pt)];
         w = { r, s: s?.entry, lsize: s?.lsize, lmtime: s?.lmtime, text: JSON.stringify([path, r ? encEntry(r, pt) : 0, synced]) };
+        rows.set(path, w);
       }
-      rows.set(path, w);
       out.push(w.text);
     };
     for (const [path, r] of this.remote) row(path, r, this.synced.get(path));
     for (const [path, s] of this.synced) if (!this.remote.has(path)) row(path, undefined, s);
-    this.rows = rows;
-    if (before.size === 0) this.packsInUse = pt.list.length;
+    // Rows of paths in neither table any more: only after a deletion, so the common save leaves the cache as it is.
+    if (rows.size > out.length) for (const path of rows.keys()) if (!this.remote.has(path) && !this.synced.has(path)) rows.delete(path);
+    if (fresh) this.packsInUse = pt.list.length;
     const head = this.head === undefined ? '' : `,"h":${JSON.stringify(this.head)}`;
     const confirmed = this.confirmed.size ? `,"c":${JSON.stringify([...this.confirmed])}` : '';
     const members = this.members.length ? `,"m":${JSON.stringify(this.members)}` : '';
