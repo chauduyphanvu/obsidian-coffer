@@ -474,6 +474,8 @@ export class SyncEngine {
   private headerSeen = -Infinity;
   /** Storage was found without the vault's key file: nothing is committed without looking, and every look asks for it, until it is back. */
   private gone = false;
+  /** See `largeRemote`. */
+  private large?: { remote: Map<string, Entry>; seq: number; head: string | undefined; maxSize: number; keys: string[] };
   /** Undefined until a sync of this engine has listed the vault and finished, and again after one fails. */
   private known?: Known;
   /** Paths the next sync looks at even when told only of others: changed remotely since a sync planned them, or left unfinished. */
@@ -1024,8 +1026,21 @@ export class SyncEngine {
   private tooLarge(st: LocalState, here: Set<string>): string[] {
     const maxSize = this.maxSize();
     const out = new Set([...here].filter((k) => !this.excluded(k)));
-    if (maxSize < Infinity) for (const [key, r] of st.remote) if (r.size > maxSize && !this.excluded(key)) out.add(key);
+    if (maxSize < Infinity) for (const key of this.largeRemote(st, maxSize)) if (!this.excluded(key)) out.add(key);
     return [...out].sort();
+  }
+
+  /**
+   * Remote paths over `maxSize`, kept while the table is the same one at the same commit: it changes only by applying a
+   * commit, which moves `lastSeq` and `head`, or by being replaced. Saves walking the whole table on every sync.
+   */
+  private largeRemote(st: LocalState, maxSize: number): string[] {
+    const c = this.large;
+    if (c && c.remote === st.remote && c.seq === st.lastSeq && c.head === st.head && c.maxSize === maxSize) return c.keys;
+    const keys: string[] = [];
+    for (const [key, r] of st.remote) if (r.size > maxSize) keys.push(key);
+    this.large = { remote: st.remote, seq: st.lastSeq, head: st.head, maxSize, keys };
+    return keys;
   }
 
   /** Files in storage that this device leaves there until asked for: see `deferral`, within the size limit, and not here. */
