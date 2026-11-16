@@ -325,6 +325,42 @@ const PULL_SAVE_EVERY = 10_000;
 const MAX_RANGE = 8 << 20;
 const MOVE_CACHE = 64 << 20;
 const OPTIMISTIC_BYTES = 256 << 10;
+/** Questions about chunks after which a push indexes the file table instead of searching it. */
+const INDEX_AFTER = 8;
+
+/**
+ * The chunks a push may point new versions at (see `SyncEngine.reusable`): those it adds, then those of the file table as
+ * it was when the push started (the last one listed for an id), then those this sync uploaded before. A small push asks
+ * about a chunk or two, so the table is searched as it is until enough questions make an index worth building.
+ */
+class Reusable {
+  private readonly entries: Entry[];
+  private readonly uploaded: ReadonlyMap<string, ChunkRef>;
+  private readonly added = new Map<string, ChunkRef>();
+  private index?: Map<string, ChunkRef>;
+  private asked = 0;
+
+  constructor(remote: ReadonlyMap<string, Entry>, uploaded: ReadonlyMap<string, ChunkRef>) {
+    this.entries = [...remote.values()];
+    this.uploaded = uploaded;
+  }
+
+  get(id: string): ChunkRef | undefined {
+    const ref = this.added.get(id);
+    if (ref) return ref;
+    if (!this.index && ++this.asked > INDEX_AFTER) {
+      this.index = new Map();
+      for (const e of this.entries) for (const c of e.chunks) this.index.set(c.id, c);
+    }
+    let found = this.index?.get(id);
+    if (!this.index) for (const e of this.entries) for (const c of e.chunks) if (c.id === id) found = c;
+    return found ?? this.uploaded.get(id);
+  }
+
+  set(id: string, ref: ChunkRef): void {
+    this.added.set(id, ref);
+  }
+}
 const OPEN_PARALLEL = 4;
 const HEAD_CHECK_EVERY = 3_600_000;
 /** More paths than this to look at, and asking for each costs more than listing the vault. */
@@ -429,7 +465,7 @@ export class SyncEngine {
   /** The last operation that changes this device's state, which the next one waits for. */
   private tail: Promise<unknown> = Promise.resolve();
   /** Chunks a commit may refer to without uploading them, by id. See `reusable`. */
-  private dedup = new Map<string, ChunkRef>();
+  private dedup = new Reusable(new Map(), new Map());
   /** Chunks this sync uploaded, by id. */
   private uploaded = new Map<string, ChunkRef>();
   /** When the log was last seen to continue from this device's newest commit. */
@@ -1055,7 +1091,7 @@ export class SyncEngine {
       throw e;
     } finally {
       this.syncing = false;
-      this.dedup = new Map();
+      this.dedup = new Reusable(new Map(), new Map());
       this.uploaded = new Map();
     }
     return res;
@@ -1587,10 +1623,9 @@ export class SyncEngine {
    * a table that went out of date, as on a device that was away, may be in a pack deleted because its
    * version was thinned or left the window. That table is replaced before anything is committed on it.
    */
-  private reusable(st: LocalState): Map<string, ChunkRef> {
-    const m = new Map(this.uploaded);
-    for (const e of st.remote.values()) for (const c of e.chunks) m.set(c.id, c);
-    return m;
+  private reusable(st: LocalState): Reusable {
+    // This sync's uploads are read as they grow: each is also added to the push's own (`Reusable.set`), which comes first.
+    return new Reusable(st.remote, this.uploaded);
   }
 
   /** Points a prepared entry at chunks it may still refer to. False when one of them must be uploaded again. */
