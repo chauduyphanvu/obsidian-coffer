@@ -895,7 +895,7 @@ export class SyncEngine {
       if (this.excluded(key) || local.has(key)) continue;
       if (f.path !== key) paths.set(key, f.path);
       if (f.size > maxSize) tooLarge.add(key);
-      else local.set(key, { ...f, key });
+      else local.set(key, { path: f.path, size: f.size, mtime: f.mtime, key });
     }
     run.known = { tooLarge, paths };
     return { local, tooLarge };
