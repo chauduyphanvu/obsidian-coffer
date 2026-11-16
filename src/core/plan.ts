@@ -39,11 +39,14 @@ export function planChanges(
   const pullDeletes: string[] = [];
   const conflicts: string[] = [];
 
-  const plan = (key: string) => {
-    if (excluded(key)) return;
-    const l = local.get(key);
+  let localSynced = 0;
+  let remoteSeen = 0;
+  const plan = (key: string, l: Local | undefined) => {
     const s = st.synced.get(key);
     const r = st.remote.get(key);
+    if (l && s) localSynced++;
+    if (r) remoteSeen++;
+    if (excluded(key)) return;
     if (tooLargeHere.has(key) || (r && r.size > maxSize)) return;
     if (!l && !s && r && defer?.(key, r)) return;
     const base = s?.entry;
@@ -63,12 +66,13 @@ export function planChanges(
     else conflicts.push(key);
   };
   if (keys) {
-    for (const key of keys) plan(key);
+    for (const key of keys) plan(key, local.get(key));
   } else {
-    for (const key of local.keys()) plan(key);
-    for (const key of st.synced.keys()) if (!local.has(key)) plan(key);
-    for (const key of st.remote.keys()) if (!local.has(key) && !st.synced.has(key)) plan(key);
-    for (const key of tooLargeHere) if (!st.synced.has(key) && !st.remote.has(key)) plan(key);
+    for (const [key, l] of local) plan(key, l);
+    // Each loop below plans only paths the loops before it did not; the counts say when there are none.
+    if (localSynced < st.synced.size) for (const key of st.synced.keys()) if (!local.has(key)) plan(key, undefined);
+    if (remoteSeen < st.remote.size) for (const key of st.remote.keys()) if (!local.has(key) && !st.synced.has(key)) plan(key, undefined);
+    for (const key of tooLargeHere) if (!st.synced.has(key) && !st.remote.has(key)) plan(key, undefined);
   }
   return { pushes, pushDeletes, pulls, pullDeletes, conflicts };
 }
