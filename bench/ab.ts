@@ -4,8 +4,9 @@
 // alike. A process can also settle fast or slow as a whole (how its code was compiled and laid out), so several fresh
 // processes run one after another, alternating which side is set up first, and the 95% interval of B's median over A's
 // comes from resampling processes and then pairs within them.
-//   node bench/ab.ts --a=/path/to/baseline/checkout [--b=.] [--notes=10000] [--procs=6] [--runs=50] [--json=out.json]
-// With --a the same as --b it measures the noise floor.
+//   node bench/ab.ts --a=/path/to/baseline/checkout [--b=.] [--notes=10000] [--procs=6] [--runs=50] [--gc=false] [--json=out.json]
+// With --a the same as --b it measures the noise floor. Each call starts after a full garbage collection, as a sync does
+// after the app sat idle; --gc=false leaves collection to the engine's own allocations.
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -22,6 +23,7 @@ const notes = Number(args.notes ?? 10_000);
 const runs = Number(args.runs ?? 50);
 const procs = Number(args.procs ?? 6);
 const seed = Number(args.seed ?? 3);
+const forceGc = args.gc !== 'false';
 const roots = { A: resolve(args.a ?? '.'), B: resolve(args.b ?? '.') };
 
 type Scenario = 'no change, full scan' | 'edit 1 note, full scan' | 'no change, hinted' | 'edit 1 note, hinted';
@@ -66,7 +68,7 @@ async function child(n: number): Promise<Samples> {
   for (let i = -2; i < runs; i++) {
     for (const s of SCENARIOS) {
       for (const k of coin() < 0.5 ? (['A', 'B'] as const) : (['B', 'A'] as const)) {
-        gc();
+        if (forceGc) gc();
         const cpu0 = process.cpuUsage();
         const t0 = performance.now();
         await sides[k].run[s]();
@@ -125,7 +127,7 @@ if (args.child !== undefined) {
   const pct = (x: number) => `${x >= 1 ? '+' : '−'}${Math.abs((x - 1) * 100).toFixed(1)}%`;
   const verdict = (lo: number, hi: number) => (hi < 1 ? 'B lower' : lo > 1 ? 'B higher' : 'no clear difference');
 
-  const report: Record<string, unknown> = { notes, runs, procs, roots };
+  const report: Record<string, unknown> = { notes, runs, procs, forceGc, roots };
   const table: Record<string, Record<string, string>> = {};
   for (const s of SCENARIOS) {
     for (const m of ['cpu', 'wall'] as const) {
@@ -144,7 +146,7 @@ if (args.child !== undefined) {
       };
     }
   }
-  console.log(JSON.stringify({ notes, runs, procs, a: roots.A, b: roots.B }));
+  console.log(JSON.stringify({ notes, runs, procs, forceGc, a: roots.A, b: roots.B }));
   console.table(table);
   if (args.json) writeFileSync(args.json, JSON.stringify(report));
 }
