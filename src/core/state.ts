@@ -87,8 +87,14 @@ export class LocalState {
       }
       out.push(w.text);
     };
-    for (const [path, r] of this.remote) row(path, r, this.synced.get(path));
-    for (const [path, s] of this.synced) if (!this.remote.has(path)) row(path, undefined, s);
+    let syncedInRemote = 0;
+    for (const [path, r] of this.remote) {
+      const s = this.synced.get(path);
+      if (s) syncedInRemote++;
+      row(path, r, s);
+    }
+    // Agreed versions of files gone from storage: none when every one was met above.
+    if (syncedInRemote < this.synced.size) for (const [path, s] of this.synced) if (!this.remote.has(path)) row(path, undefined, s);
     // Rows of paths in neither table any more: only after a deletion, so the common save leaves the cache as it is.
     if (rows.size > out.length) for (const path of rows.keys()) if (!this.remote.has(path) && !this.synced.has(path)) rows.delete(path);
     if (fresh) this.packsInUse = pt.list.length;
