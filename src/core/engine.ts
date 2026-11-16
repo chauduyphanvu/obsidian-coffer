@@ -360,6 +360,11 @@ class Reusable {
   set(id: string, ref: ChunkRef): void {
     this.added.set(id, ref);
   }
+
+  /** For an id `get` did not find: the push's own chunk, as another file of it may have added it since. Nothing else here changes. */
+  addedLately(id: string): ChunkRef | undefined {
+    return this.added.get(id);
+  }
 }
 const OPEN_PARALLEL = 4;
 const HEAD_CHECK_EVERY = 3_600_000;
@@ -1684,7 +1689,7 @@ export class SyncEngine {
         let ref = this.dedup.get(ids[i]);
         if (!ref) {
           const sealed = await repo.sealChunk(ids[i], parts[i], compress);
-          ref = this.dedup.get(ids[i]);
+          ref = this.dedup.addedLately(ids[i]);
           if (!ref) {
             ref = packer.add(ids[i], sealed, parts[i].length);
             this.dedup.set(ids[i], ref);
