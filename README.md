@@ -1,74 +1,102 @@
 # Coffer
 
-Sync your Obsidian vault between your devices through storage you own: an S3-compatible bucket (Cloudflare R2, Backblaze B2, Amazon S3, MinIO, Wasabi and others) or a WebDAV server (Nextcloud, a NAS). Everything that syncs is encrypted on your device before it leaves, so the storage provider only ever holds data it cannot read.
+Coffer syncs your Obsidian vault between desktop and mobile devices through storage that you control. It supports S3-compatible buckets (Cloudflare R2, Backblaze B2, Amazon S3, MinIO, Wasabi, and others) and WebDAV servers (Nextcloud or a NAS).
 
-Coffer runs on desktop and mobile, keeps a version history of every file, merges edits made on two devices, and can bring back deleted files or a whole folder as it was at an earlier time.
+Coffer encrypts all data on your device before upload. Your storage provider gets only data that it cannot read. Coffer also keeps file history, merges changes across devices, shares folders, and can publish notes as a website.
 
-> Coffer is young (0.7). It is covered by 828 tests and has been run on macOS and iOS, but keep a backup of a vault you care about while you try it.
+> Coffer is at version 0.7. It passes 828 tests and runs on macOS and iOS, but keep a backup of important vaults.
 
-## What you need to know first
+```mermaid
+flowchart LR
+  subgraph devices["Your devices"]
+    D(["Desktop Obsidian"])
+    M(["Mobile Obsidian"])
+    C(["CLI · Node.js"])
+  end
 
-- **Network use.** Coffer connects only to the storage you configure, to read and write your encrypted vault, and, if you publish a website, to the location you chose for it. It talks to no other server: no analytics, no telemetry, no update checks. Requests go through Obsidian's own `requestUrl`.
-- **Publishing is not encrypted.** Only if you use it: the notes you mark `publish: true` are uploaded as readable web pages to the location you choose, and anyone with its address can read them. Nothing is published until you run the command and confirm. See [Publishing a website](#publishing-a-website).
-- **No account, no payment.** Coffer is free. The storage itself is billed by your provider, if at all; R2 and B2 both have free tiers of 10 GB.
-- **Your passphrase is the only key.** If it is lost, the synced copy cannot be decrypted by anyone, including you. Keep it in a password manager.
-- **Files.** Coffer reads and writes only inside your vault, including its settings folder.
+  subgraph local["On-device boundary"]
+    E{{"Encrypt + Sign · AES-256-GCM + ECDSA"}}
+    P("Site Builder · Unencrypted")
+  end
 
-## Features
+  subgraph storage["Storage that you control"]
+    V[("Vault Storage · Encrypted")]
+    S[("Shared Folder · Separate Key")]
+    W[("Website Storage · Unencrypted HTML")]
+  end
 
-- **End-to-end encryption.** AES-256-GCM, with keys derived from your passphrase. File names, folder names, contents and device names are all encrypted.
-- **Efficient transfers.** Files are split into content-defined chunks, so an edit to a large file uploads only the changed part. Identical chunks are stored once, text is compressed before encryption, and small chunks are packed into larger objects so a new device needs few requests to download a vault.
-- **Merges, not overwrites.** A note edited on two devices is merged line by line, and word by word inside a paragraph; its properties are merged key by key. Lines two devices add in the same place, such as the end of a daily note, are both kept. Canvases are merged node by node, bases line by line, and settings files key by key. A note moved on one device and edited on another ends up edited at its new place. A note made on two devices before either synced, such as today's daily note, needs no copy when one version holds all of the other. When a merge is not possible, both versions are kept side by side, and a resolver walks you through the differences.
-- **History and restore.** Every version is kept for a day, then hourly states for a week, then daily states for the retention window (30 days by default). You can restore a version of a file, bring back deleted files, or return a folder or the whole vault to an earlier time, with a preview of what will change.
-- **Safety checks.** A sync that would delete more than 10 files and half the vault stops and asks first. Each change is chained to the one before it, so a device notices if storage was rolled back or tampered with. A "Check synced data for damage" command checks the stored data end to end, and "Repair synced data" stores again, from the files on a device that has them, whatever it finds missing.
-- **Sharing.** Share one folder with other people as members who can edit, only read, or read and suggest changes, each joining through their own invite link; or share notes scattered across the vault by marking them with a property. A shared folder gets its own storage. See [Sharing](#sharing).
-- **Publishing a website** (optional). Mark notes with `publish: true`, or publish the whole vault, and Coffer turns them into web pages, with the pictures they show, at a bucket or WebDAV folder of its own. These pages are not encrypted. See [Publishing a website](#publishing-a-website).
-- **Made for phones too.** Setup works from a phone, a new device joins by opening a setup link, and edits are sent before the app is suspended.
-- **Clear status.** The status bar says when the vault last synced; a problems screen says plainly what is wrong and what to do.
-- **Command-line tool** (optional) to keep a folder in sync from an always-on computer. See [Command line](#command-line).
+  D <--> E
+  M <--> E
+  C <--> E
+  E <-->|"Vault key"| V
+  E <-->|"Signed commits"| S
+  D -.->|"Preview + publish"| P
+  M -.->|"Preview + publish"| P
+  C -.->|"publish / watch --publish"| P
+  P -.->|"Public pages"| W
 
-## Install
+  classDef device fill:#1e293b,stroke:#64748b,color:#f8fafc,stroke-width:1.5px
+  classDef crypto fill:#2e1065,stroke:#8b5cf6,color:#f5f3ff,stroke-width:1.75px
+  classDef encrypted fill:#064e3b,stroke:#10b981,color:#ecfdf5,stroke-width:1.5px
+  classDef caution fill:#451a03,stroke:#f59e0b,color:#fffbeb,stroke-width:1.5px,stroke-dasharray: 4 3
 
-Coffer needs Obsidian 1.13.1 or later (an older Obsidian gets Coffer 0.1.0).
+  class D,M,C device
+  class E crypto
+  class V,S encrypted
+  class P,W caution
 
-From Obsidian: **Settings → Community plugins → Browse**, search for **Coffer**, install and enable it.
+  style devices fill:transparent,stroke:#64748b,stroke-width:1.25px,stroke-dasharray: 4 4
+  style local fill:transparent,stroke:#8b5cf6,stroke-width:1.25px,stroke-dasharray: 4 4
+  style storage fill:transparent,stroke:#10b981,stroke-width:1.25px,stroke-dasharray: 4 4
+```
 
-By hand: download `main.js`, `manifest.json` and `styles.css` from the [latest release](../../releases/latest) into `<vault>/.obsidian/plugins/coffer/`, then enable Coffer under **Settings → Community plugins**. (The settings folder may have another name if you changed it in Obsidian.)
+## Before you start
 
-## Set up
+- **Network access.** Coffer connects only to your storage, and to your website location if you publish. It sends no analytics, no telemetry, and no update checks. It uses Obsidian `requestUrl`.
+- **Cost.** Coffer is free and needs no account. Your storage provider sets storage costs, if any. Cloudflare R2 and Backblaze B2 give 10 GB free tiers.
+- **Passphrase.** Your passphrase is the only key. If you lose it, no person can decrypt your synced data. Keep it in a password manager.
+- **Vault files.** Coffer reads and writes only inside your vault, which includes its settings folder.
+- **Website.** Published web pages are not encrypted. In Obsidian, Coffer uploads pages only after you run the publish command and select **Publish** in the preview.
+- **One sync tool.** Do not put a Coffer vault in iCloud Drive, Dropbox, OneDrive, or Obsidian Sync at the same time.
+
+## Install and setup
+
+Coffer needs Obsidian 1.13.1 or later.
+
+- **From Obsidian:** Open **Settings → Community plugins → Browse**. Search for **Coffer**. Install and enable it.
+- **Manual install:** Download `main.js`, `manifest.json`, and `styles.css` from the [latest release](../../releases/latest). Put them in `<vault>/.obsidian/plugins/coffer/`. Enable Coffer under **Settings → Community plugins**.
 
 ### First device
 
-1. Create a bucket (or a WebDAV folder) and a key for it. See [Storage providers](#storage-providers).
-2. In Obsidian, open the command palette and run **Coffer: Set up sync**, or click the notice that appears after enabling the plugin.
-3. Choose **This is my first device**, pick your provider and fill in its details. Coffer checks that the storage works before going on.
-4. Choose a passphrase of at least 8 characters, or tap **Suggest a passphrase** for a random one (five groups of four letters and digits), and save it in your password manager.
-5. The first sync uploads the vault. When it is done, click **Copy setup link**.
+1. Make a bucket or WebDAV folder and an access key for it. See [Storage providers](#storage-providers).
+2. In Obsidian, run **Coffer: Set up sync** from the command palette.
+3. Select **This is my first device**. Select your provider. Enter the storage details. Coffer tests the storage before it continues.
+4. Enter a passphrase of at least 8 characters, or select **Suggest a passphrase**. Keep it in a password manager.
+5. Wait for the first sync to finish. Select **Copy setup link**.
 
 ### More devices
 
-1. Install Coffer on the device, ideally in a new, empty vault.
-2. Open the setup link there (or run **Set up sync**, choose **I already sync another device** and paste it), enter the passphrase, and click **Connect**.
+1. Install Coffer on the other device in a new, empty vault.
+2. Open the setup link. You can also run **Coffer: Set up sync**. Select **I already sync another device**, then paste the link.
+3. Enter your passphrase. Select **Connect**.
 
-The setup link carries the storage address and keys, encrypted with your passphrase. Treat it like a password. You can copy it again later under **Settings → Coffer → Add another device**. A link takes a moment to prepare, because it is sealed as strongly as the vault key (see [How it works](#how-it-works)). A link made by this version does not open in Coffer 0.2 or earlier, including the 0.1.0 that an Obsidian older than 1.13.1 gets; on such a device, join or update by choosing **This is my first device**, entering the storage details by hand and then the passphrase. Links made by those versions still open here.
-
-Keep a vault in one sync tool only: don't put a Coffer vault inside iCloud Drive, Dropbox or OneDrive, or run Obsidian Sync on it at the same time.
+Coffer encrypts the setup link with your passphrase. Protect it as a password. You can copy it again under **Settings → Coffer → Add another device**.
 
 ## Storage providers
 
-Use a key that can reach only the bucket you sync to. A device that only receives changes (see [What syncs](#what-syncs)) can use a key that may only read.
+Use a key limited to one bucket. A read-only device can use a read-only key.
 
-| Provider | What Coffer asks for |
+| Provider | Setup details |
 | --- | --- |
-| Cloudflare R2 | Account ID, bucket, and an R2 API token with object read and write on that bucket |
-| Backblaze B2 | The bucket's endpoint (like `s3.us-west-004.backblazeb2.com`), bucket, and an application key limited to it |
-| Amazon S3 | The bucket's region, bucket, and an access key |
-| Other S3-compatible | Endpoint, region if the provider has one, bucket, keys, and whether it needs path-style addresses (MinIO and most self-hosted servers do) |
-| WebDAV | Folder address, user name and password (for Nextcloud, an app password). The folder is created if missing |
+| Cloudflare R2 | Account ID, bucket, and an R2 API token with read and write access to that bucket |
+| Backblaze B2 | Bucket endpoint (for example, `s3.us-west-004.backblazeb2.com`), bucket, and a key limited to that bucket |
+| Amazon S3 | Bucket region, bucket, and an access key |
+| Other S3-compatible | Endpoint, region if necessary, bucket, keys, and path-style setting (necessary for MinIO and most self-hosted servers) |
+| WebDAV | Folder address, user name, and password (use an app password for Nextcloud). Coffer makes the folder if it is not present |
 
-**Folder in bucket** lets one bucket hold several vaults; it is filled in from the vault's name.
+With **Folder in bucket**, one bucket can contain more than one vault. No CORS configuration is necessary.
 
-No CORS configuration is needed. For Amazon S3, this IAM policy is enough (replace `my-notes`):
+For Amazon S3, this IAM policy is sufficient (replace `my-notes`):
 
 ```json
 {
@@ -80,121 +108,122 @@ No CORS configuration is needed. For Amazon S3, this IAM policy is enough (repla
 }
 ```
 
-Turning on versioning for the bucket, with a rule that deletes old versions after a month, adds a second safety net.
+Turn on bucket versioning with a 30-day rule as a second backup.
 
-## What syncs
+## Sync
 
-- Every file in the vault up to the size limit (500 MB on desktop, 200 MB on mobile by default). Larger files stay on their device and are listed as problems.
-- The settings folder (settings, themes and plugins), except the workspace layout. This can be turned off under **Settings → Coffer**. Because plugins sync, installing or updating a plugin on one device brings it to the others.
-- Not synced: names starting with a dot (other than the settings folder), which Obsidian cannot see, and anything matching the patterns under **Leave out**.
-- **Download only when asked** (off by default). Under **Settings → Coffer → What to sync**, set a size above which files stay in storage and take no room on this device, as on a phone. The command **Download a file left in storage** lists them, and choosing one downloads and opens it. A downloaded file syncs like any other, and this device never deletes a file it has not downloaded.
-- **Only receive changes** (off by default, per vault and per shared folder), for a device that must never write to storage, as when its keys can only read. What you edit or add there stays there and is listed as not sent; where storage changes the same file, the two are merged, or this device's version is kept beside it; a file you delete there comes back from storage. Turn it on under **Settings → Coffer → Storage and passphrase**, or when you join. The command-line tool takes `"readOnly": true` under `sync`, and then refuses `clean`, `repair`, `restore`, `restore-at` and `change-passphrase`.
+- **Files.** Coffer syncs all vault files up to the size limit (500 MB on desktop and 200 MB on mobile by default). Larger files stay on their device, and Coffer lists them as problems. Coffer also syncs the settings folder (settings, themes, and plugins, without workspace layout), which you can turn off under **Settings → Coffer → What to sync**. Files and folders whose names start with a dot (except the settings folder) and patterns under **Leave out** do not sync.
+- **Timing.** Coffer syncs at startup, a few seconds after a change, on a regular schedule, and more frequently when another device syncs. On mobile, it sends changes before the mobile OS stops the app. You can adjust these intervals in settings.
+- **Merges and conflicts.** Coffer merges note changes from two devices line by line and word by word, and merges properties key by key. It keeps lines that two devices add at the same position. It merges canvases node by node, bases line by line, and settings files key by key. If one device moves a note and another device changes it, Coffer applies the change at the new location. If Coffer cannot merge two versions, it keeps both copies. Use **Resolve a file changed on two devices** to resolve conflicts (line by line for text).
+- **History and restore.** Coffer keeps all versions for 1 day, hourly states for 1 week, and daily states for 30 days by default. You can restore a file version, restore deleted files, or return a folder or vault to an earlier time with a preview.
+- **Files on demand.** Under **Settings → Coffer → What to sync**, set **Download only when asked** to keep large files only in storage. Run **Download a file left in storage** to download and open one. This device does not delete a file that it did not download.
+- **Read-only devices.** For a read-only device, turn on **Only receive changes** at setup or under **Settings → Coffer → Storage and passphrase**. Local changes stay on that device. Remote changes merge with local files or make a conflict copy. Coffer downloads local files again if you delete them.
+- **Safety checks.** A sync that deletes more than 10 files and half of the vault stops and asks first. Run **Sync now, allowing large deletions in the vault** to continue. Run **Check synced data for damage** to test stored data. Run **Repair synced data from this device's files** to upload missing or damaged data again.
 
-Coffer syncs when Obsidian starts, a few seconds after an edit, every few minutes, and sooner when it notices another device has synced. All of these can be changed in settings.
+### Merge flow
 
-## Sharing
+```mermaid
+flowchart TD
+  A(["Two devices change the same file"]) --> B{"One device only moved it?"}
+  B == "Yes" ==> C("Apply change at new path")
+  B -->|"No"| D{"File type?"}
 
-Everything shared is encrypted like the vault, in storage you choose, and separate from the vault's own: people you share with hold no key to the rest of your notes. Add one under **Settings → Coffer → Shared folders**.
+  D -->|"Note (.md, .txt)"| E("Merge properties, lines, and words")
+  D -->|"Canvas or base"| F("Merge nodes or lines")
+  D -->|"Settings folder"| S("Merge keys · first sync wins")
+  D -.->|"Binary or other"| G("Keep both versions")
 
-- **A shared folder with members.** You are its owner, and invite each person with their own link, which works once, expires, and needs no passphrase. A member can edit, only read, or read and suggest. Every change is signed by the device that made it, and devices accept only changes signed by a current member who may edit, so "only read" holds even where the storage key itself could write. Someone invited to edit only reads until one of your devices has confirmed them, and an invite to edit is for one device.
-- **Removing someone.** Remove them under **Members**; their changes are refused from then on. To also stop them reading what is added later, give the folder new storage keys (**Give everyone new storage keys**): the new keys reach the remaining members through storage.
-- **Suggestions.** A member who reads and suggests sends the edits they made on their own device; you review each file and take it in or leave it out.
-- **Activity.** **Show recent changes** lists who changed what in a shared folder, as it does in the vault.
-- **Limited storage keys.** For S3, R2 and B2, Coffer writes the provider rule, when you invite someone, for a key that reaches only the shared folder: one that writes, one that only reads, one that reads and may send suggestions. Give members a limited key, not your own.
-- **Follow links.** Where a shared folder's storage can be read publicly, a follow link lets someone receive it with no storage key at all. A follower cannot be removed afterwards short of sharing the folder again elsewhere.
-- **Your other devices.** A shared folder added on one device is offered on your others, to add with one tap.
-- **Notes shared by a property.** Choose a name, such as `Family`, and every note whose properties say `share: Family` is shared, with the attachments it shows, at its place in the vault. This is one way: members read, or read and suggest, and nothing they do changes your vault unless you take a suggestion in. A note that stops saying `share: Family` stays shared until you remove it, under **What's shared**. One device sends these notes, and a vault has one such share.
-- **A shared folder with a passphrase**, as before 0.4: everyone who has the storage keys and the passphrase is an equal. These keep working, and still work with 0.3. A folder with members needs 0.4 on every device; to move, share the folder again with members.
+  E --> H{"Clean merge?"}
+  F --> H
+  S ==> I(["Write merged file"])
+  H == "Yes" ==> I
+  H -.->|"No"| G
+  G -.-> J(["Resolve conflict in Obsidian"])
 
-What members cannot be stopped from doing: anyone whose storage key can write can delete objects or add garbage that holds a shared folder up until the owner removes it. They cannot get a change accepted.
+  classDef entry fill:#1e293b,stroke:#64748b,color:#f8fafc,stroke-width:1.5px
+  classDef decision fill:#0f172a,stroke:#38bdf8,color:#e0f2fe,stroke-width:1.5px
+  classDef action fill:#2e1065,stroke:#8b5cf6,color:#f5f3ff,stroke-width:1.5px
+  classDef ok fill:#064e3b,stroke:#10b981,color:#ecfdf5,stroke-width:1.75px
+  classDef conflict fill:#451a03,stroke:#f59e0b,color:#fffbeb,stroke-width:1.5px,stroke-dasharray: 4 3
 
-## Publishing a website
+  class A entry
+  class B,D,H decision
+  class E,F,S action
+  class C,I ok
+  class G,J conflict
+```
 
-Sharing sends notes, encrypted, to people who hold a key. Publishing is different: it turns notes into web pages that anyone with their address can read in a browser, with no key and no sign-in. The pages are **not encrypted**, and they go to a location of their own, not to the storage your vault syncs to. Sync and sharing stay encrypted and are not touched by it. Nothing is published until you ask.
+## Shared folders
 
-### Marking notes
+Add a shared folder under **Settings → Coffer → Shared folders**. Each shared folder uses its own encrypted storage, separate from your vault. People in a share do not get a key to your other notes.
 
-There are two ways to choose what is published. Note by note: a note is on the website when its properties say `publish: true` (in Obsidian, a checkbox property named `publish`). Or the whole vault: turn on **Publish the whole vault** in the website's settings, and every note is a page, new ones included, except those whose properties say `publish: false`. Either way, **Keep off the website** in the same settings lists folders and files that are never published, such as `Private/` or `Templates/`.
+```mermaid
+flowchart LR
+  subgraph roles["Share roles"]
+    O(["Owner"])
+    E(["Editor · Confirmed"])
+    SG(["Reader + Suggest"])
+    R(["Reader or Follower"])
+  end
 
-With the whole vault published, everything you write becomes public at the next publish unless you keep it off, so set the folders to keep off first and read the preview before you confirm.
+  subgraph share["Separate encrypted storage"]
+    LOG[("Signed Commits + Data")]
+    INB[("Suggestions Inbox")]
+  end
 
-The commands **Put the current note on the website** and **Take the current note off the website** change the property for you. Notes that Obsidian Publish publishes carry the same property, so they are picked up too.
+  O <-->|"Signed changes + member list"| LOG
+  E <-->|"Signed changes"| LOG
+  SG -->|"Send suggestions"| INB
+  INB -.->|"Owner checks + accepts"| O
+  LOG -.->|"Read-only"| SG
+  LOG -.->|"Read-only"| R
 
-### What goes up
+  classDef owner fill:#2e1065,stroke:#8b5cf6,color:#f5f3ff,stroke-width:1.75px
+  classDef editor fill:#064e3b,stroke:#10b981,color:#ecfdf5,stroke-width:1.5px
+  classDef suggest fill:#451a03,stroke:#f59e0b,color:#fffbeb,stroke-width:1.5px
+  classDef reader fill:#1e293b,stroke:#64748b,color:#f1f5f9,stroke-width:1.5px
+  classDef store fill:#064e3b,stroke:#10b981,color:#ecfdf5,stroke-width:1.5px
+  classDef inbox fill:#451a03,stroke:#f59e0b,color:#fffbeb,stroke-width:1.5px,stroke-dasharray: 4 3
 
-Those notes become pages, and the pictures, sound, video and PDF files they show or link to go up with them. Nothing else goes up.
+  class O owner
+  class E editor
+  class SG suggest
+  class R reader
+  class LOG store
+  class INB inbox
 
-- A note's properties are not shown, except `title`, which is the page's title.
-- `%%comments%%` and HTML comments are removed.
-- A link to a note that is not published shows as plain text. A note embedded in another shows as a link to it.
-- A file whose name exists more than once in the vault is left out, unless the note links it with its folder.
-- Files left out of sync, files in hidden folders and conflict copies are never published. In Obsidian, neither are notes inside a shared folder.
+  style roles fill:transparent,stroke:#64748b,stroke-width:1.25px,stroke-dasharray: 4 4
+  style share fill:transparent,stroke:#10b981,stroke-width:1.25px,stroke-dasharray: 4 4
+```
 
-### Where it goes
+- **Members.** Invite each person with a link that expires. No passphrase is necessary. An edit invite works for one device. That device only gets changes until one of your devices confirms it on the next sync. Members can edit, only read, or read and suggest. Devices sign all changes and accept changes only from current editors. This rule holds if a storage key can write.
+- **Suggestions.** Members who suggest send changes from their device for you to check. You decide which files to accept.
+- **Removal.** Remove a member under **Members** to stop their future changes. To prevent access to new data, replace the storage keys with **Give everyone new storage keys**.
+- **Limited keys and follow links.** For S3, R2, and B2, Coffer shows limited key rules for each role where the provider supports them. Give members a limited key, not your own key. For public read-only storage, a follow link gives access without storage keys. You cannot remove a follower without a new share in different storage.
+- **Share by property.** Select a name (for example, `Family`) to share notes with `share: Family` and their embedded attachments. This share is one-way (read, or read and suggest) from one device. If you remove `share: Family` from a note, the note stays shared until you remove it under **What's shared**.
+- **Other devices and activity.** Your other devices show the shared folder. You can add it with one tap. Run **Show recent changes** to list who changed each file. Passphrase-based shared folders continue to work.
 
-Under **Settings → Coffer → Website**, choose an S3-compatible bucket or a WebDAV folder, with keys of its own. It must not be the bucket or folder your vault or a shared folder syncs to, nor a folder inside it or one that holds it: Coffer refuses those. Use a key that can reach only that location.
+> A member with a write key can delete objects or add invalid data in storage. That stops sync until the owner removes the invalid data, but devices do not accept their changes.
 
-Coffer uploads the files; making them readable to the public is up to you, with your provider's own setting for it (public access to the bucket, or a domain connected to it). The site's entry page is `index.html`.
+## Website
 
-### Publishing
+Coffer can publish notes as static web pages with their images, audio, video, and PDF files. Published pages are **not encrypted** and go to a separate storage location. In Obsidian, Coffer publishes nothing until you run the publish command and select **Publish** in the preview.
 
-Run **Publish notes to the website…**. Coffer builds the site and compares it with what is at the location, then shows what would change: new, changed and removed pages and files, and what was left out. It uploads only after you confirm, and only the files that changed; pages you took off are deleted from the location. Nothing is published automatically, so a note you mark does not go up until you run the command.
-
-### How the site looks
-
-One page per note, at its place in the vault (`Folder/Note.html`), and an `index.html` front page: a note you choose with a list of the other pages under it, or the list alone. When you choose none, a published note named `index.md` at the top of the vault is the front page. Each page ends with a list of the published pages that link to it. Every page uses one stylesheet, light or dark as the reader's device is set. There are no scripts, and Coffer adds no trackers.
-
-### Good to know
-
-- The file and folder names of the notes you publish are visible in their page addresses.
-- Pictures go up exactly as they are, including any location data a phone stored in them. An image a note takes from another website is loaded from there by the reader's browser.
-- Taking a page off deletes it from your location, but not from caches or from copies others made, and a bucket with versioning keeps the old versions.
-- Coffer keeps a list of what it uploaded in `coffer-site.json` at the location, and only ever deletes files on that list. Files you put there yourself are left alone.
-- Coffer renders the notes itself, so what plugins draw (Dataview queries, Mermaid diagrams, math typesetting) appears as source text, and an embedded note is a link, not its text shown in place.
-
-## Commands
-
-| Command | What it does |
-| --- | --- |
-| Sync now | Syncs right away |
-| Show sync status and problems | Opens the problems screen |
-| Set up sync | Connects this vault to storage, or joins with a setup link |
-| Sync now, allowing large deletions in the vault | Goes ahead with a sync the safety check stopped |
-| Check storage connection | Tests that the storage supports everything Coffer needs |
-| Show version history of the current file | Lists stored versions, with a diff, and restores one |
-| Download a file left in storage | Lists the files kept in storage by the size setting, and downloads the one you choose |
-| Show recent changes | Lists who changed what in the vault or a shared folder: each change by the device that made it, or in a shared folder with members by the member |
-| Add the current note to the notes shared by property | Marks the note to be shared at the next sync |
-| Remove the current note from the notes shared by property… | Deletes the note for the people it is shared with, and keeps yours |
-| Publish notes to the website… | Shows what would change on the website, and uploads it once you confirm |
-| Put the current note on the website | Marks the note so the next publish includes it: `publish: true`, or with the whole vault published, removes `publish: false` |
-| Take the current note off the website | Marks the note so the next publish deletes its page: removes `publish: true`, or with the whole vault published, sets `publish: false` |
-| Restore deleted files | Lists deleted files that can still be brought back |
-| Restore the vault or a folder to an earlier time | Previews and applies a point-in-time restore |
-| Resolve a file changed on two devices | Walks through a conflict copy line by line |
-| Check synced data for damage | Verifies the stored data end to end |
-| Repair synced data from this device's files | Stores again what the check found missing or damaged, from the files on this device |
-| Delete expired versions from storage | Runs the cleanup now (it also runs weekly, and after a day when storage has filled up with many small objects) |
-
-## How it works
-
-- **Storage layout.** `vault.json` holds the vault key, wrapped with a key derived from your passphrase (PBKDF2-SHA-256, 600,000 iterations for a new vault; setup links and invites are sealed at that cost too, or the vault's own if it is higher). It is the only object stored unencrypted, and it reveals nothing but the salt and iteration count. Changes are stored as numbered commits (`log/`), with periodic snapshots of the whole file table (`snap/`), and file contents live in encrypted packs (`pack/`).
-- **Keys.** Separate keys for encryption and for chunk IDs are derived from the vault key. Chunk IDs are keyed hashes, so storage cannot check whether you hold a particular file.
-- **Commits.** Commits are numbered, and each is written only if its number is still free, so two devices can never overwrite each other's changes. Each commit includes a hash of the one before it.
-- **What the storage provider can see:** how many objects there are, their sizes, and when they are written. Nothing else.
-- **Changing the passphrase** re-wraps the vault key; nothing else is re-uploaded. Other devices ask for the new passphrase on their next sync. A vault made with fewer than 600,000 iterations is raised to that cost at the same time, and a higher cost is never lowered; entering the current passphrase again does only that.
+- **Select notes.** Add `publish: true` to note properties. You can also run **Put the current note on the website** or **Take the current note off the website**. To publish all notes without `publish: false`, turn on **Publish the whole vault** under **Settings → Coffer → Website**. List private folders (for example, `Private/` or `Templates/`) under **Keep off the website** first. Then check the preview.
+- **Destination.** Add a separate S3 bucket or WebDAV folder with its own key under **Settings → Coffer → Website**. Coffer does not accept your vault storage or shared-folder storage. Make the destination public through your storage provider.
+- **Publish.** Run **Publish notes to the website…** to preview new, changed, and deleted files before upload. Coffer uploads only changed files and deletes removed pages.
+- **Output.** Each note becomes an HTML page at its vault path (`Folder/Note.html`), with an `index.html` front page, backlinks, and one light/dark stylesheet. Pages have no scripts and no trackers. Coffer does not include note properties (except `title`), `%%comments%%`, HTML comments, hidden folders, conflict copies, and (in Obsidian) shared folders. Coffer shows links to unpublished notes as plain text and embedded notes as links. Coffer renders Markdown itself. As a result, Coffer shows plugin syntax (for example, Dataview, Mermaid, or math) as source text.
+- **Privacy.** Page URLs include file and folder names. Coffer uploads images without changes, which includes any location metadata inside them. If you remove a page, caches, copies that others made, and old versions in a versioned bucket stay available. Coffer records uploaded files in `coffer-site.json` and deletes only files in that list.
 
 ## Command line
 
-The same engine runs from Node.js 22.18 or later, for an always-on computer that keeps a copy in sync. Download `coffer.js` from the release and run it; it is one file with nothing to install. If Node stops with `Cannot use import statement outside a module`, a nearby `package.json` says `"type": "commonjs"`: rename the file to `coffer.mjs`, which Node always reads as a module.
+The same sync engine runs on Node.js 22.18 or later for an always-on computer. Download `coffer.js` from the release and run it without installation. If Node stops with `Cannot use import statement outside a module`, rename the file to `coffer.mjs`. To check the release build, run `gh attestation verify coffer.js --repo chauduyphanvu/obsidian-coffer`. From a source clone, run `npm run cli -- <command>`.
 
 ```sh
 node coffer.js watch --config=coffer.json
 ```
 
-To check that the file was built by this repository's release workflow, run `gh attestation verify coffer.js --repo chauduyphanvu/obsidian-coffer`. From a clone, `npm ci` and then `npm run cli -- watch --config=coffer.json` run the same code.
-
-`coffer.json`:
+Example `coffer.json`:
 
 ```json
 {
@@ -204,37 +233,86 @@ To check that the file was built by this repository's release workflow, run `gh 
 }
 ```
 
-Secrets come from the environment: `COFFER_PASSPHRASE` (at least 8 characters to make a new vault, and the same for `COFFER_NEW_PASSPHRASE`), and `COFFER_ACCESS_KEY` with `COFFER_SECRET_KEY` for S3, or `COFFER_WEBDAV_PASSWORD` for WebDAV. Other commands: `join`, `sync`, `fetch`, `check`, `status`, `history`, `restore`, `deleted`, `log`, `activity`, `restore-at`, `export`, `verify`, `repair`, `clean`, `change-passphrase`, `accept-storage` and `publish`. Run `node coffer.js --help` (from a clone, `npm run cli`) for details, and `--version` for the version.
+Set secrets in environment variables:
 
-`export <dir>` writes a plain copy of every file, decrypted, into a new or empty folder outside the vault, each with the time it was last changed, including the files `deferAboveMB` leaves in storage. Add a folder of the vault to copy only that folder, and `--at=` with a time or a number from `log`, as `restore-at` takes, to copy the files as they were then. It writes nothing to storage or the vault, so it also works on a device that only receives; run from cron into a dated folder, it keeps plain backups that need nothing from Coffer to read. If some files cannot be read, it names them, writes the rest, and exits 1.
+- **Vault:** `COFFER_PASSPHRASE` (and `COFFER_NEW_PASSPHRASE` for passphrase changes, at least 8 characters), `COFFER_ACCESS_KEY` and `COFFER_SECRET_KEY` (S3), or `COFFER_WEBDAV_PASSWORD` (WebDAV).
+- **Website:** `COFFER_SITE_ACCESS_KEY` and `COFFER_SITE_SECRET_KEY` (S3), or `COFFER_SITE_WEBDAV_PASSWORD` (WebDAV).
 
-`status` says, without syncing or writing anything to storage, whether storage can be reached, its newest change, how each device keeps up, the files left in storage and the conflict copies among the files it syncs (not those in `.trash`). It exits 0 when all is well, and 1 when storage cannot be reached or read (it says why: a wrong passphrase, a history this device did not see, no vault in it), a device disagrees about the sync history, or conflict copies are waiting; a device that is behind or has not been seen for days is listed but does not fail it, as a phone that is switched off is normal. `--json` prints the same as one JSON object, with `ok` true or false and, when storage cannot be read, `storage.problem` (`unreachable`, `passphrase`, `history`, `empty`, `gone`, or `unreadable` for anything else it answered with), for a monitoring script.
+### Common commands
 
-To publish a website (see [Publishing a website](#publishing-a-website)), add a `site` to `coffer.json`: where it goes, as a `remote` of type `s3`, `webdav` or `folder` with the same fields as the vault's `remote`, and optionally a `title`, a `home` (the note that is the front page), `"whole": true` to publish every note except those that say `publish: false`, and an `exclude` list of folders and files to keep off the website.
+Run `node coffer.js --help` for all commands. Other commands include `sync`, `check`, `history`, `restore`, `deleted`, `log`, `activity`, `restore-at`, `verify`, `repair`, `clean`, `change-passphrase`, and `accept-storage`.
 
-```json
-"site": {
-  "remote": { "type": "s3", "endpoint": "https://s3.us-east-1.amazonaws.com", "region": "us-east-1", "bucket": "my-site", "prefix": "", "pathStyle": false },
-  "title": "My notes",
-  "home": "Home.md"
-}
+- `watch`: Keep the vault in sync continuously. Add `--publish` to publish the website automatically after the first sync and after syncs that change data, without a prompt.
+- `status`: Check storage access, device sync state, deferred files, and conflict copies. It writes nothing to storage. Add `--json` for scripts. It exits `1` on storage errors, history problems, or conflict copies.
+- `export <dir>`: Write a decrypted copy of the vault into an empty folder outside the vault. Add a vault subfolder or `--at=<time|commit>` for partial or point-in-time backups.
+- `publish`: Publish the website from `site` in `coffer.json` without a passphrase or sync keys. It supports `s3`, `webdav`, or an external `folder`. It uploads without a prompt. Add `--dry-run` to preview changes without upload.
+- `fetch <path>...`: Download files that `sync.deferAboveMB` keeps in storage.
+- `join -`: Join or follow a shared folder through standard input. Example: `pbpaste | node coffer.js join - --config=family.json --vault=Family`. The CLI cannot be the owner of a shared folder, send suggestions, or share by property.
+
+Set `"readOnly": true` under `sync` for a read-only computer. To publish a website, add a `site` block to `coffer.json`. Include `remote`. You can also add `title`, `home`, `"whole": true`, and `exclude`.
+
+## Security and limits
+
+```mermaid
+flowchart LR
+  subgraph unlock["Key unlock"]
+    P(["Passphrase"])
+    V[("vault.json · Salt + wrapped key")]
+    KEK{{"Key-wrapping key"}}
+    U("Unwrap")
+  end
+
+  MK{{"Master Key · 256-bit"}}
+
+  subgraph derived["Derived keys · HKDF-SHA-256"]
+    ENC{{"Encryption Key · AES-256-GCM"}}
+    ID{{"Chunk ID Key · HMAC-SHA-256"}}
+  end
+
+  subgraph objects["Encrypted storage objects"]
+    PK[("pack/ · Packed chunks")]
+    LG[("log/ · Hash-chained commits")]
+    SN[("snap/ · File table snapshots")]
+  end
+
+  P == "PBKDF2-SHA-256 · 600,000 iter" ==> KEK
+  V -.->|"Salt"| KEK
+  KEK --> U
+  V -.->|"Wrapped key"| U
+  U ==> MK
+
+  MK ==> ENC
+  MK ==> ID
+
+  ENC ==> PK
+  ENC ==> LG
+  ENC ==> SN
+  ID -.->|"Keyed chunk hashes"| PK
+
+  classDef secret fill:#1e293b,stroke:#38bdf8,color:#f0f9ff,stroke-width:1.5px
+  classDef header fill:#451a03,stroke:#f59e0b,color:#fffbeb,stroke-width:1.5px,stroke-dasharray: 4 3
+  classDef key fill:#2e1065,stroke:#8b5cf6,color:#f5f3ff,stroke-width:1.75px
+  classDef op fill:#0f172a,stroke:#64748b,color:#e2e8f0,stroke-width:1.5px
+  classDef encrypted fill:#064e3b,stroke:#10b981,color:#ecfdf5,stroke-width:1.5px
+
+  class P secret
+  class V header
+  class KEK,MK,ENC,ID key
+  class U op
+  class PK,LG,SN encrypted
+
+  style unlock fill:transparent,stroke:#64748b,stroke-width:1.25px,stroke-dasharray: 4 4
+  style derived fill:transparent,stroke:#8b5cf6,stroke-width:1.25px,stroke-dasharray: 4 4
+  style objects fill:transparent,stroke:#10b981,stroke-width:1.25px,stroke-dasharray: 4 4
 ```
 
-`node coffer.js publish --config=coffer.json` uploads the website and prints what changed. Unlike the command in Obsidian it does not ask first, so run it with `--dry-run` to see what it would do: that prints the same and writes nothing. The website's keys are separate from the vault's: `COFFER_SITE_ACCESS_KEY` and `COFFER_SITE_SECRET_KEY` for S3, or `COFFER_SITE_WEBDAV_PASSWORD` for WebDAV. `publish` reads only the vault folder, so it needs no passphrase and no sync keys, works on a device that only receives, and leaves the sync state alone. A `folder` site writes plain files you can host anywhere; the folder must be outside the vault, neither inside it nor holding it.
-
-`watch --publish` keeps the website current: it publishes after its first sync and after each sync that sends or receives something, and prints what changed on the website. There is no preview to confirm, so a note goes public as soon as it syncs, and with `"whole": true` that is every new note that does not say `publish: false`. A publish that fails is printed and tried again after the next sync; syncing carries on either way.
-
-To keep large files off this machine, set `deferAboveMB` under `sync` to a size in MB: files above it stay in storage, `sync` lists them as not downloaded, and `fetch <path>...` downloads the ones you name, after which they sync like any other file.
-
-To join a shared folder with members, or follow one, pass its link on standard input so it stays out of shell history: `pbpaste | node coffer.js join - --config=family.json --vault=Family`. The keys are kept in `<folder>/.coffer/keys.json`, readable by you alone, and the other commands then work on that config. The command line cannot own a shared folder, send suggestions, or send notes shared by a property.
-
-## Known limitations
-
-- In a shared folder with members, a device that joins with an invite made before someone was removed can be shown storage put back to before the removal, until the folder is given new keys.
-
-- If objects are deleted from storage by something other than Coffer, the weekly cleanup names the files affected on the problems screen, as **Check synced data for damage** does at any time, and **Repair synced data** stores them again from a device that still has those files. What no device has any more cannot be recovered, and neither can an earlier version that no current file shares data with.
-- If storage is put back to an older copy, a device notices when it next sends a change, and at once takes back the one change it sent, or within an hour if it has nothing to send, as a device that only receives never does.
-- In the device list, another device's "changes behind" count can be a few minutes old, and the list says how old.
+- **Encryption.** Coffer uses AES-256-GCM to encrypt file contents, file names, folder names, and device names. In a vault, `vault.json` is the only unencrypted object. It contains the vault key wrapped with PBKDF2-SHA-256 (600,000 iterations for a new vault). Separate derived keys encrypt data and calculate keyed chunk hashes. Storage cannot test if you have a file.
+- **Storage layout.** Coffer divides files into content-defined chunks, compresses text, keeps matching chunks one time, and packs them into `pack/`. Numbered commits (`log/`) include the previous commit hash and write only when the number is free. Devices do not overwrite changes. Periodic snapshots (`snap/`) record the full file table.
+- **Provider visibility.** Your storage provider sees only object counts, sizes, and write times.
+- **Passphrase change.** Coffer wraps the vault key again in `vault.json` without a new upload of vault data. Other devices ask for the new passphrase on the next sync.
+- **External deletions.** If an external tool deletes storage objects, weekly cleanup and **Check synced data for damage** list affected files. **Repair synced data from this device's files** restores them from a device that has them. You cannot restore data that is missing from all devices.
+- **Storage rollback.** If storage returns to an older state, a device detects it on its next upload, or in less than 1 hour when idle. In a member-shared folder, a device with an old invite can accept storage from before a removal until you replace the keys.
+- **Device status.** The "changes behind" count for another device can be a few minutes old.
 
 ## Build from source
 
