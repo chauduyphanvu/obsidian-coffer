@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { SafetyError, SyncEngine, deleteLimit } from '../src/core/engine.ts';
 import { LocalState } from '../src/core/state.ts';
+import type { RemoteStore } from '../src/core/types.ts';
 import { MemoryStore } from '../src/stores/memory.ts';
 import { rng, SimStore } from '../src/testing/netsim.ts';
 import { Device, lossy } from './helpers.ts';
@@ -393,6 +394,124 @@ test('a note moved on one device and edited on the other ends up edited under it
   assert.deepEqual(Object.keys(a.snapshot()).sort(), ['Archive/two.md', 'Inbox/one.md']);
   assert.equal(a.fs.text('Inbox/one.md'), note('one') + 'Edited on B.\n');
   assert.equal(a.fs.text('Archive/two.md'), note('two') + 'Edited on A.\n');
+});
+
+test('a note removed here for a move elsewhere, then made again under its old name after the app stopped, is a new note and leaves the moved one as it is', async () => {
+  const clock = { now: 1_800_000_000_000 };
+  const mem = new MemoryStore(() => clock.now);
+  let packsDown = false;
+  const net: RemoteStore = {
+    get: (key, range) => (packsDown && key.startsWith('pack/') ? Promise.reject(new Error('the network is down')) : mem.get(key, range)),
+    put: (key, data, opts) => mem.put(key, data, opts),
+    list: (prefix, after) => mem.list(prefix, after),
+    delete: (key) => mem.delete(key),
+  };
+  const [a, b] = ['A', 'B'].map((n) => new Device(n, net, clock));
+  a.fs.put('note.md', 'kept text\n');
+  a.fs.put('other.md', 'first\n');
+  await a.sync();
+  await b.sync();
+  // A moves the note and edits another file. B removes the note at its old name, then fails to download the edit.
+  a.fs.files.set('Archive/note.md', a.fs.files.get('note.md')!);
+  a.fs.files.delete('note.md');
+  a.fs.put('other.md', 'second\n');
+  await a.sync();
+  packsDown = true;
+  await assert.rejects(b.sync());
+  packsDown = false;
+  assert.equal(b.fs.files.has('note.md'), false);
+  // The app stops before saving anything else, and a new note is made under the old name before the next sync.
+  b.restart();
+  b.fs.put('note.md', 'a new note\n');
+  await b.sync();
+  await a.sync();
+  assert.deepEqual(b.snapshot(), a.snapshot());
+  assert.equal(a.fs.text('Archive/note.md'), 'kept text\n');
+  assert.equal(a.fs.text('note.md'), 'a new note\n');
+});
+
+test('a note moved here and edited elsewhere keeps the edit when the sync that took it fails, and another device then makes a note under the new name', async () => {
+  const clock = { now: 1_800_000_000_000 };
+  const mem = new MemoryStore(() => clock.now);
+  let commitsDown = false;
+  const net: RemoteStore = {
+    get: (key, range) => mem.get(key, range),
+    put: (key, data, opts) => (commitsDown && key.startsWith('log/') ? Promise.reject(new Error('the network is down')) : mem.put(key, data, opts)),
+    list: (prefix, after) => mem.list(prefix, after),
+    delete: (key) => mem.delete(key),
+  };
+  const [a, b] = ['A', 'B'].map((n) => new Device(n, net, clock));
+  a.fs.put('note.md', 'first line\n');
+  await a.sync();
+  await b.sync();
+  // B moves the note and A edits it. B takes the edit into the moved note, saves its state, and then cannot commit.
+  b.fs.files.set('Moved/note.md', b.fs.files.get('note.md')!);
+  b.fs.files.delete('note.md');
+  a.fs.put('note.md', 'first line\nedited on A\n');
+  await a.sync();
+  // B has seen A's commit (as a view of history does), so its sync plans the edit first rather than committing at once.
+  await b.engine.view();
+  commitsDown = true;
+  await assert.rejects(b.sync());
+  commitsDown = false;
+  assert.equal(b.fs.text('Moved/note.md'), 'first line\nedited on A\n');
+  // The app stops. Meanwhile A makes a note of its own under the new name.
+  b.restart();
+  a.fs.put('Moved/note.md', 'made on A\n');
+  await a.sync();
+  await b.sync();
+  await a.sync();
+  assert.deepEqual(b.snapshot(), a.snapshot());
+  const texts = [...a.fs.files.keys()].map((path) => a.fs.text(path)).sort();
+  assert.deepEqual(texts, ['first line\nedited on A\n', 'made on A\n']);
+});
+
+test('a move whose new name another device just changed is not committed by halves, so moving the note back keeps it', async () => {
+  const clock = { now: 1_800_000_000_000 };
+  const mem = new MemoryStore(() => clock.now);
+  let loseCommitReply = false;
+  const net: RemoteStore = {
+    get: (key, range) => mem.get(key, range),
+    put: async (key, data, opts) => {
+      const ok = await mem.put(key, data, opts);
+      if (loseCommitReply && ok && key.startsWith('log/')) {
+        loseCommitReply = false;
+        throw new Error('the reply was lost');
+      }
+      return ok;
+    },
+    list: (prefix, after) => mem.list(prefix, after),
+    delete: (key) => mem.delete(key),
+  };
+  const [a, b] = ['A', 'B'].map((n) => new Device(n, net, clock));
+  const move = (d: Device, from: string, to: string) => {
+    d.fs.files.set(to, d.fs.files.get(from)!);
+    d.fs.files.delete(from);
+  };
+  a.fs.put('note.md', 'the note\n');
+  a.fs.put('other.md', 'other\n');
+  await a.sync();
+  await b.sync();
+  // A edits other.md. B, not knowing, moves other.md away, moves the note to other.md, and writes a new note. B's commit
+  // loses the race to A's; what it commits instead at once, still in the same pass, lands but its reply is lost.
+  a.fs.put('other.md', 'other, edited on A\n');
+  await a.sync();
+  move(b, 'other.md', 'other 2.md');
+  move(b, 'note.md', 'other.md');
+  b.fs.put('new.md', 'a new note\n');
+  loseCommitReply = true;
+  await assert.rejects(b.sync());
+  // The app stops, and the note is moved back before the next sync.
+  b.restart();
+  move(b, 'other.md', 'note.md');
+  await b.sync();
+  await a.sync();
+  await b.sync();
+  assert.deepEqual(b.snapshot(), a.snapshot());
+  assert.equal(a.fs.text('note.md'), 'the note\n');
+  // A's edit follows B's move of other.md.
+  assert.deepEqual(Object.keys(a.snapshot()).sort(), ['new.md', 'note.md', 'other 2.md']);
+  assert.equal(a.fs.text('other 2.md'), 'other, edited on A\n');
 });
 
 test('a move is not followed when it cannot be told which file the note went to, or the move also changed it', async () => {

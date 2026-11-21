@@ -16,7 +16,7 @@ import { findDamage, repairReport, storeAgain, type RepairOptions, type RepairRe
 import { Repo, StorageGoneError } from './repo.ts';
 import { INBOX, INBOX_OPENED, MAX_SEALED, SUGGEST_MAX_FILE, SUGGEST_MAX_TOTAL, inboxKey, openSuggestion, parseInboxKey, sealSuggestion, suggestKind, type SuggestedFile, type Suggestion } from './suggest.ts';
 import { collectGarbage, listVersions, type CleanupResult } from './retention.ts';
-import { LocalState } from './state.ts';
+import { LocalState, type Synced } from './state.ts';
 import { errorText } from './text.ts';
 import { ReadOnlyError, hasChunks, putNew, readOnlyStore, sameContent, type Change, type ChunkRef, type Commit, type Entry, type FileStat, type Held, type LocalFS, type RemoteStore, type StateStore, type Version } from './types.ts';
 import { affectedBy, missingFiles, verifyRepo, type VerifyOptions, type VerifyReport } from './verify.ts';
@@ -1245,9 +1245,10 @@ export class SyncEngine {
           const data = await this.readVersion(r);
           if (!unchanged(await fs.stat(l.path), l)) continue;
           const stat = await fs.write(l.path, data, r.mtime);
-          // The old name agrees with storage and is gone here, so its deletion is sent; the new name is sent with the edit.
+          // The old name agrees with storage and is gone here, so its deletion is sent; the new name is sent as a new file.
+          // Not recorded as agreed under the new name, which storage has never held: saved by a sync that then fails,
+          // that record would make the file pass for unchanged, and a file another device puts there would replace it.
           st.synced.set(from[0], { entry: r, lsize: -1, lmtime: -1 });
-          st.synced.set(l.key, { entry: r, lsize: -1, lmtime: -1 });
           local.set(l.key, { ...l, ...stat });
           keys?.add(from[0]);
           followed++;
@@ -1344,6 +1345,7 @@ export class SyncEngine {
     if (p.pullDeletes.length) for (const key of p.pulls) wanted.add(contentKey(st.remote.get(key)!));
     const moved = new Map<string, Uint8Array>();
     let movedBytes = 0;
+    const doomed: { key: string; l: Local; was: Synced }[] = [];
 
     for (const key of p.pullDeletes) {
       const l = local.get(key)!;
@@ -1352,19 +1354,44 @@ export class SyncEngine {
           this.skip(run, res, key);
           continue;
         }
-        const ck = contentKey(st.synced.get(key)!.entry);
+        const was = st.synced.get(key)!;
+        const ck = contentKey(was.entry);
         if (wanted.has(ck) && !moved.has(ck) && movedBytes + l.size <= MOVE_CACHE) {
           moved.set(ck, await fs.read(l.path));
           movedBytes += l.size;
         }
+        doomed.push({ key, l, was });
+      } catch (e) {
+        recordError(res, key, e);
+      }
+    }
+    if (!doomed.length) return moved;
+
+    // Forgotten and saved before the files go. Saved after, a stop in between would leave the state holding as synced
+    // a file that is gone, and a new file made under that name would pass for an edit of the old one: an edit that,
+    // following a move (`followMoves`), lands on the moved file and replaces what it held.
+    for (const { key } of doomed) st.synced.delete(key);
+    this.unsaved = true;
+    try {
+      await this.save();
+    } catch (e) {
+      for (const { key, was } of doomed) st.synced.set(key, was);
+      throw e;
+    }
+    for (const { key, l, was } of doomed) {
+      try {
+        if (!unchanged(await fs.stat(l.path), l)) {
+          st.synced.set(key, was);
+          this.skip(run, res, key);
+          continue;
+        }
         await fs.remove(l.path);
-        st.synced.delete(key);
-        this.unsaved = true;
         local.delete(key);
         run.known.paths.delete(key);
         pass.byLower?.delete(key.toLowerCase());
         res.deletedLocal++;
       } catch (e) {
+        st.synced.set(key, was);
         recordError(res, key, e);
       }
     }
@@ -1789,8 +1816,16 @@ export class SyncEngine {
       contended = true;
       const touched = await this.fetchRemote();
       this.dedup = this.reusable(st);
-      prepared = prepared.filter((p) => !touched.has(p.file.key) && this.rebase(p.entry));
-      deletes = deletes.filter((path) => !touched.has(path));
+      const kept = prepared.filter((p) => !touched.has(p.file.key) && this.rebase(p.entry));
+      // A move is a deletion and a new file with the same content. When the new file goes back through planning, so
+      // does the old name: committed alone, the deletion would leave the content only here, and moving the file back
+      // before the next sync would then make it look unchanged at a name storage deleted, and remove it.
+      const replanned = new Set(prepared.filter((p) => !kept.includes(p)).map((p) => contentKey(p.entry)));
+      prepared = kept;
+      deletes = deletes.filter((path) => {
+        const was = st.synced.get(path)?.entry;
+        return !touched.has(path) && !(was && replanned.has(contentKey(was)));
+      });
     }
     return contended;
   }
