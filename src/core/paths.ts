@@ -2,7 +2,7 @@
 
 // No character below U+0300 changes under NFC or combines with one before it (Unicode's NFC quick check starts there),
 // so most paths can skip `normalize`, which costs more than the rest of the scan's work on a path.
-const MAY_CHANGE_UNDER_NFC = /[^\u0000-˿]/;
+const MAY_CHANGE_UNDER_NFC = /[̀-￿]/;
 
 /** Paths are compared in NFC so the same name typed on macOS and elsewhere is one file. */
 export const vaultKey = (path: string) => (MAY_CHANGE_UNDER_NFC.test(path) ? path.normalize('NFC') : path);
