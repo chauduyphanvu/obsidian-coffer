@@ -428,6 +428,11 @@ export default class CofferPlugin extends Plugin {
     this.register(() => window.clearTimeout(this.retryTimer));
     // A sync an edit scheduled must not run once the plugin is disabled, or beside the next copy of it after an update.
     this.register(() => this.schedule.cancel());
+    // After an update the next copy announces the same problems again, and tapping this copy's notice would open its details.
+    this.register(() => {
+      this.alertNotice?.notice.hide();
+      this.progressNotice?.hide();
+    });
     this.app.workspace.onLayoutReady(() => {
       // `places` are the ids of the places the change is in: a place paused before a mass delete may sync again.
       const changed = (...places: (string | string[])[]) => {
