@@ -805,6 +805,16 @@ test('the same note renders to the same string every time', () => {
 
 test('pathological input renders quickly and without throwing', () => {
   const big = 'word '.repeat(100_000);
+  // The limit is 2 s, or 100 times what plain text of the same length takes on this machine if that is more. GitHub's
+  // runners can be ten times slower than a laptop, and busy with other test files; these inputs take at most about 60
+  // times plain text, so one that sends the renderer down a slow path still fails on any machine.
+  const plain = 'word '.repeat(400_000);
+  const runs = Array.from({ length: 5 }, () => {
+    const start = performance.now();
+    renderMarkdown(plain, site());
+    return performance.now() - start;
+  }).sort((a, b) => a - b);
+  const perChar = runs[2] / plain.length;
   for (const [name, md] of [
     ['50,000 *', '*'.repeat(50_000)],
     ['50,000 * between words', 'a* '.repeat(50_000)],
@@ -837,7 +847,8 @@ test('pathological input renders quickly and without throwing', () => {
     const r = renderMarkdown(md, site());
     const ms = performance.now() - start;
     assert.equal(typeof r.html, 'string', name);
-    assert.ok(ms < 2000, `${name}: ${Math.round(ms)} ms`);
+    const limit = Math.max(2000, 100 * md.length * perChar);
+    assert.ok(ms < limit, `${name}: ${Math.round(ms)} ms, limit ${Math.round(limit)} ms`);
   }
 });
 
