@@ -1,0 +1,5 @@
+{
+  "vault": "docs",
+  "remote": { "type": "folder", "path": "_unused" },
+  "site": { "remote": { "type": "folder", "path": "_site" }, "title": "Coffer", "home": "Coffer", "whole": true }
+}
