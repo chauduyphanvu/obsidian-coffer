@@ -1,10 +1,73 @@
 # Coffer
 
-Coffer syncs your Obsidian vault between desktop and mobile devices through storage that you control. It supports S3-compatible buckets (Cloudflare R2, Backblaze B2, Amazon S3, MinIO, Wasabi, and others) and WebDAV servers (Nextcloud or a NAS).
+**Sync, share, and publish your Obsidian vault through storage that you control. Coffer encrypts all data on your device, merges changes from all your devices, and needs no server.**
 
-Coffer encrypts all data on your device before upload. Your storage provider gets only data that it cannot read. Coffer also keeps file history, merges changes across devices, shares folders, and can publish notes as a website.
+Coffer works with S3-compatible buckets (Cloudflare R2, Backblaze B2, Amazon S3, MinIO, Wasabi, and others) and WebDAV servers (Nextcloud or a NAS). Cloudflare R2 and Backblaze B2 each give 10 GB of free storage. Coffer is free, open source (MIT), and needs no account.
 
-> Coffer is at version 0.7. It passes 828 tests and runs on macOS and iOS, but keep a backup of important vaults.
+> Coffer is at version 0.7. It passes 831 tests and runs on macOS and iOS, but keep a backup of important vaults.
+
+<p align="center"><img src="docs/images/conflict-resolver.png" width="720" alt="Coffer's conflict resolver in Obsidian. Kitchen.md changed on two devices. Change 1 of 3 shows 'Countertops: $3,900, quartz' from this device and 'Countertops: $2,800, laminate' from the other device, with buttons to keep this device, the other device, or both."></p>
+
+<p align="center"><sub>A note changed at the same line on two devices. For each change, you keep the lines from this device, the other device, or both.</sub></p>
+
+## Who Coffer is for
+
+### Obsidian users on desktop and mobile
+
+- **One vault on all your devices.** Coffer syncs a few seconds after a change. On mobile, it sends changes before the OS stops the app.
+- **No lost changes.** Coffer does a three-way merge of notes, line by line and word by word. It does not overwrite a change from another device. If it cannot merge two versions, it keeps both.
+- **Conflicts in Obsidian.** Compare two versions of a note. For each change, keep the lines from this device, the other device, or both.
+- **Return to an earlier time.** Restore an old version of a file or deleted files. Return a folder or the full vault to an earlier time, with a preview.
+- **Share and publish.** Share a folder with family or a team, and give each person a role. Publish selected notes as a static website in storage of your own.
+
+<p align="center"><img src="docs/images/restore-earlier.png" width="560" alt="Coffer's Restore to an earlier time dialog. The whole vault as it was today at 05:44 PM: 2 files will be brought back and 2 changed, with the file names listed and a Restore 4 files button."></p>
+
+<p align="center"><sub>Return the vault or a folder to an earlier time. Coffer shows what will change before it does anything.</sub></p>
+
+### Self-hosters and homelab users
+
+- **No server to run.** Coffer needs only storage. There is no database, sync service, or daemon to maintain.
+- **Your own hardware.** Use a WebDAV folder on Nextcloud or a NAS, or a self-hosted S3 server such as MinIO. At setup, Coffer tests your storage, which includes a test that it refuses to overwrite an object.
+- **Command line.** The same sync engine runs on Node.js with no installation. `watch` keeps a vault in sync on an always-on computer. `status --json` gives health data to scripts and monitors. `export` writes a decrypted copy for your usual backups, for example from cron.
+
+### Security-minded users
+
+- **End-to-end encryption.** AES-256-GCM encrypts file contents, file names, folder names, and device names. HKDF-SHA-256 derives separate keys for encryption and for chunk hashes. Your storage provider cannot read your data.
+- **Commits without locks.** Each commit contains the hash of the previous commit. A device writes a commit only if its number is free (a conditional PUT with `If-None-Match: *`). Two devices cannot overwrite each other.
+- **Signed shared folders.** Devices sign each change in a shared folder with ECDSA P-256. Devices accept changes only from current editors. This rule holds also if a member's storage key can write.
+- **Code that you can check.** Coffer has no runtime dependencies and sends no telemetry. Its 831 tests include fuzz tests with failed requests and app crashes, and a network fault simulator. Each release file has a GitHub build attestation.
+
+## Compared with other sync options
+
+Obsidian Sync is the official sync service. It needs no setup, and your subscription supports the Obsidian team. Coffer is for people who want their vault in storage that they control.
+
+The facts about the other tools come from their own websites and READMEs, checked on 2026-11-20 (see [sources](#comparison-sources)). A dash (—) means that the tool's documentation does not say. If something is out of date, please open an issue.
+
+| | Coffer | Obsidian Sync | Remotely Save | Self-hosted LiveSync | iCloud Drive | Obsidian Git |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Price** | Free | From $4 a month | Free. PRO price not set yet | Free | Your iCloud plan | Free |
+| **Your data is in** | Your bucket or WebDAV server | Obsidian's servers | S3, Dropbox, OneDrive, WebDAV. More with PRO | CouchDB, S3, or peer-to-peer | iCloud Drive | Any Git remote |
+| **You run** | Nothing | Nothing | Nothing | CouchDB, for live mode | Nothing | A Git remote, and Git on desktop |
+| **End-to-end encryption** | Always | On by default | Optional | Optional | With Advanced Data Protection | — |
+| **Same note changed on two devices** | Three-way merge. Else keeps both | Merges Markdown. Other files: last change wins | You choose: the newer or the larger file. PRO merges small notes | Three-way merge. Else asks you | — | Git merge. You resolve it |
+| **Version history** | 30 days by default. Restore the whole vault | 1 or 12 months | — | Per-note history | — | Full Git history |
+| **Mobile** | iOS tested. Android not yet | iOS and Android | Yes. Slow for files of 50 MB or more | Yes. Self-hosted CouchDB needs HTTPS | iOS and iPadOS | Not recommended by its author |
+| **Share with others** | Shared folders with roles | Shared vaults, up to 20 people | — | — | — | Through Git, not live |
+| **Publish a website** | Static pages in your storage | Obsidian Publish, from $8 a month | — | — | — | — |
+
+Other tools do some things better:
+
+- **Obsidian Sync** comes from the Obsidian team, sets up in a few minutes, needs no storage account, and is independently audited.
+- **Self-hosted LiveSync** syncs in real time (with CouchDB, or peer-to-peer while both devices are online).
+- **Remotely Save** supports more storage services, such as Dropbox and OneDrive.
+- **iCloud Drive** is built into Apple devices and needs no plugin.
+- **Obsidian Git** gives full Git history and diffs with any Git host.
+
+Coffer is not real time: it syncs a few seconds after a change. It has run on macOS and iOS only. It has no independent security audit yet.
+
+## How it works
+
+Each device encrypts and signs data before upload. Published web pages go to a separate location without encryption.
 
 ```mermaid
 flowchart LR
@@ -314,6 +377,35 @@ flowchart LR
 - **Storage rollback.** If storage returns to an older state, a device detects it on its next upload, or in less than 1 hour when idle. In a member-shared folder, a device with an old invite can accept storage from before a removal until you replace the keys.
 - **Device status.** The "changes behind" count for another device can be a few minutes old.
 
+## Tests and benchmarks
+
+### Tests
+
+`npm test` runs 831 tests with the Node.js test runner. The release workflow also runs 88 command-line tests against the bundled `coffer.js`. The tests include:
+
+- **Merges, history, and restore.** Line and word merges, moves on one device with edits on another, version thinning, and restores to an earlier time.
+- **Shared folders.** Roles, invites, removal, and attacks by members whose storage keys can write.
+- **Fuzz tests.** Three devices do 200 random steps (edits, deletions, moves, syncs, cleanups, and time jumps), for each of 40 seeds. A second run adds failed requests (8%), lost replies, and app stops before the state file is saved (15%). After each run, all devices and a new device must hold the same vault. Each line that a device wrote must still exist, unless a device that saw that line deleted it. See `src/testing/fuzz.ts`.
+- **Network simulation.** `src/testing/netsim.ts` adds round-trip delay, bandwidth limits, and failed requests.
+
+### Benchmarks
+
+`npm run bench -- --notes=10000 --net=mobile --grown=0` syncs a generated vault between two devices. It uses a simulated mobile link (120 ms round trip, 5 Mbit/s up, 20 Mbit/s down). The vault has 10,000 notes, images, and one 20 MB video: 10,209 files and 91.5 MB. Storage holds 80.5 MB for it, because Coffer compresses text and keeps matching chunks one time.
+
+| Action | Time | Sent / received |
+| --- | --- | --- |
+| Sync with nothing changed | 130 ms | 0 / 0 KB (2 small reads) |
+| Edit 1 note, send | 267 ms | 2 / 30 KB |
+| Edit 1 note, receive | 253 ms | 0 / 2 KB |
+| Edit 100 notes, send | 424 ms | 101 / 0 KB |
+| Move a folder of 3,006 files, send | 552 ms | 159 / 5 KB |
+| Add 100 bytes in the middle of a 20 MB file, send | 984 ms | 310 / 1 KB |
+| Add a 2 MB photo, send | 3.6 s | 1.9 MB / 159 KB |
+| New device, download the full vault | 32 s | 0 / 76 MB |
+| First device, upload the full vault | 126 s | 76 MB / 430 KB |
+
+The times are medians of 3 runs on an Apple M5 Max with Node.js 26 at commit `203f7bb`. They include the simulated network, which takes most of the time. A phone has a slower processor, so times on a phone are longer. The benchmark uses fewer passphrase iterations, so that the unlock step does not hide the sync time.
+
 ## Build from source
 
 ```sh
@@ -321,6 +413,16 @@ npm ci
 npm run build      # dist/main.js, dist/manifest.json, dist/styles.css, dist/coffer.js
 npm test
 ```
+
+## Comparison sources
+
+Checked on 2026-11-20:
+
+- **Obsidian Sync:** [obsidian.md/sync](https://obsidian.md/sync), [pricing](https://obsidian.md/pricing), and the help pages on [security](https://obsidian.md/help/sync/security), [conflicts](https://obsidian.md/help/sync/troubleshoot), [version history](https://obsidian.md/help/sync/version-history), [collaboration](https://obsidian.md/help/sync/collaborate), and the [FAQ](https://obsidian.md/help/sync/faq).
+- **Remotely Save:** [README](https://github.com/remotely-save/remotely-save), [pricing](https://remotelysave.com/pricing), and [encryption formats](https://github.com/remotely-save/remotely-save/blob/master/docs/encryption/comparation.md).
+- **Self-hosted LiveSync:** [README](https://github.com/vrtmrz/obsidian-livesync), [settings](https://github.com/vrtmrz/obsidian-livesync/blob/main/docs/settings.md), and [conflict resolution](https://github.com/vrtmrz/obsidian-livesync/blob/main/docs/specs_conflict_resolution.md).
+- **iCloud Drive:** Obsidian help on [syncing notes](https://obsidian.md/help/sync-notes) and [Sync security](https://obsidian.md/help/sync/security) (encryption types).
+- **Obsidian Git:** [README](https://github.com/Vinzent03/obsidian-git) and its [documentation](https://publish.obsidian.md/git-doc/Start+here).
 
 ## License
 
