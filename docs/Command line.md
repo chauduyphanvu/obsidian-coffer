@@ -21,6 +21,7 @@ Secrets come from environment variables: `COFFER_PASSPHRASE`, and `COFFER_ACCESS
 - `watch`: keep the vault in sync. Add `--publish` to publish the website after syncs that change something.
 - `status`: check storage access, the sync state, and conflict copies, without writing to storage. Add `--json` for scripts. It exits with `1` when something is wrong.
 - `export <dir>`: write a decrypted copy of the vault into an empty folder, for your usual backups. Add `--at=<time>` for the vault at an earlier time.
+- `activity`: list the latest changes, each after its number. `undo <number>` takes one of them back out and keeps everything done since. Add `--dry-run` to see what would change.
 - `publish`: publish the website from the `site` part of `coffer.json`. Add `--dry-run` to see what would change.
 - `join -`: join or follow a shared folder from an invite link on standard input.
 

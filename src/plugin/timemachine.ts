@@ -5,7 +5,7 @@ import { fileName, vaultKey } from '../core/paths.ts';
 import type { RepairReport } from '../core/repair.ts';
 import { listVersions } from '../core/retention.ts';
 import { plural } from '../core/text.ts';
-import { TooOldError, listActivity, listCommits, listDeleted, planRestore, tableAt, type CommitSummary, type DeletedFile, type PastVault } from '../core/timeline.ts';
+import { TooOldError, listActivity, listCommits, listDeleted, planRestore, tableAt, type CommitSummary, type DeletedFile, type Operation, type PastVault } from '../core/timeline.ts';
 import { sameContent, type Version } from '../core/types.ts';
 import type { VerifyReport } from '../core/verify.ts';
 import { ActivityPages, activityRows, savedBy, type ActivityRow, type Self } from './activity.ts';
@@ -28,17 +28,20 @@ import {
   lineChanges,
   matchesQuery,
   momentLabel,
+  operationLabel,
   previewVersion,
   repeatsDay,
   restoreSteps,
   scopeName,
   sentNote,
   sizeLabel,
+  skippedNote,
   stepSummary,
   timeLabels,
   verifyProgress,
   type DiffLine,
   type Preview,
+  type Skipped,
   type Step,
 } from './restore.ts';
 import { MAX_COMPARE_BYTES } from './status.ts';
@@ -572,6 +575,16 @@ export class DeletedModal extends Modal {
 
 const KIND: [Step['kind'], string][] = [['add', 'Brought back'], ['change', 'Changed'], ['remove', 'Removed']];
 
+/** One part of a plan, folded: its name, how many lines, and the first of them. */
+function planList(c: HTMLElement, label: string, lines: string[]): void {
+  if (!lines.length) return;
+  const d = c.createEl('details', { cls: 'coffer-plan' });
+  d.createEl('summary', { text: `${label} (${lines.length.toLocaleString()})` });
+  const list = d.createDiv({ cls: 'coffer-files' });
+  for (const line of lines.slice(0, MAX_ROWS)) list.createDiv({ cls: 'coffer-file', text: line });
+  if (lines.length > MAX_ROWS) list.createDiv({ cls: 'coffer-hint', text: `…and ${(lines.length - MAX_ROWS).toLocaleString()} more` });
+}
+
 /**
  * The whole vault or one folder back to how it was at an earlier time: pick the time and the scope, see exactly what
  * would change, confirm, then watch it happen.
@@ -767,15 +780,7 @@ export class RestoreEarlierModal extends Modal {
     message(c, this.error);
     const counts = countSteps(this.steps);
     c.createEl('p', { cls: 'coffer-summary', text: stepSummary(counts) });
-    for (const [kind, label] of KIND) {
-      const paths = this.steps.filter((s) => s.kind === kind).map((s) => s.path);
-      if (!paths.length) continue;
-      const d = c.createEl('details', { cls: 'coffer-plan' });
-      d.createEl('summary', { text: `${label} (${paths.length.toLocaleString()})` });
-      const list = d.createDiv({ cls: 'coffer-files' });
-      for (const path of paths.slice(0, MAX_ROWS)) list.createDiv({ cls: 'coffer-file', text: path });
-      if (paths.length > MAX_ROWS) list.createDiv({ cls: 'coffer-hint', text: `…and ${(paths.length - MAX_ROWS).toLocaleString()} more` });
-    }
+    for (const [kind, label] of KIND) planList(c, label, this.steps.filter((s) => s.kind === kind).map((s) => s.path));
     if (this.left) c.createDiv({ cls: 'coffer-hint', text: leftNote(this.left) });
     if (!this.steps.length) {
       button(buttonRow(c), 'Back', () => this.back());
@@ -923,7 +928,12 @@ export class ActivityModal extends Modal {
       return;
     }
     const box = parent.createDiv({ cls: 'coffer-activity' });
-    row(box, r.who, `${time} · ${r.text}`);
+    const head = box.createDiv({ cls: 'coffer-activity-head' });
+    row(head, r.who, `${time} · ${r.text}`);
+    // Notes shared by a property are never written into from here, and a device that only receives sends no undo.
+    if (r.files.length && !this.share?.property && !this.plugin.receivesOnly(this.share)) {
+      button(head, 'Undo', () => new UndoModal(this.app, this.plugin, r.seq, this.share).open()).setTooltip('Take this change back out, keeping what was done since');
+    }
     const files = box.createDiv({ cls: 'coffer-activity-files' });
     for (const f of r.files.slice(0, MAX_FILES)) {
       // Notes shared by a property keep their versions in the vault's history, which counts its changes apart.
@@ -933,6 +943,153 @@ export class ActivityModal extends Modal {
       if (f.kind === 'deleted') el.addClass('is-deleted');
     }
     if (r.files.length > MAX_FILES) files.createDiv({ cls: 'coffer-hint', text: `…and ${(r.files.length - MAX_FILES).toLocaleString()} more` });
+  }
+}
+
+/**
+ * One change taken back out of the vault or a shared folder, with everything done since kept: what would happen, file
+ * by file, to confirm, then the undo itself. What one device sent together is undone as one.
+ */
+export class UndoModal extends Modal {
+  private plugin: CofferPlugin;
+  private share?: Share;
+  private seq: number;
+  private step: 'review' | 'working' | 'done' = 'review';
+  private op?: Operation;
+  private steps: Step[] = [];
+  private skipped: Skipped[] = [];
+  private left = 0;
+  private error = '';
+  private note = '';
+  private outcome?: RestoreOutcome;
+  private closed = false;
+
+  constructor(app: App, plugin: CofferPlugin, seq: number, share?: Share) {
+    super(app);
+    this.plugin = plugin;
+    this.seq = seq;
+    this.share = share;
+  }
+
+  onOpen(): void {
+    this.modalEl.addClass('coffer-modal', 'coffer-past');
+    this.setTitle('Undo a change');
+    void this.plan();
+  }
+
+  onClose(): void {
+    this.closed = true;
+    this.contentEl.empty();
+  }
+
+  private async plan(): Promise<void> {
+    this.render();
+    try {
+      const kept = await this.plugin.keptOutFiles(this.share);
+      const p = await this.plugin.planUndo(await this.plugin.look(this.share), this.seq, kept, this.share);
+      this.op = p.op;
+      this.steps = p.steps;
+      this.skipped = p.skipped;
+      this.left = p.left;
+    } catch (e) {
+      this.error = `Could not work out what would change: ${historyFailure(e)}`;
+    }
+    this.render();
+  }
+
+  private render(): void {
+    if (this.closed) return;
+    const c = this.contentEl;
+    c.empty();
+    if (this.step === 'working') {
+      statusLine(c, this.plugin.progress || 'Undoing…', 'busy');
+      c.createDiv({ cls: 'coffer-sub', text: 'Keep Obsidian open until this finishes. Closing this window does not stop it.' });
+    } else if (this.step === 'done') this.renderDone(c);
+    else this.renderReview(c);
+  }
+
+  private skippedList(c: HTMLElement, skipped: Skipped[]): void {
+    planList(c, 'Left as they are', skipped.map(skippedNote));
+  }
+
+  private renderReview(c: HTMLElement): void {
+    const op = this.op;
+    if (!op) {
+      if (this.error) {
+        message(c, this.error);
+        button(buttonRow(c), 'Close', () => this.close());
+      } else c.createEl('p', { cls: 'coffer-intro', text: 'Working out what would change…' });
+      return;
+    }
+    placeLine(c, this.plugin, this.share);
+    const who = deviceLabel(op.device, this.plugin.settings.deviceName);
+    c.createDiv({ cls: 'coffer-preview-title', text: `What ${who} sent ${momentLabel(op.time, Date.now())}` });
+    c.createDiv({ cls: 'coffer-row-sub', text: `${capital(operationLabel(op))}. Undoing takes this change back out and keeps everything done since.` });
+    message(c, this.note, 'coffer-note');
+    message(c, this.error);
+    const counts = countSteps(this.steps);
+    c.createEl('p', {
+      cls: 'coffer-summary',
+      text: this.steps.length ? stepSummary(counts) : this.skipped.length ? 'Nothing can be undone safely.' : 'Nothing to undo: no file is as that change left it.',
+    });
+    for (const [kind, label] of KIND) planList(c, label, this.steps.filter((s) => s.kind === kind).map((s) => s.path));
+    this.skippedList(c, this.skipped);
+    if (this.left) c.createDiv({ cls: 'coffer-hint', text: leftNote(this.left) });
+    if (!this.steps.length) {
+      button(buttonRow(c), 'Close', () => this.close());
+      return;
+    }
+    const what = c.createEl('ul', { cls: 'coffer-what' });
+    what.createEl('li', { text: 'Changes on this device sync first, so nothing unsaved is lost.' });
+    what.createEl('li', { text: 'A note edited since keeps those edits; a file that was only moved goes back to its old name with what it holds now.' });
+    if (counts.remove) what.createEl('li', { text: 'Removed files go where your “Deleted files” setting sends them.' });
+    what.createEl('li', { text: 'What each file holds now stays in its version history, and the undo shows up here as a change of its own, so it can be undone too.' });
+    const confirm = buttonRow(c);
+    button(confirm, 'Cancel', () => this.close());
+    button(confirm, `Undo in ${plural(this.steps.length, 'file')}`, () => this.apply(), counts.remove ? 'warning' : 'cta');
+  }
+
+  private async apply(): Promise<void> {
+    this.step = 'working';
+    this.error = this.note = '';
+    this.render();
+    const unsubscribe = this.plugin.onChange(() => this.step === 'working' && this.render());
+    try {
+      const out = await this.plugin.undoOperation(this.seq, this.steps, this.share);
+      if (out.changed) {
+        this.steps = out.changed;
+        this.skipped = out.skipped ?? [];
+        this.step = 'review';
+        this.note = 'Something changed since this list was made. Check it again, then undo.';
+      } else if (out.problem) {
+        this.step = 'review';
+        this.error = `Nothing was undone. ${out.problem.title}. ${out.problem.detail}`;
+      } else {
+        this.outcome = out;
+        this.step = 'done';
+      }
+    } catch (e) {
+      this.step = 'review';
+      this.error = `Nothing was undone: ${historyFailure(e)}`;
+    } finally {
+      unsubscribe();
+    }
+    if (!this.closed) this.render();
+    else if (this.outcome) new Notice(`The change is undone. ${stepSummary(countSteps(this.outcome.done), true)}`, 10_000);
+    else new Notice(this.error || this.note, 10_000);
+  }
+
+  private renderDone(c: HTMLElement): void {
+    const out = this.outcome!;
+    const except = out.failed.length + (out.skipped?.length ?? 0);
+    statusLine(c, except ? `Undone, except ${plural(except, 'file')}` : 'Undone', except ? 'warning' : 'ok');
+    c.createEl('p', { cls: 'coffer-intro', text: stepSummary(countSteps(out.done), true) });
+    if (out.failed.length) message(c, `These files could not be changed:\n${out.failed.map((f) => `${f.path}: ${f.message}`).join('\n')}`);
+    this.skippedList(c, out.skipped ?? []);
+    const p = out.sent?.problem;
+    if (p) message(c, `It is not sent to your other devices yet. ${p.title}. ${p.detail}`);
+    else c.createDiv({ cls: 'coffer-hint', text: 'Sent to storage. Your other devices get it when they next sync.' });
+    button(buttonRow(c), 'Close', () => this.close(), 'cta');
   }
 }
 

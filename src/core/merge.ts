@@ -1,3 +1,5 @@
+import { ext } from './paths.ts';
+
 const MAX_D = 2000;
 
 /** For each index of `x`, the index in `y` it is matched to in a longest common subsequence, or -1. Null when the inputs differ too much. */
@@ -639,4 +641,10 @@ export function mergeCanvas(base: string, ours: string, theirs: string): string 
   const list = (key: string, xs: Item[]) => (xs.length ? `\t"${key}":[\n${xs.map((x) => `\t\t${JSON.stringify(x)}`).join(',\n')}\n\t]` : `\t"${key}":[]`);
   const rest = Object.entries(merged.other).map(([k, v]) => `\t${JSON.stringify(k)}:${JSON.stringify(v)}`);
   return `{\n${[list('nodes', nodes), list('edges', merged.edges), ...rest].join(',\n')}\n}`;
+}
+
+/** The three-way merge a file of `path`'s kind takes: a canvas by cards, a note by properties and text, a base by whole lines. */
+export function mergeFor(path: string): typeof merge3 {
+  const kind = ext(path);
+  return kind === 'canvas' ? mergeCanvas : kind === 'md' || kind === 'markdown' ? mergeNote : kind === 'base' ? mergeByLines : merge3;
 }

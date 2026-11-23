@@ -172,6 +172,9 @@ export function sameContent(a: Entry, b: Entry): boolean {
   return true;
 }
 
+/** A file's content as one string, to find the same content under another path. */
+export const contentKey = (e: Entry) => e.chunks.map((c) => c.id).join(',');
+
 /** True when `ids` are exactly the chunks of `e`, in order. */
 export function hasChunks(e: Entry, ids: string[]): boolean {
   return ids.length === e.chunks.length && ids.every((id, i) => id === e.chunks[i].id);

@@ -174,6 +174,94 @@ test('cli: restore-at brings a folder back exactly, leaves other folders alone, 
   }
 });
 
+test('cli: undo takes one change back out by its number from activity, keeps what another device did since, and sends it', () => {
+  const a = setup({ deviceName: 'laptop' });
+  const b = setup({ deviceName: 'phone' }, a);
+  try {
+    put(a.vault, 'note.md', 'one\ntwo\nthree\nfour\nfive\n');
+    put(a.vault, 'other.md', 'a note that gets moved\n');
+    a.cli('sync');
+    // Another device's change in between: what one device sends within a minute counts as one change.
+    b.cli('sync');
+    put(b.vault, 'b.md', 'b\n');
+    b.cli('sync');
+    a.cli('sync');
+    put(a.vault, 'note.md', 'ONE\ntwo\nthree\nfour\nfive\n');
+    put(a.vault, 'moved/other.md', 'a note that gets moved\n');
+    rmSync(join(a.vault, 'other.md'));
+    a.cli('sync');
+    const number = /^ *(\d+) {2}/.exec(a.cli('activity', '--limit=1'))![1];
+    b.cli('sync');
+    put(b.vault, 'note.md', 'ONE\ntwo\nthree\nfour\nFIVE\n');
+    b.cli('sync');
+    a.cli('sync');
+    const before = files(a.vault);
+
+    const dry = a.run('undo', number, '--dry-run');
+    assert.equal(dry.status, 0, dry.stderr);
+    const out = dry.stdout.trim().split('\n');
+    assert.match(out[0], /^what laptop sent at \S+ \(1 moved, 1 changed\), taken back out:$/);
+    assert.deepEqual(out.slice(1), ['  remove      moved/other.md', '  change      note.md', '  bring back  other.md', 'dry run: would bring back 1, change 1 and remove 1; nothing changed']);
+    assert.deepEqual(files(a.vault), before);
+
+    const r = a.run('undo', number);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /\nundone: brought back 1, changed 1, removed 1\nthen synced: /);
+    const expected = { 'b.md': 'b\n', 'note.md': 'one\ntwo\nthree\nfour\nFIVE\n', 'other.md': 'a note that gets moved\n' };
+    assert.deepEqual(files(a.vault), expected);
+    b.cli('sync');
+    assert.deepEqual(files(b.vault), expected);
+
+    assert.match(a.cli('undo', number, '--dry-run'), /nothing to do: no file is as that change left it/);
+    assert.match(a.run('undo', 'yesterday').stderr, /is not a number that activity prints/);
+    assert.match(a.run('undo', '99999').stderr, /There is no change with the number 99999/);
+  } finally {
+    a.done();
+  }
+});
+
+test('cli: when the sync that sends an undo fails, the next sync sends it with its removals still asked for, and a version storage lost is said in plain words', () => {
+  const a = setup({ deviceName: 'laptop' });
+  const b = setup({ deviceName: 'phone' }, a);
+  const remote = join(a.dir, 'remote');
+  try {
+    put(a.vault, 'base.md', 'base\n');
+    put(a.vault, 'note.md', 'first\n');
+    a.cli('sync');
+    const firstPacks = readdirSync(join(remote, 'pack'));
+    b.cli('sync');
+    put(b.vault, 'b.md', 'b\n');
+    b.cli('sync');
+    a.cli('sync');
+    for (let i = 0; i < 30; i++) put(a.vault, `import/f${i}.md`, `imported ${i}\n`);
+    put(a.vault, 'note.md', 'second\n');
+    a.cli('sync');
+    const number = /^ *(\d+) {2}/.exec(a.cli('activity', '--limit=1'))![1];
+    put(b.vault, 'b.md', 'b again\n');
+    b.cli('sync');
+    a.cli('sync');
+    // Storage loses the first version of the note, and then refuses writes.
+    for (const p of firstPacks) rmSync(join(remote, 'pack', p));
+    chmodSync(join(remote, 'log'), 0o555);
+    const r = a.run('undo', number);
+    chmodSync(join(remote, 'log'), 0o755);
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /\nundone: brought back 0, changed 0, removed 30\n$/);
+    assert.match(r.stderr, /failed: note\.md: the version to put back is no longer in storage, so the file is left as it is/);
+    assert.match(r.stderr, /the files are changed here, but that could not be sent: /);
+    assert.match(r.stderr, /\nrun sync to send it\n$/);
+    assert.equal(files(a.vault)['note.md'], 'second\n');
+    // No --force: the removals are still deletions the user asked for, here and on the other device.
+    assert.match(a.cli('sync'), /deleted 0 here and 30 remotely/);
+    assert.match(b.cli('sync'), /deleted 30 here/);
+    assert.match(a.cli('sync'), /^sent 0, received 0, deleted 0 here and 0 remotely/);
+    assert.deepEqual(Object.keys(files(b.vault)).sort(), ['b.md', 'base.md', 'note.md']);
+  } finally {
+    chmodSync(join(remote, 'log'), 0o755);
+    a.done();
+  }
+});
+
 test('cli: restore-at sends the many files it removes without --force, another device on this version deletes them too, and it says older ones stop', async () => {
   const t = setup({ deviceName: 'laptop' });
   const other = setup({ deviceName: 'phone' }, t);
@@ -2485,8 +2573,8 @@ test('cli export: files above 16 MB, which it writes one at a time, come out who
   }
 });
 
-/** An activity listing with the times taken out, for comparing. */
-const untimed = (text: string) => text.replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z {2}/gm, '');
+/** An activity listing with the numbers and times taken out, for comparing. */
+const untimed = (text: string) => text.replace(/^(?: *\d+ {2})?\d{4}-\d\d-\d\dT[\d:.]+Z {2}/gm, '');
 
 test('cli activity: lists the changes newest first, who made each and the files, in a vault each by its device, with --limit and for one folder', () => {
   const a = setup({ deviceName: 'laptop' });
@@ -2503,7 +2591,7 @@ test('cli activity: lists the changes newest first, who made each and the files,
 
     const r = a.run('activity');
     assert.equal(r.status, 0, r.stderr);
-    assert.match(r.stdout, /^\d{4}-\d\d-\d\dT[\d:.]+Z {2}phone/);
+    assert.match(r.stdout, /^ {5}2 {2}\d{4}-\d\d-\d\dT[\d:.]+Z {2}phone/);
     assert.equal(
       untimed(r.stdout),
       'phone            1 added, 1 changed, 1 deleted\n  changed  b.md\n  added    notes/new.md\n  deleted  notes/a.md\n' +

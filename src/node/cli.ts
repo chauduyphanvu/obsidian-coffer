@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, readdir, realpath } from 'node:fs/promises';
+import { mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pool } from '../core/bytes.ts';
@@ -7,15 +7,15 @@ import { DEFAULT_CONFIG, compileExcludes, resolveConfig, type SyncConfig } from 
 import { MIN_PASSPHRASE, WrongPassphraseError } from '../core/crypto.ts';
 import { agoText, heartbeatDue, listDevices, statusText, writeHeartbeat, type Beat } from '../core/devices.ts';
 import { HistoryError, NoVaultError, PassphraseUnknownError, RemovedError, SafetyError, StorageGoneError, SyncEngine, UnverifiedError, type RepoView, type SyncOptions, type SyncResult } from '../core/engine.ts';
-import { conflictOriginal, vaultKey } from '../core/paths.ts';
+import { conflictOriginal, ext, vaultKey } from '../core/paths.ts';
 import { Repo } from '../core/repo.ts';
 import { listVersions } from '../core/retention.ts';
 import { errorText, plural } from '../core/text.ts';
-import { TooOldError, listActivity, listCommits, listDeleted, planRestore, tableAt, type Activity, type PastVault } from '../core/timeline.ts';
+import { TooOldError, listActivity, listCommits, listDeleted, operationAt, planRestore, planUndo, tableAt, type Activity, type PastVault } from '../core/timeline.ts';
 import type { Entry, RemoteStore } from '../core/types.ts';
 import { changesOf, preparePublish, publishPrepared, summaryLines, type Prepared } from '../publish/publish.ts';
 import { activityRows, whoLabel, type Self } from '../plugin/activity.ts';
-import { applyRestore, countSteps, deleteLimitCrossed, keepDeferred, keepOut, leftNote, restoreSteps, sizeLabel, unsent } from '../plugin/restore.ts';
+import { applyRestore, countSteps, deleteLimitCrossed, keepDeferred, keepOut, leftNote, operationLabel, restoreSteps, sizeLabel, skippedNote, undoSteps, unsent, type Step } from '../plugin/restore.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { MemoryStore } from '../stores/memory.ts';
 import { openRemote } from '../stores/open.ts';
@@ -82,9 +82,16 @@ const USAGE = `Usage: node coffer.js <command> [--config=coffer.json]
   log [--limit=20]       list the times the vault can be restored to, newest first, each after
                          its number
   activity [--limit=20] [folder]
-                         list the latest changes, newest first: when, who made each (the device, or in a shared
-                         folder with members the member) and the files it added, changed and deleted, and who
-                         was invited, joined or was removed; with a folder, only the changes to files in it
+                         list the latest changes, newest first, each after its number: when, who made each (the
+                         device, or in a shared folder with members the member) and the files it added, changed
+                         and deleted, and who was invited, joined or was removed; with a folder, only the
+                         changes to files in it
+  undo <number> [--dry-run]
+                         take one change back out, keeping everything done since: <number> is one that activity
+                         prints, and what its device sent together with it is undone as one. A file untouched
+                         since goes back to what it was, a note edited since keeps those edits, a moved file
+                         goes back to its old name; what cannot be undone safely is left as it is and named.
+                         Syncs first and again after, as restore-at does
   restore-at <time> [folder] [--dry-run]
                          bring the vault, or one folder, back to how it was at <time> (ISO 8601,
                          like 2026-11-10T14:30, or a number from log, which names that moment even
@@ -148,6 +155,7 @@ const OPTIONS: Record<string, string[]> = {
   log: ['limit'],
   activity: ['limit'],
   'restore-at': ['dry-run'],
+  undo: ['dry-run'],
   export: ['at'],
   verify: ['deep'],
   repair: ['deep'],
@@ -163,6 +171,7 @@ const WRITES: Record<string, string> = {
   repair: 'it cannot store data in storage again',
   restore: 'a restored file would never be sent',
   'restore-at': 'a restore would never be sent',
+  undo: 'an undo would never be sent',
   'change-passphrase': 'it cannot change the passphrase in storage',
 };
 
@@ -365,16 +374,110 @@ function vaultAt(v: RepoView, at: number | { seq: number }, when: string): Promi
 /** The folder `folder` as a prefix of the paths in it, or '' for the whole vault. */
 const prefixOf = (folder: string) => (folder ? `${vaultKey(folder).replace(/\/+$/, '')}/` : '');
 
+/** Applies a restore's or an undo's `steps` to the vault folder, made against `v`, and names the files it had to leave. */
+async function applySteps(engine: SyncEngine, fs: NodeFS, v: RepoView, steps: Step[]) {
+  const here = new Map((await fs.list()).map((f) => [vaultKey(f.path), f.path]));
+  const on = (path: string) => here.get(path) ?? path;
+  const synced = new Map([...v.st.synced].map(([key, s]) => [key, { lsize: s.lsize, lmtime: s.lmtime }]));
+  const applied = await applyRestore(
+    steps,
+    synced,
+    {
+      stat: (path) => fs.stat(on(path)),
+      write: async (path, data) => void (await fs.write(on(path), data)),
+      remove: (path) => fs.remove(on(path)),
+      read: (entry) => engine.readVersion(entry),
+    },
+    v.cfg.concurrency,
+  );
+  for (const f of applied.failed) {
+    const gone = /^Remote pack \S+ is missing/.test(f.message);
+    console.error(`failed: ${f.path}: ${gone ? `the version to put back is no longer in storage, so the file is left as it is (${f.message})` : f.message}`);
+  }
+  return applied;
+}
+
+type Sync = (options?: SyncOptions) => Promise<SyncResult>;
+
+/** Where the removals of a restore or an undo wait when the sync that sends them failed. */
+const askedFile = (vault: string) => join(vault, STATE_DIR, 'asked-deletions.json');
+
+async function askedDeletions(vault: string): Promise<string[]> {
+  try {
+    const paths: unknown = JSON.parse(await readFile(askedFile(vault), 'utf8'));
+    return Array.isArray(paths) ? paths.filter((p) => typeof p === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The sync that sends what a restore or an undo changed, its removals as deletions the user asked for, so they do not
+ * count against the guard here, nor on other devices. Undefined when it fails: the files stay changed here, and the
+ * removals are kept for the next sync, which would otherwise take them for files that vanished and stop.
+ */
+async function sendResult(sync: Sync, vault: string, removed: string[]): Promise<SyncResult | undefined> {
+  try {
+    const r = await sync({ allowDeletes: removed });
+    report(r, 'then synced: ');
+    return r;
+  } catch (e) {
+    if (removed.length) await writeFile(askedFile(vault), JSON.stringify([...new Set([...(await askedDeletions(vault)), ...removed])]));
+    console.error(`the files are changed here, but that could not be sent: ${errorText(e)}`);
+    console.error('run sync to send it');
+    return undefined;
+  }
+}
+
+/**
+ * Takes the operation commit `which` belongs to back out of the vault, keeping what was done since (`planUndo`). Syncs
+ * first and after, as `restoreAt` does; a file it cannot undo safely is left as it is and named. With `dry`, only prints the plan.
+ */
+async function undo(engine: SyncEngine, sync: Sync, vault: string, fs: NodeFS, which: string, dry: boolean): Promise<number> {
+  if (!/^\d+$/.test(which)) throw new Error(`"${which}" is not a number that activity prints`);
+  if (!dry) {
+    const r = await sync();
+    report(r, 'synced first: ');
+    if (r.errors.length) {
+      console.error('not undoing: some files could not sync, and undoing could overwrite their changes');
+      return 1;
+    }
+  }
+  const v = await engine.view();
+  const op = await operationAt(v.repo, v.st.lastSeq, v.cfg, Number(which));
+  const kept = await keepDeferred(keepOut(v.cfg.exclude, []), engine);
+  const mergeable = (path: string) => v.cfg.mergeExtensions.includes(ext(path));
+  const { steps, skipped, left } = await undoSteps(planUndo(op.changes, v.st.remote), v.st.remote, kept, (e) => engine.readVersion(e), mergeable, v.cfg.concurrency);
+  console.log(`what ${op.device} sent at ${iso(op.time)} (${operationLabel(op)}), taken back out:`);
+  for (const s of steps) console.log(`  ${STEP[s.kind].padEnd(10)}  ${s.path}`);
+  for (const s of skipped) console.log(`  left as it is  ${skippedNote(s)}`);
+  if (left) console.log(leftNote(left));
+  const c = countSteps(steps);
+  if (!steps.length) {
+    console.log(skipped.length ? 'nothing was undone' : 'nothing to do: no file is as that change left it');
+    return skipped.length ? 1 : 0;
+  }
+  if (dry) {
+    console.log(`dry run: would bring back ${c.add}, change ${c.change} and remove ${c.remove}; nothing changed`);
+    return 0;
+  }
+  const applied = await applySteps(engine, fs, v, steps);
+  const done = countSteps(applied.done);
+  console.log(`undone: brought back ${done.add}, changed ${done.change}, removed ${done.remove}`);
+  const r = await sendResult(sync, vault, applied.done.filter((s) => s.kind === 'remove').map((s) => s.path));
+  return !r || applied.failed.length || skipped.length || r.errors.length ? 1 : 0;
+}
+
 /**
  * Brings the vault, or `folder`, back to how it was at `when`: a time, or a moment's number as `log` prints it, which
  * names that moment exactly whatever the clocks of the devices said. Removals first. Syncs first, so edits not yet
  * synced are kept in history and the plan matches the files here, and after, to send the result; a file with changes
  * that sync could not send is left as it is (see `applyRestore`). With `dry`, only prints the plan.
  */
-async function restoreAt(engine: SyncEngine, fs: NodeFS, when: string, folder: string, dry: boolean): Promise<number> {
+async function restoreAt(engine: SyncEngine, sync: Sync, vault: string, fs: NodeFS, when: string, folder: string, dry: boolean): Promise<number> {
   const at = momentOf(when);
   if (!dry) {
-    const r = await engine.sync();
+    const r = await sync();
     report(r, 'synced first: ');
     if (r.errors.length) {
       console.error('not restoring: some files could not sync, and restoring could overwrite their changes');
@@ -399,29 +502,14 @@ async function restoreAt(engine: SyncEngine, fs: NodeFS, when: string, folder: s
     return 0;
   }
 
-  const here = new Map((await fs.list()).map((f) => [vaultKey(f.path), f.path]));
-  const on = (path: string) => here.get(path) ?? path;
-  const synced = new Map([...v.st.synced].map(([key, s]) => [key, { lsize: s.lsize, lmtime: s.lmtime }]));
-  const applied = await applyRestore(
-    steps,
-    synced,
-    {
-      stat: (path) => fs.stat(on(path)),
-      write: async (path, data) => void (await fs.write(on(path), data)),
-      remove: (path) => fs.remove(on(path)),
-      read: (entry) => engine.readVersion(entry),
-    },
-    v.cfg.concurrency,
-  );
-  for (const f of applied.failed) console.error(`failed: ${f.path}: ${f.message}`);
+  const applied = await applySteps(engine, fs, v, steps);
   const done = countSteps(applied.done);
   const removed = applied.done.filter((s) => s.kind === 'remove').map((s) => s.path);
   const failed = applied.failed.length;
   console.log(`restored ${scope} as of ${iso(past.commit.time)}: brought back ${done.add}, changed ${done.change}, removed ${done.remove}`);
   const limit = deleteLimitCrossed(done.add + done.change, done.remove, v.st.synced.size, v.cfg);
-  // The removals are deletions the user asked for: they do not count against the guard here, nor on other devices.
-  const r = await engine.sync({ allowDeletes: removed });
-  report(r, 'then synced: ');
+  const r = await sendResult(sync, vault, removed);
+  if (!r) return 1;
   if (limit !== undefined) {
     console.log(
       `the ${done.remove} files removed went to storage as deletions you asked for, so no --force was needed, and other devices delete them ` +
@@ -742,8 +830,9 @@ async function main(): Promise<number> {
     console.error(`${command} does not work on a followed folder: ${NOT_FOR_FOLLOWERS[command]}`);
     return 1;
   }
-  // restore-at --dry-run only reads, so a device that only receives may look at what a restore would do.
-  if (receivesOnly && WRITES[command] && !(command === 'restore-at' && flags.has('dry-run'))) {
+  // restore-at and undo with --dry-run only read, so a device that only receives may look at what they would do.
+  const looksOnly = (command === 'restore-at' || command === 'undo') && flags.has('dry-run');
+  if (receivesOnly && WRITES[command] && !looksOnly) {
     console.error(`this device only receives changes, so ${WRITES[command]}; run ${command} from a device that sends them`);
     return 1;
   }
@@ -815,14 +904,17 @@ async function main(): Promise<number> {
     memberNote = standing?.waiting ? `waiting for ${standing.owner || 'the owner'}'s device to confirm this device; until then it only receives` : undefined;
   };
   const syncNow = async (options?: SyncOptions) => {
-    const r = await engine.sync(options);
+    // Removals a restore or an undo made and could not send: still deletions the user asked for.
+    const asked = await askedDeletions(vault);
+    const r = await engine.sync({ ...options, allowDeletes: [...(options?.allowDeletes ?? []), ...asked] });
+    if (asked.length) await rm(askedFile(vault), { force: true });
     await noteStanding();
     return r;
   };
   // Trying new storage keys writes to storage, which looking never does.
   if (command !== 'watch' && !looks) await switchKeys();
   // A writing device the owner has not confirmed yet, or has removed, sends nothing: what would write, or would never be sent, is refused as on a device set to only receive.
-  if (member?.member.key && WRITES[command] && !(command === 'restore-at' && flags.has('dry-run'))) {
+  if (member?.member.key && WRITES[command] && !looksOnly) {
     const standing = await engine.memberStanding();
     if (standing?.removed) throw new RemovedError();
     if (standing?.role && !standing.mayWrite) {
@@ -991,10 +1083,10 @@ async function main(): Promise<number> {
     if (!items.length) console.error(`no changes ${prefix ? `to ${prefix} ` : ''}in the history storage keeps`);
     for (const r of activityRows(items.slice(0, limit), selfOf(v))) {
       if (!r.who) {
-        console.log(`${iso(r.time)}  ${r.text}`);
+        console.log(`${String(r.seq).padStart(6)}  ${iso(r.time)}  ${r.text}`);
         continue;
       }
-      console.log(`${iso(r.time)}  ${r.who.padEnd(16)} ${r.text}`);
+      console.log(`${String(r.seq).padStart(6)}  ${iso(r.time)}  ${r.who.padEnd(16)} ${r.text}`);
       for (const f of r.files) console.log(`  ${f.kind.padEnd(7)}  ${f.path}`);
     }
     return 0;
@@ -1040,7 +1132,8 @@ async function main(): Promise<number> {
     }
     return 0;
   }
-  if (command === 'restore-at' && rest[0]) return restoreAt(engine, fs, rest[0], rest[1] ?? '', flags.has('dry-run'));
+  if (command === 'restore-at' && rest[0]) return restoreAt(engine, syncNow, vault, fs, rest[0], rest[1] ?? '', flags.has('dry-run'));
+  if (command === 'undo' && rest[0]) return undo(engine, syncNow, vault, fs, rest[0], flags.has('dry-run'));
   if (command === 'verify') {
     const r = await engine.verify({ deep: flags.has('deep') });
     for (const p of r.problems) {

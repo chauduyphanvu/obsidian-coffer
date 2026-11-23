@@ -517,6 +517,9 @@ body.is-phone .coffer-share-actions { flex-basis: 100%; }
 .coffer-share.coffer-offer .coffer-share-name { font-weight: var(--font-medium); }
 
 /* Activity in a shared folder: each change and who made it, the files it touched under it, tappable. */
+.coffer-activity-head { display: flex; align-items: center; gap: var(--size-4-2); }
+.coffer-activity-head > .coffer-row { flex: 1; min-width: 0; }
+.coffer-activity-head > button { flex: none; }
 .coffer-activity-files { padding-inline-start: var(--size-4-4); }
 .coffer-past .coffer-activity-files .coffer-row { font-size: var(--font-ui-small); }
 .coffer-activity-event .coffer-row-title { font-weight: var(--font-normal); color: var(--text-muted); }
@@ -538,3 +541,24 @@ body.is-phone .coffer-share-actions { flex-basis: 100%; }
   color: var(--text-muted);
 }
 .setting-item.coffer-publish-warning .setting-item-name { color: var(--text-warning); }
+
+/* Rewind: the vault as it was at an earlier time. The times on top, that time's files beside the one chosen. */
+.coffer-rewind { display: flex; flex-direction: column; height: 100%; padding: 0; overflow: hidden; }
+.coffer-rewind-top { flex: none; padding: var(--size-4-3) var(--size-4-4); border-bottom: 1px solid var(--background-modifier-border); }
+.coffer-rewind-bar { display: flex; align-items: center; gap: var(--size-4-2); margin-top: var(--size-4-2); }
+.coffer-rewind-bar > input[type='range'] { flex: 1; min-width: 0; }
+.coffer-rewind-body { display: flex; flex: 1; min-height: 0; }
+.coffer-rewind-side { display: flex; flex-direction: column; flex: 0 0 34%; max-width: 340px; min-width: 0; min-height: 0; border-inline-end: 1px solid var(--background-modifier-border); }
+.coffer-rewind-find { margin: var(--size-4-2); }
+.coffer-rewind-files { flex: 1; min-height: 0; overflow-y: auto; padding: 0 var(--size-4-2) var(--size-4-2); }
+.coffer-rewind-files.is-loading { opacity: 0.5; }
+.coffer-rewind-folder > summary { font-size: var(--font-ui-small); padding: var(--size-2-2) var(--size-4-2); border-radius: var(--radius-m); color: var(--text-muted); cursor: pointer; }
+.coffer-rewind-folder > summary:hover { background: var(--background-modifier-hover); }
+.coffer-rewind-inside { padding-inline-start: var(--size-4-3); }
+.coffer-rewind .coffer-rewind-file { padding: var(--size-2-2) var(--size-4-2); font-size: var(--font-ui-small); overflow-wrap: anywhere; }
+.coffer-rewind-reader { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; padding: var(--size-4-3) var(--size-4-4); }
+.coffer-rewind-head { padding-bottom: var(--size-4-2); margin-bottom: var(--size-4-3); border-bottom: 1px solid var(--background-modifier-border); }
+.coffer-rewind-picture, .coffer-rewind-note .internal-embed img { max-width: 100%; }
+.coffer-rewind-missing { color: var(--text-faint); font-style: italic; }
+.is-phone .coffer-rewind-body { flex-direction: column; }
+.is-phone .coffer-rewind-side { flex: 0 0 34%; max-width: none; border-inline-end: none; border-bottom: 1px solid var(--background-modifier-border); }

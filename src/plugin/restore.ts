@@ -2,11 +2,11 @@
 import { pool } from '../core/bytes.ts';
 import { compileExcludes, type SyncConfig } from '../core/config.ts';
 import { deleteLimit, type GcCounts, type RepairReport, type SyncEngine } from '../core/engine.ts';
-import { diffCounts, lineDiff, type DiffRegion } from '../core/merge.ts';
+import { diffCounts, lineDiff, mergeFor, type DiffRegion } from '../core/merge.ts';
 import { ext, vaultKey } from '../core/paths.ts';
 import { DAY } from '../core/retention.ts';
 import { errorText, plural } from '../core/text.ts';
-import type { CommitSummary, RestorePlan } from '../core/timeline.ts';
+import { operationMoves, type CommitSummary, type Operation, type RestorePlan, type UndoPlan, type UndoSkip } from '../core/timeline.ts';
 import type { Entry, FileStat } from '../core/types.ts';
 import type { VerifyReport } from '../core/verify.ts';
 import { MAX_COMPARE_BYTES, asText, describeFailure, sameBytes } from './status.ts';
@@ -16,6 +16,8 @@ export interface Step {
   kind: 'add' | 'change' | 'remove';
   path: string;
   entry?: Entry;
+  /** What to write when no stored version holds it: an undo's merge of a file changed since. */
+  data?: Uint8Array;
 }
 
 const byPath = (a: { path: string }, b: { path: string }) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
@@ -106,9 +108,132 @@ export function placeRestored(paths: string[], taken: Set<string>): Map<string, 
   return out;
 }
 
+/**
+ * Where the links of a past note lead, among the files of that time. As Obsidian resolves them: a path from the
+ * vault's root or from the note's folder, with or without `.md`, or failing that a file of that name anywhere, the
+ * one beside the note first and then the one nearest the root. Letter case is ignored.
+ */
+export class PastLinks {
+  private byPath = new Map<string, string>();
+  private byName = new Map<string, string[]>();
+
+  constructor(paths: Iterable<string>) {
+    for (const path of paths) {
+      const low = vaultKey(path).toLowerCase();
+      this.byPath.set(low, path);
+      const name = low.slice(low.lastIndexOf('/') + 1);
+      for (const n of name.endsWith('.md') ? [name, name.slice(0, -3)] : [name]) this.byName.set(n, [...(this.byName.get(n) ?? []), path]);
+    }
+  }
+
+  /** `link` as a link's target is written, with any `#heading` or `|alias`; `from` is the note it is in. */
+  resolve(link: string, from: string): string | undefined {
+    const target = vaultKey(link.split('|')[0].split('#')[0].trim()).replace(/^\/+/, '').toLowerCase();
+    if (!target) return this.byPath.get(vaultKey(from).toLowerCase());
+    const dir = from.includes('/') ? `${vaultKey(from).slice(0, from.lastIndexOf('/')).toLowerCase()}/` : '';
+    for (const p of [target, `${target}.md`, `${dir}${target}`, `${dir}${target}.md`]) {
+      const hit = this.byPath.get(p);
+      if (hit) return hit;
+    }
+    const named = this.byName.get(target.slice(target.lastIndexOf('/') + 1)) ?? [];
+    const fits = target.includes('/') ? named.filter((p) => [`/${target}`, `/${target}.md`].some((end) => `/${p.toLowerCase()}`.endsWith(end))) : named;
+    const depth = (p: string) => p.split('/').length;
+    return fits.find((p) => p.toLowerCase().startsWith(dir) && depth(p) === depth(`${dir}x`)) ?? [...fits].sort((a, b) => depth(a) - depth(b) || (a < b ? -1 : 1))[0];
+  }
+}
+
+/** The folders and files directly inside each folder of `paths` ('' for the root), each list sorted by name. */
+export function folderTree(paths: Iterable<string>): Map<string, { folders: string[]; files: string[] }> {
+  const tree = new Map<string, { folders: Set<string>; files: string[] }>();
+  const at = (dir: string) => {
+    let d = tree.get(dir);
+    if (!d) tree.set(dir, (d = { folders: new Set(), files: [] }));
+    return d;
+  };
+  at('');
+  for (const path of paths) {
+    const parts = path.split('/');
+    for (let i = 1; i < parts.length; i++) at(parts.slice(0, i - 1).join('/')).folders.add(parts.slice(0, i).join('/'));
+    at(parts.slice(0, -1).join('/')).files.push(path);
+  }
+  const byName = (a: string, b: string) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+  return new Map([...tree].map(([dir, d]) => [dir, { folders: [...d.folders].sort(byName), files: d.files.sort(byName) }]));
+}
+
 export interface Failed {
   path: string;
   message: string;
+}
+
+/** Why an undo leaves a file as it is: `planUndo`'s reasons, and `lost` for a version whose data storage no longer holds. */
+export type Skipped = { path: string; why: UndoSkip | 'lost' };
+
+const SKIPPED: Record<Skipped['why'], string> = {
+  edited: 'changed since in a way that cannot be combined with the undo',
+  'added-edited': 'added by that change and edited since, so it stays',
+  'made-again': 'deleted by that change and made again since',
+  gone: 'deleted or moved since',
+  taken: 'something else has its old name now',
+  lost: 'the version from before is no longer in storage',
+};
+
+export const skippedNote = (s: Skipped) => `${s.path}: ${SKIPPED[s.why]}`;
+
+/** "312 files moved, 2 changed": what an operation did, a file it moved unchanged counted once. */
+export function operationLabel(op: Pick<Operation, 'changes'>): string {
+  const moves = operationMoves(op.changes);
+  const moved = new Set(moves.flatMap((m) => [m.from, m.to]));
+  const rest = op.changes.filter((ch) => !moved.has(ch));
+  const count = (n: number, verb: string) => (n ? [`${n.toLocaleString()} ${verb}`] : []);
+  const parts = [
+    ...count(moves.length, 'moved'),
+    ...count(rest.filter((ch) => !ch.before).length, 'added'),
+    ...count(rest.filter((ch) => ch.before && ch.after).length, 'changed'),
+    ...count(rest.filter((ch) => !ch.after).length, 'deleted'),
+  ];
+  return parts.length ? parts.join(', ') : 'no files changed';
+}
+
+/**
+ * An undo plan as steps, removals first, without the paths `keptOut` protects. A file changed since is read in its
+ * three versions and merged, as the sync merges that kind of file (`mergeable` says which kinds); where the result is
+ * what the file holds now there is nothing to do, and where the versions cannot be read or combined the file is left
+ * as it is and listed. `current` is the file table the plan was made against.
+ */
+export async function undoSteps(
+  plan: UndoPlan,
+  current: Map<string, unknown>,
+  keptOut: (path: string) => boolean,
+  read: (entry: Entry) => Promise<Uint8Array>,
+  mergeable: (path: string) => boolean,
+  parallel = 4,
+): Promise<{ steps: Step[]; skipped: Skipped[]; left: number }> {
+  const out = (path: string) => !keptOut(path);
+  const skipped: Skipped[] = plan.skipped.filter((s) => out(s.path));
+  const remove: Step[] = plan.remove.filter(out).map((path) => ({ kind: 'remove' as const, path }));
+  const write: Step[] = plan.write.filter((w) => out(w.path)).map((w) => ({ kind: current.has(w.path) ? ('change' as const) : ('add' as const), path: w.path, entry: w.entry }));
+  const merges = plan.merge.filter((m) => out(m.path));
+  const text = (data: Uint8Array) => new TextDecoder('utf-8', { fatal: true }).decode(data);
+  await pool(merges, parallel, async (m) => {
+    if (!mergeable(m.path)) return void skipped.push({ path: m.path, why: 'edited' });
+    let versions: Uint8Array[];
+    try {
+      versions = await Promise.all([read(m.base), read(m.ours), read(m.theirs)]);
+    } catch {
+      return void skipped.push({ path: m.path, why: 'lost' });
+    }
+    let merged: string | null;
+    try {
+      merged = mergeFor(m.path)(text(versions[0]), text(versions[1]), text(versions[2]));
+      if (merged === text(versions[1])) return;
+    } catch {
+      merged = null;
+    }
+    if (merged === null) skipped.push({ path: m.path, why: 'edited' });
+    else write.push({ kind: 'change', path: m.path, data: new TextEncoder().encode(merged) });
+  });
+  const left = plan.remove.length + plan.write.length + plan.merge.length + plan.skipped.length - remove.length - write.length - skipped.length;
+  return { steps: [...remove.sort(byPath), ...write.sort(byPath)], skipped: skipped.sort(byPath), left };
 }
 
 /** Where a restore is applied, by the paths of its steps. */
@@ -153,7 +278,7 @@ export async function applyRestore(
         await settled(s.path);
         await t.remove(s.path);
       } else {
-        const data = await t.read(s.entry!);
+        const data = s.data ?? (await t.read(s.entry!));
         await settled(s.path);
         await t.write(s.path, data);
       }

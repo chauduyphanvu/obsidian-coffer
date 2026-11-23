@@ -3,7 +3,7 @@ import type { Member } from './members.ts';
 import { vaultKey } from './paths.ts';
 import type { Repo } from './repo.ts';
 import { Backward, Forward, HOUR, Reads, Thinning, historyFloor, keptState, type Snapshot } from './retention.ts';
-import { sameContent, type Commit, type Entry } from './types.ts';
+import { contentKey, sameContent, type Commit, type Entry } from './types.ts';
 
 /** A commit seen as a point in time: the vault right after it. */
 export interface Moment {
@@ -457,4 +457,139 @@ export function planRestore(current: Map<string, Entry>, target: Map<string, Ent
   }
   const remove = [...current.keys()].filter((path) => inside(path) && !target.has(path));
   return { write, remove };
+}
+
+/** Commits of one device this close together, with nothing from another device between them, were sent together. */
+export const OPERATION_GAP = 60_000;
+
+/** What an operation did to one file: what it was just before (null: not there) and right after. */
+export interface OperationChange {
+  path: string;
+  before: Entry | null;
+  after: Entry | null;
+}
+
+/**
+ * What one device sent together: one sync often writes several commits, as for a large upload or for deletions the
+ * user confirmed. `first` and `seq` are its first and last commit; the moment is that of the last.
+ */
+export interface Operation extends Moment {
+  first: number;
+  /** The files it left other than it found them, in path order. */
+  changes: OperationChange[];
+}
+
+const same = (a: Entry | null, b: Entry | null) => (a && b ? sameContent(a, b) : !a && !b);
+
+/**
+ * The operation commit `seq` belongs to: that commit and its device's commits around it, each within `OPERATION_GAP`
+ * of the next, up to the first commit of another device. Nothing is thinned: every commit the log holds counts,
+ * though the data of an old version may be gone.
+ */
+export async function operationAt(repo: Repo, lastSeq: number, cfg: SyncConfig, seq: number): Promise<Operation> {
+  if (!Number.isInteger(seq) || seq < 1 || seq > lastSeq) throw new Error(`There is no change with the number ${seq}`);
+  const reads = new Reads(repo, cfg);
+  const at = await reads.get(seq);
+  if (at.moved) throw new Error(`Number ${seq} only moved stored data or changed the members: it changed no file`);
+  const joins = (a: Commit, b: Commit) => a.device === b.device && a.signer === b.signer && Math.abs(a.time - b.time) <= OPERATION_GAP;
+  const snaps = (await repo.snapshots()).filter((s) => s.seq <= lastSeq);
+  const commits = [at];
+  const back = new Backward(reads, snaps, seq - 1);
+  for (let c: Commit | undefined; (c = await back.next()); ) {
+    if (c.moved) continue;
+    if (!joins(c, commits[0])) break;
+    commits.unshift(c);
+  }
+  const fwd = new Forward(reads, seq + 1, lastSeq);
+  for (let c: Commit | undefined; (c = await fwd.next()); ) {
+    if (c.moved) continue;
+    if (!joins(commits.at(-1)!, c)) break;
+    commits.push(c);
+  }
+  const after = new Map<string, Entry | null>();
+  for (const c of commits) for (const { path, entry } of c.changes) after.set(path, entry);
+  const first = commits[0].seq;
+  // A walk of its own: the one above has read past commits that only moved data, which say where a version is kept now.
+  const before = await new Backward(reads, snaps, first - 1).entries(after.keys());
+  const changes: OperationChange[] = [];
+  for (const [path, entry] of after) {
+    const was = before.get(path) ?? null;
+    if (!same(was, entry)) changes.push({ path, before: was, after: entry });
+  }
+  changes.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return { ...moment(commits.at(-1)!), first, changes };
+}
+
+/** Files an operation moved without changing them: the one file it deleted and the one it added with the same content. */
+export function operationMoves(changes: OperationChange[]): { from: OperationChange; to: OperationChange }[] {
+  const gone = new Map<string, OperationChange[]>();
+  const came = new Map<string, OperationChange[]>();
+  const add = (m: Map<string, OperationChange[]>, e: Entry, ch: OperationChange) => {
+    if (e.size > 0) m.set(contentKey(e), [...(m.get(contentKey(e)) ?? []), ch]);
+  };
+  for (const ch of changes) {
+    if (ch.before && !ch.after) add(gone, ch.before, ch);
+    else if (!ch.before && ch.after) add(came, ch.after, ch);
+  }
+  const out: { from: OperationChange; to: OperationChange }[] = [];
+  for (const [key, from] of gone) {
+    const to = came.get(key);
+    if (from.length === 1 && to?.length === 1) out.push({ from: from[0], to: to[0] });
+  }
+  return out;
+}
+
+/**
+ * Why an undo leaves a file as it is: `edited` since in a way, or a kind of file, that cannot be combined;
+ * `added-edited`, added by the operation and edited since, so undoing would delete those edits; `made-again` after
+ * the operation deleted it; `gone`, deleted or moved since; `taken`, where something
+ * else now has the name a moved file would go back to.
+ */
+export type UndoSkip = 'edited' | 'added-edited' | 'made-again' | 'gone' | 'taken';
+
+export interface UndoPlan {
+  /** Versions to put at a path: the one from before the operation, or for a file moved back, the one it holds now. */
+  write: { path: string; entry: Entry }[];
+  remove: string[];
+  /** Files changed again since: the operation's change is taken out of what they hold now, a three-way merge with what it left as the common version. */
+  merge: { path: string; base: Entry; ours: Entry; theirs: Entry }[];
+  skipped: { path: string; why: UndoSkip }[];
+}
+
+/**
+ * What takes an operation's changes back out of `current`, keeping everything done since. A file untouched since
+ * goes back to what it was; one edited since is merged; one the operation only moved goes back to its old name with
+ * what it holds now. Apply the removals first, as for `planRestore`.
+ */
+export function planUndo(changes: OperationChange[], current: Map<string, Entry>): UndoPlan {
+  const plan: UndoPlan = { write: [], remove: [], merge: [], skipped: [] };
+  const now = (path: string) => current.get(path) ?? null;
+  const moved = new Set<OperationChange>();
+  for (const { from, to } of operationMoves(changes)) {
+    moved.add(from).add(to);
+    const there = now(to.path);
+    const back = now(from.path);
+    if (!there) {
+      if (!same(back, from.before)) plan.skipped.push({ path: to.path, why: 'gone' });
+    } else if (back) {
+      plan.skipped.push({ path: from.path, why: 'taken' });
+    } else {
+      plan.remove.push(to.path);
+      plan.write.push({ path: from.path, entry: there });
+    }
+  }
+  for (const ch of changes) {
+    if (moved.has(ch)) continue;
+    const { path, before, after } = ch;
+    const cur = now(path);
+    if (same(cur, before)) continue;
+    if (same(cur, after)) {
+      if (before) plan.write.push({ path, entry: before });
+      else plan.remove.push(path);
+    } else if (before && after && cur) plan.merge.push({ path, base: after, ours: cur, theirs: before });
+    else if (!after) plan.skipped.push({ path, why: 'made-again' });
+    else if (!before) plan.skipped.push({ path, why: 'added-edited' });
+    else plan.skipped.push({ path, why: 'gone' });
+  }
+  return plan;
 }

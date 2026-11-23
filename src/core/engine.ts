@@ -3,7 +3,7 @@ import { WrongPassphraseError, digest } from './crypto.ts';
 import { worthCompressing } from './compress.ts';
 import { copyChunks, fragmented, placeKey, planCompaction } from './compact.ts';
 import { compileExcludes, type SyncConfig } from './config.ts';
-import { merge3, mergeAdded, mergeByLines, mergeCanvas, mergeJson, mergeNote, mergeStrict } from './merge.ts';
+import { mergeAdded, mergeFor, mergeJson, mergeStrict, type merge3 } from './merge.ts';
 import { Packer, packRanges } from './packer.ts';
 import { conflictCopyName, ext, vaultKey } from './paths.ts';
 import { nothingToDo, planChanges, type Local, type Plan } from './plan.ts';
@@ -18,7 +18,7 @@ import { INBOX, INBOX_OPENED, MAX_SEALED, SUGGEST_MAX_FILE, SUGGEST_MAX_TOTAL, i
 import { collectGarbage, listVersions, type CleanupResult } from './retention.ts';
 import { LocalState, type Synced } from './state.ts';
 import { errorText } from './text.ts';
-import { ReadOnlyError, hasChunks, putNew, readOnlyStore, sameContent, type Change, type ChunkRef, type Commit, type Entry, type FileStat, type Held, type LocalFS, type RemoteStore, type StateStore, type Version } from './types.ts';
+import { ReadOnlyError, contentKey, hasChunks, putNew, readOnlyStore, sameContent, type Change, type ChunkRef, type Commit, type Entry, type FileStat, type Held, type LocalFS, type RemoteStore, type StateStore, type Version } from './types.ts';
 import { affectedBy, missingFiles, verifyRepo, type VerifyOptions, type VerifyReport } from './verify.ts';
 
 export type { VerifyOptions, VerifyProblem, VerifyReport } from './verify.ts';
@@ -371,7 +371,6 @@ const HEAD_CHECK_EVERY = 3_600_000;
 /** More paths than this to look at, and asking for each costs more than listing the vault. */
 const MAX_LOOKED_UP = 256;
 
-const contentKey = (e: Entry) => e.chunks.map((c) => c.id).join(',');
 /** An object directly in `inbox/`: what the owner's device lists and may delete there, whatever it holds. */
 const inInbox = (key: string) => key.startsWith(INBOX) && !/[/\\]/.test(key.slice(INBOX.length)) && !['', '.', '..'].includes(key.slice(INBOX.length));
 
@@ -1620,9 +1619,7 @@ export class SyncEngine {
     try {
       const text = (data: Uint8Array) => new TextDecoder('utf-8', { fatal: true }).decode(data);
       const [theirBase, theirs] = await Promise.all([this.readVersion(base), this.readVersion(remote)]);
-      const kind = ext(key);
-      const byKind = kind === 'canvas' ? mergeCanvas : kind === 'md' || kind === 'markdown' ? mergeNote : kind === 'base' ? mergeByLines : merge3;
-      const merged = (merge ?? byKind)(text(theirBase), text(mine), text(theirs));
+      const merged = (merge ?? mergeFor(key))(text(theirBase), text(mine), text(theirs));
       return merged === null ? null : new TextEncoder().encode(merged);
     } catch {
       // Not text, or the base version is no longer stored: fall back to keeping both.

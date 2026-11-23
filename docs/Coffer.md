@@ -12,7 +12,7 @@ Coffer is free and open source (MIT). In Obsidian, find it under **Settings → 
 - [[Get started]]: install Coffer, set up the first device, and add more devices.
 - [[Storage providers]]: Cloudflare R2, Backblaze B2, Amazon S3, MinIO, and WebDAV.
 - [[Sync and conflicts]]: what syncs, when, and how Coffer merges changes from two devices.
-- [[History and restore]]: old versions, deleted files, and the vault at an earlier time.
+- [[History and restore]]: old versions, deleted files, the vault at an earlier time, and undoing one change.
 - [[Shared folders]]: share a folder with other people, and give each person a role.
 - [[Website]]: publish notes as web pages.
 - [[Command line]]: run the same sync engine on an always-on computer.

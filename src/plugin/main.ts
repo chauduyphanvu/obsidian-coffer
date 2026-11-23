@@ -21,11 +21,11 @@ import {
 } from '../core/engine.ts';
 import { encodeFollow, encodeInvite, ownerLinkFields, type FollowInvite, type MemberChange, type MemberInvite, type MemberKeys } from '../core/members.ts';
 import { createMemberShare, joinShare } from '../core/membership.ts';
-import { fileName, vaultKey } from '../core/paths.ts';
+import { ext, fileName, vaultKey } from '../core/paths.ts';
 import type { Repo } from '../core/repo.ts';
 import { LocalState } from '../core/state.ts';
 import { errorText, firstSentence, plural } from '../core/text.ts';
-import { planRestore, type DeletedFile } from '../core/timeline.ts';
+import { operationAt, planRestore, planUndo, type DeletedFile, type Operation } from '../core/timeline.ts';
 import type { Entry, RemoteStore, Version } from '../core/types.ts';
 import { checkStore } from '../stores/doctor.ts';
 import { openRemote } from '../stores/open.ts';
@@ -99,7 +99,7 @@ import {
 } from './shares.ts';
 import { ShareModal, pickTarget } from './sharing.ts';
 import { resolveFirstConflict } from './resolve.ts';
-import { applyRestore, deleteLimitCrossed, describeCleanup, keepDeferred, keepOut, momentLabel, placeRestored, restoreSteps, sameSteps, sentNote, type Failed, type Step } from './restore.ts';
+import { applyRestore, deleteLimitCrossed, describeCleanup, keepDeferred, keepOut, momentLabel, placeRestored, restoreSteps, sameSteps, sentNote, undoSteps, unsent, type Failed, type Skipped, type Step } from './restore.ts';
 import { canSuggest, forgetSent, recordSent, sentBefore } from './suggestions.ts';
 import {
   MAX_COMPARE_BYTES,
@@ -123,6 +123,7 @@ import {
   type Tone,
   unchangedSince,
 } from './status.ts';
+import { PAST_VIEW, PastVaultView } from './pastvault.ts';
 import { ActivityModal, DeletedModal, RepairModal, RestoreEarlierModal, VerifyModal, VersionsModal } from './timemachine.ts';
 import { ProblemsModal, SettingsTab } from './views.ts';
 
@@ -152,7 +153,7 @@ export interface Look {
 
 export type { Failed };
 
-/** How a restore to an earlier time went. */
+/** How a restore to an earlier time, or an undo of one change, went. */
 export interface RestoreOutcome {
   /** The sync before it failed, so nothing was changed. */
   problem?: Problem;
@@ -160,6 +161,8 @@ export interface RestoreOutcome {
   changed?: Step[];
   done: Step[];
   failed: Failed[];
+  /** Files an undo left as they are, each with why. */
+  skipped?: Skipped[];
   /** The sync that sent the result. */
   sent?: SyncOutcome;
   /**
@@ -265,6 +268,7 @@ export default class CofferPlugin extends Plugin {
     this.statusEl.addClass('coffer-status', 'mod-clickable');
     this.statusEl.onClickEvent(() => this.openStatus());
     this.ribbonEl = this.addRibbonIcon('refresh-cw', 'Sync now', () => (this.problems().length ? this.openStatus() : void this.sync(true)));
+    this.registerView(PAST_VIEW, (leaf) => new PastVaultView(leaf, this));
     this.registerObsidianProtocolHandler('coffer', (params) => {
       if (params.setup) new SetupModal(this.app, this, 'join', params.setup).open();
       else if (params.share) new ShareModal(this.app, this, 'join', params.share).open();
@@ -323,6 +327,11 @@ export default class CofferPlugin extends Plugin {
       name: 'Restore deleted files',
       // Notes shared by a property keep every version in the vault's history: restoring goes through the vault.
       checkCallback: whenConfigured(() => pickTarget(this, 'Restore deleted files from', (share) => new DeletedModal(this.app, this, share).open(), (share) => !share?.property)),
+    });
+    this.addCommand({
+      id: 'rewind',
+      name: 'Rewind: look through the vault as it was at an earlier time',
+      checkCallback: whenConfigured(() => void this.openRewind()),
     });
     this.addCommand({
       id: 'restore-earlier',
@@ -786,6 +795,14 @@ export default class CofferPlugin extends Plugin {
       this.alertNotice = { notice, ids: fresh.map((p) => p.id) };
     }
     this.updateStatus();
+  }
+
+  /** Opens the vault as it was at an earlier time in a tab, or shows the tab that already does. */
+  async openRewind(): Promise<void> {
+    const { workspace } = this.app;
+    const leaf = workspace.getLeavesOfType(PAST_VIEW)[0] ?? workspace.getLeaf('tab');
+    await leaf.setViewState({ type: PAST_VIEW, active: true });
+    await workspace.revealLeaf(leaf);
   }
 
   openStatus(): void {
@@ -1974,9 +1991,23 @@ export default class CofferPlugin extends Plugin {
 
   /** Puts `version` in place of the file at vault path `path`, or brings it back if there is none; the next sync sends it, unless the place only receives. */
   async restoreVersion(path: string, version: Version): Promise<void> {
-    if (!version.entry) return;
+    const entry = version.entry;
+    if (!entry) return;
     const { share, path: inside } = this.placeOf(path);
-    await this.writeFile(share, inside, await this.getEngine(share).readVersion(version.entry));
+    const { engine, fs } = this.scope(share);
+    await this.exclusive('Restoring…', async () => {
+      await this.saveEditorOf(path).catch(() => undefined);
+      // What the file holds now stays in its version history only once it has synced: send it first.
+      const pending = async () => {
+        const s = (await engine.view()).st.synced.get(vaultKey(inside));
+        return unsent(await fs.stat(inside), s && { lsize: s.lsize, lmtime: s.lmtime });
+      };
+      if (!this.receivesOnly(share) && (await pending())) {
+        await this.syncHeld(true, false, true, 'manual');
+        if (await pending()) throw new Error(`“${fileName(path)}” has changes on this device that could not sync, and restoring now would lose them. Sync, then restore.`);
+      }
+      await this.writeFile(share, inside, await engine.readVersion(entry));
+    });
     new Notice(`Restored “${fileName(path)}” as it was ${momentLabel(version.time, Date.now())}.${this.receivesOnly(share) ? ` ${sentNote(1, true)}` : ''}`);
   }
 
@@ -2023,17 +2054,51 @@ export default class CofferPlugin extends Plugin {
    * writes; a file with changes the sync has not sent is left as it is (see `applyRestore`), and one file failing does
    * not stop the rest. Ends with the sync that sends the result.
    */
-  async restoreTo(target: Map<string, Entry>, folder: string, expected: Step[], share?: Share): Promise<RestoreOutcome> {
+  restoreTo(target: Map<string, Entry>, folder: string, expected: Step[], share?: Share): Promise<RestoreOutcome> {
+    const words = { a: 'A restore', doing: 'Restoring', done: 'restored' };
+    return this.changeFiles(words, folder, expected, share, async (v, kept) => restoreSteps(planRestore(v.st.remote, target, folder), v.st.remote, kept));
+  }
+
+  /**
+   * Takes the operation commit `seq` belongs to back out of the vault, or of `share`, keeping what was done since
+   * (`planUndo`), the way `restoreTo` changes files: synced first and after, and only when the plan is still `expected`.
+   */
+  undoOperation(seq: number, expected: Step[], share?: Share): Promise<RestoreOutcome> {
+    const words = { a: 'An undo', doing: 'Undoing', done: 'undone' };
+    return this.changeFiles(words, '', expected, share, (v, kept) => this.planUndo({ repo: v.repo, remote: v.st.remote, lastSeq: v.st.lastSeq, cfg: v.cfg }, seq, kept, share));
+  }
+
+  /** The operation commit `seq` belongs to, the steps that undo it against the files in `l`, and what it leaves alone. */
+  async planUndo(
+    l: Pick<Look, 'repo' | 'remote' | 'lastSeq' | 'cfg'>,
+    seq: number,
+    kept: (path: string) => boolean,
+    share?: Share,
+  ): Promise<{ op: Operation; steps: Step[]; skipped: Skipped[]; left: number }> {
+    const op = await operationAt(l.repo, l.lastSeq, l.cfg, seq);
+    const engine = this.getEngine(share);
+    const mergeable = (path: string) => l.cfg.mergeExtensions.includes(ext(path));
+    return { op, ...(await undoSteps(planUndo(op.changes, l.remote), l.remote, kept, (e) => engine.readVersion(e), mergeable)) };
+  }
+
+  /** What `restoreTo` and `undoOperation` share; `plan` gives the steps against the files as the sync just before left them. */
+  private async changeFiles(
+    words: { a: string; doing: string; done: string },
+    folder: string,
+    expected: Step[],
+    share: Share | undefined,
+    plan: (v: RepoView, kept: (path: string) => boolean) => Promise<{ steps: Step[]; skipped?: Skipped[] }>,
+  ): Promise<RestoreOutcome> {
     if (this.receivesOnly(share)) {
       const problem: Problem = {
         id: 'read-only',
         severity: 'critical',
         title: 'This device only receives changes',
-        detail: 'A restore changes files that would then have to be sent to storage, which this device never writes to. Restore from a device that sends changes, or turn off Only receive changes here.',
+        detail: `${words.a} changes files that would then have to be sent to storage, which this device never writes to. Use a device that sends changes, or turn off Only receive changes here.`,
       };
       return { problem, done: [], failed: [] };
     }
-    return this.exclusive('Restoring…', async () => {
+    return this.exclusive(`${words.doing}…`, async () => {
       this.say('Syncing recent changes first…');
       const saving: Promise<void>[] = [];
       this.app.workspace.iterateAllLeaves((leaf) => {
@@ -2049,15 +2114,16 @@ export default class CofferPlugin extends Plugin {
           id: 'restore-unsent',
           severity: 'critical',
           title: `${plural(unsent.length, 'file')} could not sync first`,
-          detail: `Restoring now could overwrite changes that are not saved anywhere else, so nothing was restored.\n${unsent.map((e) => `${e.path}: ${e.message}`).join('\n')}`,
+          detail: `${words.doing} now could overwrite changes that are not saved anywhere else, so nothing was ${words.done}.\n${unsent.map((e) => `${e.path}: ${e.message}`).join('\n')}`,
         };
         return { problem, done: [], failed: [] };
       }
       const { engine, fs } = this.scope(share);
       const kept = await this.keptOutFiles(share);
-      const { st, cfg } = await engine.view();
-      const { steps } = restoreSteps(planRestore(st.remote, target, folder), st.remote, kept);
-      if (!sameSteps(steps, expected)) return { changed: steps, done: [], failed: [] };
+      const v = await engine.view();
+      const { st, cfg } = v;
+      const { steps, skipped } = await plan(v, kept);
+      if (!sameSteps(steps, expected)) return { changed: steps, skipped, done: [], failed: [] };
       const synced = st.synced.size;
       const last = new Map([...st.synced].map(([key, s]) => [key, { lsize: s.lsize, lmtime: s.lmtime }]));
 
@@ -2078,7 +2144,7 @@ export default class CofferPlugin extends Plugin {
           read: (entry) => engine.readVersion(entry),
         },
         4,
-        (kind, n, total) => this.say(`${kind === 'remove' ? 'Removing' : 'Restoring'} ${n.toLocaleString()} of ${total.toLocaleString()}`),
+        (kind, n, total) => this.say(`${kind === 'remove' ? 'Removing' : words.doing} ${n.toLocaleString()} of ${total.toLocaleString()}`),
       );
       this.files?.forgetConfigListing();
       const removed = done.filter((s) => s.kind === 'remove').map((s) => s.path);
@@ -2088,7 +2154,7 @@ export default class CofferPlugin extends Plugin {
       await this.saveData(this.settings);
       this.say('Sending the result to storage…');
       const sent = this.outcomeOf(await this.syncHeld(true, false, true, 'manual'), share);
-      return { done, failed, sent, olderPause: deleteLimitCrossed(done.length - removed.length, removed.length, synced, cfg) !== undefined };
+      return { done, failed, skipped, sent, olderPause: deleteLimitCrossed(done.length - removed.length, removed.length, synced, cfg) !== undefined };
     });
   }
 

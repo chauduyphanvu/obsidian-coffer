@@ -21,6 +21,8 @@ import {
   historyFailure,
   diffLines,
   MomentPages,
+  PastLinks,
+  folderTree,
   keepOut,
   lineChanges,
   matchesQuery,
@@ -480,4 +482,27 @@ test('a version whose data is gone says so, not that sync is stopped', () => {
   assert.equal(historyFailure(new Error('fetch failed')), "Can't reach the storage. Sync tries again on its own. (fetch failed)");
   assert.match(historyFailure(new Error('Remote commit 7 is missing, though a snapshot was taken at it')), /^Synced data in storage is damaged\. Sync is stopped/, 'the log itself, which a sync reads too');
   assert.equal(historyFailure(new Error('odd')), 'odd');
+});
+
+test('links in a past note lead to the files of that time, as Obsidian resolves them', () => {
+  const links = new PastLinks(['Welcome.md', 'Notes/Plan.md', 'Notes/Sub/Plan.md', 'Archive/Old/Plan.md', 'Notes/pic.png', 'Daily/2026-11-01.md', 'Deep/Down/Here/Only.md']);
+  assert.equal(links.resolve('Welcome', 'Notes/Plan.md'), 'Welcome.md');
+  assert.equal(links.resolve('welcome#Heading|shown', 'Notes/Plan.md'), 'Welcome.md');
+  assert.equal(links.resolve('Notes/Plan.md', 'Welcome.md'), 'Notes/Plan.md');
+  assert.equal(links.resolve('Plan', 'Notes/Sub/Other.md'), 'Notes/Sub/Plan.md', 'the one beside the note');
+  assert.equal(links.resolve('Plan', 'Welcome.md'), 'Notes/Plan.md', 'the one nearest the root');
+  assert.equal(links.resolve('Old/Plan', 'Welcome.md'), 'Archive/Old/Plan.md');
+  assert.equal(links.resolve('pic.png', 'Daily/2026-11-01.md'), 'Notes/pic.png');
+  assert.equal(links.resolve('Only', 'Welcome.md'), 'Deep/Down/Here/Only.md');
+  assert.equal(links.resolve('#Heading', 'Notes/Plan.md'), 'Notes/Plan.md');
+  assert.equal(links.resolve('Missing', 'Welcome.md'), undefined);
+  assert.equal(links.resolve('lan', 'Welcome.md'), undefined, 'part of a name is not the name');
+});
+
+test('the files of a past time as folders: what is directly in each, by name with numbers in order', () => {
+  const tree = folderTree(['b.md', 'A/2.md', 'A/10.md', 'A/Deep/x.md', 'a.md']);
+  assert.deepEqual(tree.get(''), { folders: ['A'], files: ['a.md', 'b.md'] });
+  assert.deepEqual(tree.get('A'), { folders: ['A/Deep'], files: ['A/2.md', 'A/10.md'] });
+  assert.deepEqual(tree.get('A/Deep'), { folders: [], files: ['A/Deep/x.md'] });
+  assert.deepEqual(folderTree([]).get(''), { folders: [], files: [] });
 });
