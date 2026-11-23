@@ -1,12 +1,13 @@
 import type { SyncConfig } from '../src/core/config.ts';
 import { run, type Row } from './run.ts';
+import { say, showTable } from './io.ts';
 
 const base: Partial<SyncConfig> = { kdfIterations: 1000 };
 const only = process.argv[2];
 
 async function sweep(title: string, o: { notes: number; net: string; imageEvery?: number; largeFile?: number }, variants: Record<string, Partial<SyncConfig>>, pick: string[]) {
   if (only && !title.startsWith(only)) return;
-  console.log(`\n## ${title} (${o.notes} notes, net=${o.net})`);
+  say(`\n## ${title} (${o.notes} notes, net=${o.net})`);
   const table: Record<string, Record<string, string | number>> = {};
   for (const [name, config] of Object.entries(variants)) {
     const { rows, summary } = await run({ notes: o.notes, net: o.net, imageEvery: o.imageEvery ?? 50, largeFile: o.largeFile ?? 0, config: { ...base, ...config }, quiet: true });
@@ -21,7 +22,7 @@ async function sweep(title: string, o: { notes: number; net: string; imageEvery?
     line.stateKB = summary.stateKB;
     table[name] = line;
   }
-  console.table(table);
+  showTable(table);
 }
 
 const chunk = (avg: number) => ({ chunk: { min: avg / 4, avg, max: avg * 4 } });

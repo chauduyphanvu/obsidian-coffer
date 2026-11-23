@@ -5,8 +5,8 @@ import { MemFS, MemState } from '../src/testing/memfs.ts';
 import { NET, SimStore } from '../src/testing/netsim.ts';
 import { generateVault } from './gen.ts';
 import { grown } from './grown.ts';
+import { args, clearInterval, say, setInterval, showTable } from './io.ts';
 
-const args = Object.fromEntries(process.argv.slice(2).map((a) => a.replace(/^--/, '').split('=')));
 const num = (k: string, d: number) => (k in args ? Number(args[k]) : d);
 
 export interface Row {
@@ -105,8 +105,8 @@ export async function run(o: { notes: number; net: string; imageEvery: number; l
     objects: mem.objects.size, stateKB: Math.round((a.state.data?.length ?? 0) / 1024), peakRssMB: Math.round(peak / 1e6),
   };
   if (!o.quiet) {
-    console.log(JSON.stringify({ notes: o.notes, net: o.net, ...o.config, ...summary }));
-    console.table(Object.fromEntries(rows.map(({ scenario, ...r }) => [scenario, r])));
+    say(JSON.stringify({ notes: o.notes, net: o.net, ...o.config, ...summary }));
+    showTable(Object.fromEntries(rows.map(({ scenario, ...r }) => [scenario, r])));
   }
   return { rows, summary };
 }

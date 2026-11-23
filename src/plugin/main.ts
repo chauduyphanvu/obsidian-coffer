@@ -494,8 +494,10 @@ export default class CofferPlugin extends Plugin {
       );
       // Phones suspend the app in the background; catch up the moment it is opened again.
       // Going to the background: send pending edits now, before the system suspends the app.
-      this.registerDomEvent(document, 'visibilitychange', () => {
-        const visible = document.visibilityState === 'visible';
+      // The main window's document, whichever window is in front: it is the one that says the app went to the background.
+      const main = this.mainDocument();
+      this.registerDomEvent(main, 'visibilitychange', () => {
+        const visible = main.visibilityState === 'visible';
         if (visible) this.noteActivity();
         if (visible || this.dirty) {
           this.schedule.cancel();
@@ -569,8 +571,12 @@ export default class CofferPlugin extends Plugin {
    * Storage cannot notify devices, so ask each one: a tiny request each, and a real sync only when something is there.
    * A place paused before a mass delete, or waiting after a failed sync, is not asked (see Pauses and Retries).
    */
+  private mainDocument(): Document {
+    return this.app.workspace.containerEl.ownerDocument;
+  }
+
   private async poll(): Promise<void> {
-    if (this.polling || this.running || document.visibilityState !== 'visible' || !this.configured()) return;
+    if (this.polling || this.running || this.mainDocument().visibilityState !== 'visible' || !this.configured()) return;
     this.polling = true;
     try {
       const places = new Map(this.targets().map((share) => [keyOf(share), share]));

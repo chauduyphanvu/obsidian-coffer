@@ -145,7 +145,8 @@ export async function storageProblem(store: RemoteStore, keys: MemberKeys): Prom
 /** A folder name a link suggests, if it is one a folder can be called on any system. */
 function folderName(suggested: string): string {
   const name = suggested.split(/[\\/]/).filter(Boolean).at(-1)?.trim() ?? '';
-  return name && name !== '.' && name !== '..' && !/[\u0000-\u001f:*?"<>|]/.test(name) ? name : '';
+  const usable = (ch: string) => ch >= ' ' && !':*?"<>|'.includes(ch);
+  return name && name !== '.' && name !== '..' && [...name].every(usable) ? name : '';
 }
 
 /** What a link says, whichever of the two kinds of link it is, bare or in the obsidian:// link the plugin copies. */

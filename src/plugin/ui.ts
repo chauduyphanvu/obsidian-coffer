@@ -126,7 +126,7 @@ export function buttonRow(parent: HTMLElement): HTMLElement {
 export function button(parent: HTMLElement, text: string, onClick: () => unknown, kind: 'cta' | 'warning' | 'plain' = 'plain'): ButtonComponent {
   const b = new ButtonComponent(parent).setButtonText(text).onClick(() => void onClick());
   if (kind === 'cta') b.setCta();
-  if (kind === 'warning') b.setWarning();
+  if (kind === 'warning') b.setDestructive().setCta();
   return b;
 }
 

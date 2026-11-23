@@ -8,8 +8,8 @@ import { SyncEngine } from '../src/core/engine.ts';
 import { FileState, FolderStore, NodeFS } from '../src/node/nodefs.ts';
 import { MemFS } from '../src/testing/memfs.ts';
 import { generateVault } from './gen.ts';
+import { args, clearInterval, collect, say, setInterval } from './io.ts';
 
-const args = Object.fromEntries(process.argv.slice(2).map((a) => a.replace(/^--/, '').split('=')));
 const root = args.dir;
 if (!root) throw new Error('--dir is required');
 const config: Partial<SyncConfig> = { kdfIterations: 1000 };
@@ -23,10 +23,10 @@ await rm(root, { recursive: true, force: true });
     await mkdir(dirname(join(root, 'a', path)), { recursive: true });
     await writeFile(join(root, 'a', path), f.data);
   }
-  console.log(`vault on disk: ${mem.files.size} files, ${(v.bytes / 1e6).toFixed(0)} MB`);
+  say(`vault on disk: ${mem.files.size} files, ${(v.bytes / 1e6).toFixed(0)} MB`);
 }
 await mkdir(join(root, 'b'));
-(globalThis as { gc?: () => void }).gc?.();
+collect();
 
 const store = new FolderStore(join(root, 'remote'));
 const engine = (name: string) =>
@@ -35,7 +35,7 @@ const a = engine('a');
 const b = engine('b');
 
 async function measure(label: string, fn: () => Promise<unknown>) {
-  (globalThis as { gc?: () => void }).gc?.();
+  collect();
   // ArrayBuffer memory is where file contents live; RSS also counts garbage not yet collected.
   const base = process.memoryUsage().arrayBuffers;
   let peak = base;
@@ -43,7 +43,7 @@ async function measure(label: string, fn: () => Promise<unknown>) {
   const t = performance.now();
   await fn();
   clearInterval(timer);
-  console.log(`${label.padEnd(22)} ${String(Math.round(performance.now() - t)).padStart(6)} ms   peak buffer memory +${Math.round((peak - base) / 1e6)} MB`);
+  say(`${label.padEnd(22)} ${String(Math.round(performance.now() - t)).padStart(6)} ms   peak buffer memory +${Math.round((peak - base) / 1e6)} MB`);
 }
 
 await measure('first upload', () => a.sync());

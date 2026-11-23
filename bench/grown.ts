@@ -11,6 +11,7 @@ import { cleanupDue } from '../src/plugin/settings.ts';
 import { MemFS, MemState } from '../src/testing/memfs.ts';
 import { NET, SimStore, rng } from '../src/testing/netsim.ts';
 import { generateVault } from './gen.ts';
+import { args, say, showTable } from './io.ts';
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
@@ -97,13 +98,12 @@ export async function grown(o: { commits: number; net: string; config: Partial<S
     await measure(`cleanup, week ${week}`, await cleanup());
   }
   if (!o.quiet) {
-    console.log(JSON.stringify({ scenario: 'grown one edit at a time', commits: o.commits, net: o.net, files: fs.files.size, autoClean: !!o.autoClean, ...(o.autoClean && { automaticCleanups: auto.cleanups, automaticCleanupRequests: auto.requests }) }));
-    console.table(Object.fromEntries(rows.map(({ stage, ...r }) => [stage, r])));
+    say(JSON.stringify({ scenario: 'grown one edit at a time', commits: o.commits, net: o.net, files: fs.files.size, autoClean: !!o.autoClean, ...(o.autoClean && { automaticCleanups: auto.cleanups, automaticCleanupRequests: auto.requests }) }));
+    showTable(Object.fromEntries(rows.map(({ stage, ...r }) => [stage, r])));
   }
   return rows;
 }
 
 if (import.meta.main) {
-  const args = Object.fromEntries(process.argv.slice(2).map((a) => a.replace(/^--/, '').split('=')));
   await grown({ commits: Number(args.commits ?? 600), net: args.net ?? 'mobile', config: {}, autoClean: args.autoClean === 'true' });
 }

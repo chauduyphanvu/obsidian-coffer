@@ -95,7 +95,7 @@ export class SettingsTab extends PluginSettingTab {
         let button!: ButtonComponent;
         setting.addButton((b) => (button = b.setButtonText(label).setDisabled(disabled?.() ?? false).onClick(() => void run())));
         // What disables it can change while this page is open, as with the toggle on it.
-        if (disabled) return plugin.onChange(() => button.setDisabled(disabled()));
+        if (disabled) return plugin.onChange(() => void button.setDisabled(disabled()));
       },
     });
 
@@ -278,7 +278,7 @@ export class SettingsTab extends PluginSettingTab {
                 visible: () => s.deferAboveMB > 0,
                 render: (setting) => {
                   setting.addButton((b) => b.setButtonText('Choose…').onClick(() => void chooseDeferred(plugin)));
-                  const draw = () => setting.setName(leftInStorage(plugin.deferredCounts()));
+                  const draw = () => void setting.setName(leftInStorage(plugin.deferredCounts()));
                   draw();
                   return plugin.onChange(draw);
                 },

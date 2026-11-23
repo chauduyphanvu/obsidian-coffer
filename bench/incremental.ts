@@ -14,8 +14,8 @@ import { MemoryStore } from '../src/stores/memory.ts';
 import { MemFS } from '../src/testing/memfs.ts';
 import { NET, SimStore, rng } from '../src/testing/netsim.ts';
 import { generateVault } from './gen.ts';
+import { args, collect, say, showTable } from './io.ts';
 
-const args = Object.fromEntries(process.argv.slice(2).map((a) => a.replace(/^--/, '').split('=')));
 
 type Samples = Record<string, { cpu: number[]; wall: number[] }>;
 
@@ -39,7 +39,7 @@ class Via implements RemoteStore {
   }
 }
 
-const gc = (globalThis as { gc?: () => void }).gc ?? (() => {});
+const gc = collect;
 
 async function measure(notes: number, runs: number, net: string): Promise<Samples> {
   const mem = new MemoryStore();
@@ -122,7 +122,7 @@ if (args.compare) {
       };
     }
   }
-  console.table(table);
+  showTable(table);
 } else {
   const notes = Number(args.notes ?? 10_000);
   const runs = Number(args.runs ?? 15);
@@ -136,8 +136,8 @@ if (args.compare) {
         'wall ms median (IQR)': `${f1(median(s.wall))} (${f1(quantile(s.wall, 0.25))}–${f1(quantile(s.wall, 0.75))})`,
       };
     }
-    console.log(JSON.stringify({ notes, runs, net }));
-    console.table(table);
+    say(JSON.stringify({ notes, runs, net }));
+    showTable(table);
   }
   if (args.out) writeFileSync(args.out, JSON.stringify(all));
 }

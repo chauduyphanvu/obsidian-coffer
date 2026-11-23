@@ -1,5 +1,6 @@
 import { watch, type FSWatcher } from 'node:fs';
 import { basename, sep } from 'node:path';
+import timers from 'node:timers';
 import { SafetyError, type SyncResult } from '../core/engine.ts';
 import type { NodeFS } from './nodefs.ts';
 
@@ -41,8 +42,8 @@ export class SyncLoop {
   }
 
   start(): void {
-    this.poller = setInterval(() => void this.poll(), this.o.pollMs);
-    this.full = setInterval(() => this.request(), this.o.intervalMs);
+    this.poller = timers.setInterval(() => void this.poll(), this.o.pollMs);
+    this.full = timers.setInterval(() => this.request(), this.o.intervalMs);
     this.request();
   }
 
@@ -57,16 +58,16 @@ export class SyncLoop {
   /** Stops scheduling and resolves once a sync in progress has finished. */
   async stop(): Promise<void> {
     this.stopped = true;
-    clearInterval(this.poller);
-    clearInterval(this.full);
-    clearTimeout(this.debounce);
-    clearTimeout(this.retry);
+    timers.clearInterval(this.poller);
+    timers.clearInterval(this.full);
+    timers.clearTimeout(this.debounce);
+    timers.clearTimeout(this.retry);
     await this.current;
   }
 
   private settle(): void {
-    clearTimeout(this.debounce);
-    this.debounce = setTimeout(() => this.request(), this.o.debounceMs);
+    timers.clearTimeout(this.debounce);
+    this.debounce = timers.setTimeout(() => this.request(), this.o.debounceMs);
   }
 
   /** Never two syncs at once, and none while waiting out a failure or a refusal. */
@@ -89,7 +90,7 @@ export class SyncLoop {
   }
 
   private async run(): Promise<void> {
-    clearTimeout(this.debounce);
+    timers.clearTimeout(this.debounce);
     this.again = false;
     try {
       const r = await this.o.sync();
@@ -103,7 +104,7 @@ export class SyncLoop {
       } else {
         const ms = Math.min(BACKOFF_START * 2 ** this.failures++, BACKOFF_CAP);
         this.o.onFailure(e, ms);
-        this.retry = setTimeout(() => {
+        this.retry = timers.setTimeout(() => {
           this.retry = undefined;
           this.request();
         }, ms);

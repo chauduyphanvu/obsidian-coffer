@@ -22,6 +22,7 @@ import { openRemote } from '../stores/open.ts';
 import type { S3Config } from '../stores/s3.ts';
 import { KEYS_FILE, POSITION_FILE, STATE_FILE, credentialsFrom, joinWithLink, loadKeyFile, saveKeyFile, storageProblem, type Credentials, type KeyFile, type MemberRemote } from './member.ts';
 import { FileState, FolderStore, NodeFS } from './nodefs.ts';
+import { say, warn } from './out.ts';
 import { SyncLoop, watchVault } from './watch.ts';
 
 /** Set at build time in dist/coffer.js; undefined when this file runs from source. */
@@ -345,10 +346,10 @@ const leftAlone = (r: SyncResult) => [
 
 /** `notes` is which of the lines about what the sync left alone to print: all, unless the caller says them only once. */
 function report(r: SyncResult, at = '', notes = leftAlone(r)): void {
-  console.log(`${at}${summary(r)}`);
-  for (const copy of r.conflictCopies) console.log(`${at}both versions kept: ${copy}`);
-  for (const line of notes) console.error(`${at}${line}`);
-  for (const e of r.errors) console.error(`${at}failed: ${e.path}: ${e.message}`);
+  say(`${at}${summary(r)}`);
+  for (const copy of r.conflictCopies) say(`${at}both versions kept: ${copy}`);
+  for (const line of notes) warn(`${at}${line}`);
+  for (const e of r.errors) warn(`${at}failed: ${e.path}: ${e.message}`);
 }
 
 const didSomething = (r: SyncResult) =>
@@ -392,7 +393,7 @@ async function applySteps(engine: SyncEngine, fs: NodeFS, v: RepoView, steps: St
   );
   for (const f of applied.failed) {
     const gone = /^Remote pack \S+ is missing/.test(f.message);
-    console.error(`failed: ${f.path}: ${gone ? `the version to put back is no longer in storage, so the file is left as it is (${f.message})` : f.message}`);
+    warn(`failed: ${f.path}: ${gone ? `the version to put back is no longer in storage, so the file is left as it is (${f.message})` : f.message}`);
   }
   return applied;
 }
@@ -423,8 +424,8 @@ async function sendResult(sync: Sync, vault: string, removed: string[]): Promise
     return r;
   } catch (e) {
     if (removed.length) await writeFile(askedFile(vault), JSON.stringify([...new Set([...(await askedDeletions(vault)), ...removed])]));
-    console.error(`the files are changed here, but that could not be sent: ${errorText(e)}`);
-    console.error('run sync to send it');
+    warn(`the files are changed here, but that could not be sent: ${errorText(e)}`);
+    warn('run sync to send it');
     return undefined;
   }
 }
@@ -439,7 +440,7 @@ async function undo(engine: SyncEngine, sync: Sync, vault: string, fs: NodeFS, w
     const r = await sync();
     report(r, 'synced first: ');
     if (r.errors.length) {
-      console.error('not undoing: some files could not sync, and undoing could overwrite their changes');
+      warn('not undoing: some files could not sync, and undoing could overwrite their changes');
       return 1;
     }
   }
@@ -448,22 +449,22 @@ async function undo(engine: SyncEngine, sync: Sync, vault: string, fs: NodeFS, w
   const kept = await keepDeferred(keepOut(v.cfg.exclude, []), engine);
   const mergeable = (path: string) => v.cfg.mergeExtensions.includes(ext(path));
   const { steps, skipped, left } = await undoSteps(planUndo(op.changes, v.st.remote), v.st.remote, kept, (e) => engine.readVersion(e), mergeable, v.cfg.concurrency);
-  console.log(`what ${op.device} sent at ${iso(op.time)} (${operationLabel(op)}), taken back out:`);
-  for (const s of steps) console.log(`  ${STEP[s.kind].padEnd(10)}  ${s.path}`);
-  for (const s of skipped) console.log(`  left as it is  ${skippedNote(s)}`);
-  if (left) console.log(leftNote(left));
+  say(`what ${op.device} sent at ${iso(op.time)} (${operationLabel(op)}), taken back out:`);
+  for (const s of steps) say(`  ${STEP[s.kind].padEnd(10)}  ${s.path}`);
+  for (const s of skipped) say(`  left as it is  ${skippedNote(s)}`);
+  if (left) say(leftNote(left));
   const c = countSteps(steps);
   if (!steps.length) {
-    console.log(skipped.length ? 'nothing was undone' : 'nothing to do: no file is as that change left it');
+    say(skipped.length ? 'nothing was undone' : 'nothing to do: no file is as that change left it');
     return skipped.length ? 1 : 0;
   }
   if (dry) {
-    console.log(`dry run: would bring back ${c.add}, change ${c.change} and remove ${c.remove}; nothing changed`);
+    say(`dry run: would bring back ${c.add}, change ${c.change} and remove ${c.remove}; nothing changed`);
     return 0;
   }
   const applied = await applySteps(engine, fs, v, steps);
   const done = countSteps(applied.done);
-  console.log(`undone: brought back ${done.add}, changed ${done.change}, removed ${done.remove}`);
+  say(`undone: brought back ${done.add}, changed ${done.change}, removed ${done.remove}`);
   const r = await sendResult(sync, vault, applied.done.filter((s) => s.kind === 'remove').map((s) => s.path));
   return !r || applied.failed.length || skipped.length || r.errors.length ? 1 : 0;
 }
@@ -480,7 +481,7 @@ async function restoreAt(engine: SyncEngine, sync: Sync, vault: string, fs: Node
     const r = await sync();
     report(r, 'synced first: ');
     if (r.errors.length) {
-      console.error('not restoring: some files could not sync, and restoring could overwrite their changes');
+      warn('not restoring: some files could not sync, and restoring could overwrite their changes');
       return 1;
     }
   }
@@ -489,16 +490,16 @@ async function restoreAt(engine: SyncEngine, sync: Sync, vault: string, fs: Node
   const kept = await keepDeferred(keepOut(v.cfg.exclude, []), engine);
   const { steps, left } = restoreSteps(planRestore(v.st.remote, past.files, folder), v.st.remote, kept);
   const scope = prefixOf(folder) || 'the vault';
-  console.log(`${scope} as of ${iso(past.commit.time)}, synced by ${past.commit.device}:`);
-  for (const s of steps) console.log(`  ${STEP[s.kind].padEnd(10)}  ${s.path}`);
-  if (left) console.log(leftNote(left));
+  say(`${scope} as of ${iso(past.commit.time)}, synced by ${past.commit.device}:`);
+  for (const s of steps) say(`  ${STEP[s.kind].padEnd(10)}  ${s.path}`);
+  if (left) say(leftNote(left));
   const c = countSteps(steps);
   if (!steps.length) {
-    console.log('nothing to do: it already matches');
+    say('nothing to do: it already matches');
     return 0;
   }
   if (dry) {
-    console.log(`dry run: would bring back ${c.add}, change ${c.change} and remove ${c.remove}; nothing changed`);
+    say(`dry run: would bring back ${c.add}, change ${c.change} and remove ${c.remove}; nothing changed`);
     return 0;
   }
 
@@ -506,12 +507,12 @@ async function restoreAt(engine: SyncEngine, sync: Sync, vault: string, fs: Node
   const done = countSteps(applied.done);
   const removed = applied.done.filter((s) => s.kind === 'remove').map((s) => s.path);
   const failed = applied.failed.length;
-  console.log(`restored ${scope} as of ${iso(past.commit.time)}: brought back ${done.add}, changed ${done.change}, removed ${done.remove}`);
+  say(`restored ${scope} as of ${iso(past.commit.time)}: brought back ${done.add}, changed ${done.change}, removed ${done.remove}`);
   const limit = deleteLimitCrossed(done.add + done.change, done.remove, v.st.synced.size, v.cfg);
   const r = await sendResult(sync, vault, removed);
   if (!r) return 1;
   if (limit !== undefined) {
-    console.log(
+    say(
       `the ${done.remove} files removed went to storage as deletions you asked for, so no --force was needed, and other devices delete them ` +
         `when they next sync; one on an older version, or many syncs behind, stops first, as it does before deleting more than ${limit} files ` +
         'at once in case they vanished by mistake, so sync that one with --force',
@@ -585,14 +586,14 @@ function prepareSite(cli: CliConfig, site: SiteConfig, vault: string, store: Rem
 async function publish(cli: CliConfig, vault: string, configFile: string, dry: boolean): Promise<number> {
   const { site, store } = await siteLocation(cli, vault, configFile, dry);
   const prepared = await prepareSite(cli, site, vault, store);
-  for (const line of summaryLines(prepared)) console.log(line);
+  for (const line of summaryLines(prepared)) say(line);
   if (dry) {
-    console.log('dry run: nothing was uploaded or deleted');
+    say('dry run: nothing was uploaded or deleted');
     return 0;
   }
   if (changesOf(prepared).nothing) return 0;
   await publishPrepared(store, prepared);
-  console.log(`published to ${describeRemote(site.remote)}`);
+  say(`published to ${describeRemote(site.remote)}`);
   return 0;
 }
 
@@ -635,8 +636,8 @@ async function exportTo(engine: SyncEngine, vault: string, dir: string, folder: 
   };
   await pool(files.filter(([, e]) => e.size <= EXPORT_ALONE), v.cfg.concurrency, one);
   for (const [path, entry] of files) if (entry.size > EXPORT_ALONE) await one([path, entry]);
-  for (const f of failed.sort((a, b) => (a.path < b.path ? -1 : 1))) console.error(`failed: ${f.path}: ${f.message}`);
-  console.log(`exported ${plural(files.length - failed.length, 'file')} (${sizeLabel(bytes)}) of ${prefix || 'the vault'}${asOf} to ${there}`);
+  for (const f of failed.sort((a, b) => (a.path < b.path ? -1 : 1))) warn(`failed: ${f.path}: ${f.message}`);
+  say(`exported ${plural(files.length - failed.length, 'file')} (${sizeLabel(bytes)}) of ${prefix || 'the vault'}${asOf} to ${there}`);
   return failed.length ? 1 : 0;
 }
 
@@ -678,8 +679,8 @@ async function status(
     // Anything else, such as a log with a hole or a member list that does not verify, is told apart from storage that
     // never answered by asking it once more.
     const why = unreadable(e) ?? ((await answers()) ? { problem: 'unreadable', but: `it could not be read: ${error}` } : undefined);
-    if (json) console.log(JSON.stringify({ ok: false, storage: { reachable: !!why, where, problem: why?.problem ?? 'unreachable', error } }, null, 2));
-    else console.log(why ? `storage: reachable, ${where}, but ${why.but}` : `storage: not reachable, ${where}: ${error}`);
+    if (json) say(JSON.stringify({ ok: false, storage: { reachable: !!why, where, problem: why?.problem ?? 'unreachable', error } }, null, 2));
+    else say(why ? `storage: reachable, ${where}, but ${why.but}` : `storage: not reachable, ${where}: ${error}`);
     return 1;
   }
   const { v, newest, devices, left } = read;
@@ -711,23 +712,23 @@ async function status(
       leftInStorage: left,
       conflictCopies: copies.map((path) => ({ path, of: conflictOriginal(path) })),
     };
-    console.log(JSON.stringify(report, null, 2));
+    say(JSON.stringify(report, null, 2));
     return problems.length ? 1 : 0;
   }
-  console.log(`storage: reachable, ${where}`);
-  console.log(`newest change: ${newest ? `number ${newest.seq}, ${iso(newest.time)}, by ${by}` : 'none yet'}`);
-  if (!devices) console.log(`devices: ${noDevices}`);
-  else if (!devices.length) console.log('devices: none has reported yet; each appears after its next sync');
-  else console.log('devices:');
+  say(`storage: reachable, ${where}`);
+  say(`newest change: ${newest ? `number ${newest.seq}, ${iso(newest.time)}, by ${by}` : 'none yet'}`);
+  if (!devices) say(`devices: ${noDevices}`);
+  else if (!devices.length) say('devices: none has reported yet; each appears after its next sync');
+  else say('devices:');
   for (const d of devices ?? []) {
     const about = [d.platform, d.version && `v${d.version}`].filter(Boolean).join(' ');
-    console.log(`  ${d.name}${d.isSelf ? ' (this device)' : ''}${about ? `, ${about}` : ''}, last synced ${agoText(v.now - d.lastSeen)}: ${statusText(d, v.now)}`);
+    say(`  ${d.name}${d.isSelf ? ' (this device)' : ''}${about ? `, ${about}` : ''}, last synced ${agoText(v.now - d.lastSeen)}: ${statusText(d, v.now)}`);
   }
-  console.log(`files left in storage: ${left.length ? `${left.length}, which fetch downloads` : 'none'}`);
-  for (const f of left) console.log(`  ${f.path} (${sizeLabel(f.size)})`);
-  console.log(`conflict copies: ${copies.length || 'none'}`);
-  for (const path of copies) console.log(`  ${path}`);
-  console.log(problems.length ? `needs attention: ${problems.join(', ')}` : 'all is well');
+  say(`files left in storage: ${left.length ? `${left.length}, which fetch downloads` : 'none'}`);
+  for (const f of left) say(`  ${f.path} (${sizeLabel(f.size)})`);
+  say(`conflict copies: ${copies.length || 'none'}`);
+  for (const path of copies) say(`  ${path}`);
+  say(problems.length ? `needs attention: ${problems.join(', ')}` : 'all is well');
   return problems.length ? 1 : 0;
 }
 
@@ -740,56 +741,56 @@ async function readStdin(): Promise<string> {
 async function main(): Promise<number> {
   const { flags, words, error } = parseArgs(process.argv.slice(2));
   if (error) {
-    console.error(error);
+    warn(error);
     return 2;
   }
   const [command, ...rest] = words;
   if (flags.has('help') || command === 'help') {
-    console.log(USAGE);
+    say(USAGE);
     return 0;
   }
   if (flags.has('version')) {
-    console.log(await version());
+    say(await version());
     return 0;
   }
   if (!command) {
-    console.log(USAGE);
+    say(USAGE);
     return 2;
   }
   if (!Object.hasOwn(OPTIONS, command)) {
-    console.error(`unknown command: ${command}\n\n${USAGE}`);
+    warn(`unknown command: ${command}\n\n${USAGE}`);
     return 2;
   }
   // An option that is ignored can make a command do more than asked, as a mistyped --dry-run.
   const unknown = [...flags.keys()].filter((f) => f !== 'config' && !OPTIONS[command].includes(f));
   if (unknown.length) {
-    console.error(`unknown option for ${command}: ${unknown.map((f) => `--${f}`).join(', ')}`);
+    warn(`unknown option for ${command}: ${unknown.map((f) => `--${f}`).join(', ')}`);
     return 2;
   }
   const stray = [...flags].find(([name, value]) => value !== undefined && !VALUED.includes(name));
   if (stray) {
-    console.error(`--${stray[0]} takes no value`);
+    warn(`--${stray[0]} takes no value`);
     return 2;
   }
   const configFile = flags.get('config') ?? 'coffer.json';
   if (command === 'join') {
     const link = rest.length > 1 ? '' : rest[0] === '-' ? await readStdin() : (rest[0] ?? process.env.COFFER_LINK ?? '');
     if (!link.trim()) {
-      console.error('join takes the link to join with on standard input: join - [--vault=<folder>], or in COFFER_LINK');
+      warn('join takes the link to join with on standard input: join - [--vault=<folder>], or in COFFER_LINK');
       return 2;
     }
     const j = await joinWithLink(link, { config: configFile, vault: flags.get('vault'), stateDir: STATE_DIR, open: (remote, creds) => makeStore(remote, false, creds) });
-    console.log(`joined “${j.share}” ${j.role === 'follow' ? 'as a follower' : `as a member who ${j.role === 'write' ? 'writes' : 'reads'}`}`);
-    console.log(`  folder  ${j.vault}`);
-    console.log(`  config  ${j.config}`);
-    console.log(`  keys    ${j.keys}, readable by you alone; it holds what opens the shared folder, so keep it private`);
-    if (j.late) console.error(`could not tell the owner's device about this one yet (${j.late}); sync tries again`);
-    console.log(
+    say(`joined “${j.share}” ${j.role === 'follow' ? 'as a follower' : `as a member who ${j.role === 'write' ? 'writes' : 'reads'}`}`);
+    say(`  folder  ${j.vault}`);
+    say(`  config  ${j.config}`);
+    say(`  keys    ${j.keys}, readable by you alone; it holds what opens the shared folder, so keep it private`);
+    if (j.late) warn(`could not tell the owner's device about this one yet (${j.late}); sync tries again`);
+    say(
       j.role === 'write'
         ? 'this device only receives until the owner\'s device confirms it, which sync tells you about; then it sends changes'
         : 'this device only receives',
     );
-    console.log(`next: sync --config=${j.config}`);
+    say(`next: sync --config=${j.config}`);
     return 0;
   }
   const cli = await readFile(configFile, 'utf8').then(
@@ -823,24 +824,24 @@ async function main(): Promise<number> {
   rejoin = `delete ${resolve(configFile)} and ${join(vault, STATE_DIR)} (the files in the folder stay) and run join with it`;
   receivesOnly = !!cli.sync?.readOnly || (!!member && !member.member.key);
   if (member && NOT_FOR_MEMBERS[command]) {
-    console.error(`${command} does not work on a shared folder with members: ${NOT_FOR_MEMBERS[command]}`);
+    warn(`${command} does not work on a shared folder with members: ${NOT_FOR_MEMBERS[command]}`);
     return 1;
   }
   if (cli.remote.type === 'follow' && NOT_FOR_FOLLOWERS[command]) {
-    console.error(`${command} does not work on a followed folder: ${NOT_FOR_FOLLOWERS[command]}`);
+    warn(`${command} does not work on a followed folder: ${NOT_FOR_FOLLOWERS[command]}`);
     return 1;
   }
   // restore-at and undo with --dry-run only read, so a device that only receives may look at what they would do.
   const looksOnly = (command === 'restore-at' || command === 'undo') && flags.has('dry-run');
   if (receivesOnly && WRITES[command] && !looksOnly) {
-    console.error(`this device only receives changes, so ${WRITES[command]}; run ${command} from a device that sends them`);
+    warn(`this device only receives changes, so ${WRITES[command]}; run ${command} from a device that sends them`);
     return 1;
   }
   let store = makeStore(cli.remote, !existsSync(stateFile) && !looks, member?.storage);
 
   if (command === 'check') {
     const report = await checkStore(store, receivesOnly);
-    for (const c of report.checks) console.log(`${c.ok ? 'ok  ' : 'FAIL'} ${c.name}${c.detail ? `: ${c.detail}` : ''}`);
+    for (const c of report.checks) say(`${c.ok ? 'ok  ' : 'FAIL'} ${c.name}${c.detail ? `: ${c.detail}` : ''}`);
     return report.ok ? 0 : 1;
   }
 
@@ -864,7 +865,7 @@ async function main(): Promise<number> {
         // A custom list replaces the defaults, but this device's own state must never sync.
         exclude: [...(cli.sync?.exclude ?? DEFAULT_CONFIG.exclude), `${STATE_DIR}/**`],
       }),
-      log: console.error,
+      log: warn,
       // Its member list lives apart from the sync state, which accepting storage resets.
       ...(member && { member: { keys: member.member, position: new FileState(join(vault, STATE_DIR, POSITION_FILE)) } }),
     });
@@ -888,7 +889,7 @@ async function main(): Promise<number> {
       }
     }
     if (!creds || !next || problem) {
-      if (toldRekey !== offer.n) console.error(`the owner sent new storage keys, but they do not work here (${problem}); this device keeps the ones it has`);
+      if (toldRekey !== offer.n) warn(`the owner sent new storage keys, but they do not work here (${problem}); this device keeps the ones it has`);
       toldRekey = offer.n;
       return;
     }
@@ -897,7 +898,7 @@ async function main(): Promise<number> {
     await engine.acceptRekey(offer.n);
     store = next;
     engine = build(store);
-    console.error('the owner sent new storage keys, and this device now uses them');
+    warn('the owner sent new storage keys, and this device now uses them');
   };
   const noteStanding = async () => {
     const standing = member && (await engine.memberStanding());
@@ -919,7 +920,7 @@ async function main(): Promise<number> {
     if (standing?.removed) throw new RemovedError();
     if (standing?.role && !standing.mayWrite) {
       const why = standing.waiting ? `this device only receives until ${standing.owner || 'the owner'}'s device confirms it` : 'this device may not send changes to this shared folder';
-      console.error(`${why}, so ${WRITES[command]}; run ${command} once it may send them`);
+      warn(`${why}, so ${WRITES[command]}; run ${command} once it may send them`);
       return 1;
     }
   }
@@ -939,7 +940,7 @@ async function main(): Promise<number> {
     try {
       return await writeHeartbeat(await engine.view(), { platform: `CLI on ${SYSTEMS[process.platform] ?? process.platform}`, version: await version() });
     } catch (e) {
-      console.error(`could not record this device's heartbeat: ${errorText(e)}`);
+      warn(`could not record this device's heartbeat: ${errorText(e)}`);
       return undefined;
     }
   };
@@ -998,19 +999,19 @@ async function main(): Promise<number> {
         const fresh = left.filter((line) => !lastLeft.has(line));
         lastLeft = new Set(left);
         if (didSomething(r)) report(r, `${stamp()} `, fresh);
-        else for (const line of fresh) console.error(`${stamp()} ${line}`);
-        for (const { line, error } of published) (error ? console.error : console.log)(`${stamp()} ${line}`);
+        else for (const line of fresh) warn(`${stamp()} ${line}`);
+        for (const { line, error } of published) (error ? warn : say)(`${stamp()} ${line}`);
         published = [];
       },
       onFailure: (e, retryMs) => {
         const message = errorText(e);
         const why = e instanceof SafetyError ? `${message} Not retrying until something changes.` : e instanceof RemovedError ? `${message}. Not watching any more.` : `sync failed: ${message}; retrying in ${retryMs! / 1000}s`;
-        console.error(`${stamp()} ${why}`);
-        if (e instanceof SafetyError) console.error(`${stamp()} ${FORCE_HINT}`);
-        if (e instanceof HistoryError) console.error(`${stamp()} ${ACCEPT_HINT}`);
-        if (refusedWriting(e)) console.error(`${stamp()} ${READ_ONLY_HINT}`);
+        warn(`${stamp()} ${why}`);
+        if (e instanceof SafetyError) warn(`${stamp()} ${FORCE_HINT}`);
+        if (e instanceof HistoryError) warn(`${stamp()} ${ACCEPT_HINT}`);
+        if (refusedWriting(e)) warn(`${stamp()} ${READ_ONLY_HINT}`);
         const hint = memberHint(e);
-        if (hint) console.error(`${stamp()} ${hint}`);
+        if (hint) warn(`${stamp()} ${hint}`);
         // Nothing a removed device does is ever accepted again.
         if (e instanceof RemovedError) {
           removed = true;
@@ -1022,17 +1023,17 @@ async function main(): Promise<number> {
       intervalMs,
     });
     // Watching starts before the first sync so that edits made during it are not missed.
-    const watcher = watchVault(vault, fs, STATE_DIR, () => loop.changed(), (e) => console.error(`${stamp()} watching failed: ${e.message}; relying on the --interval syncs`));
+    const watcher = watchVault(vault, fs, STATE_DIR, () => loop.changed(), (e) => warn(`${stamp()} watching failed: ${e.message}; relying on the --interval syncs`));
     const signalled = new Promise<void>((done) => {
       leave = done;
       for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => done());
     });
-    console.log(
+    say(
       `${stamp()} watching ${vault} against ${describeRemote(cli.remote)}${receivesOnly ? ', receive only' : ''}; ` +
         `checking for changes every ${pollMs / 1000}s and syncing everything every ${intervalMs / 1000}s`,
     );
     if (site) {
-      console.log(
+      say(
         `${stamp()} publishing the website to ${describeRemote(site.site.remote)} after the first sync and after each one that changes something, with no preview to check first: ` +
           (site.site.whole ? 'the whole vault is published, so every note, a new one too, goes public unless it says publish: false' : 'every note that says publish: true goes public'),
       );
@@ -1047,7 +1048,7 @@ async function main(): Promise<number> {
     const left = new Set((await engine.deferred()).map((f) => f.path));
     const not = rest.filter((path) => !left.has(vaultKey(path)));
     if (not.length) {
-      console.error(`cannot fetch ${not.join(', ')}: not a file left in storage by sync.deferAboveMB; nothing was downloaded`);
+      warn(`cannot fetch ${not.join(', ')}: not a file left in storage by sync.deferAboveMB; nothing was downloaded`);
       return 1;
     }
     const r = await syncNow({ fetch: rest });
@@ -1080,14 +1081,14 @@ async function main(): Promise<number> {
       if (page.next === undefined) break;
       beforeSeq = page.next;
     }
-    if (!items.length) console.error(`no changes ${prefix ? `to ${prefix} ` : ''}in the history storage keeps`);
+    if (!items.length) warn(`no changes ${prefix ? `to ${prefix} ` : ''}in the history storage keeps`);
     for (const r of activityRows(items.slice(0, limit), selfOf(v))) {
       if (!r.who) {
-        console.log(`${String(r.seq).padStart(6)}  ${iso(r.time)}  ${r.text}`);
+        say(`${String(r.seq).padStart(6)}  ${iso(r.time)}  ${r.text}`);
         continue;
       }
-      console.log(`${String(r.seq).padStart(6)}  ${iso(r.time)}  ${r.who.padEnd(16)} ${r.text}`);
-      for (const f of r.files) console.log(`  ${f.kind.padEnd(7)}  ${f.path}`);
+      say(`${String(r.seq).padStart(6)}  ${iso(r.time)}  ${r.who.padEnd(16)} ${r.text}`);
+      for (const f of r.files) say(`  ${f.kind.padEnd(7)}  ${f.path}`);
     }
     return 0;
   }
@@ -1095,12 +1096,12 @@ async function main(): Promise<number> {
     const view = await engine.view();
     const versions = await listVersions(view.repo, view.st.lastSeq, vaultKey(rest[0]), view.cfg, view.now);
     if (!versions.length) {
-      console.error(`no stored versions of ${rest[0]}`);
+      warn(`no stored versions of ${rest[0]}`);
       return 1;
     }
     const by = namer(selfOf(view));
     for (const v of versions) {
-      console.log(`${String(v.seq).padStart(6)}  ${new Date(v.time).toISOString()}  ${by(v).padEnd(16)} ${v.entry ? `${v.entry.size} bytes` : 'deleted'}`);
+      say(`${String(v.seq).padStart(6)}  ${new Date(v.time).toISOString()}  ${by(v).padEnd(16)} ${v.entry ? `${v.entry.size} bytes` : 'deleted'}`);
     }
     return 0;
   }
@@ -1114,13 +1115,13 @@ async function main(): Promise<number> {
       throw new Error(`${rest[0]} has changes on this device that are not synced yet; run sync first, so they are kept as a version, then restore`);
     }
     await fs.write(rest[0], data);
-    console.log(`restored ${rest[0]} as of ${new Date(version.time).toISOString()}; run sync to send it to other devices`);
+    say(`restored ${rest[0]} as of ${new Date(version.time).toISOString()}; run sync to send it to other devices`);
     return 0;
   }
   if (command === 'deleted') {
     const v = await engine.view();
     const by = namer(selfOf(v));
-    for (const d of await listDeleted(v.repo, v.st.lastSeq, v.cfg, v.now, rest[0] ?? '')) console.log(`${iso(d.time)}  ${by(d).padEnd(16)} ${d.path}`);
+    for (const d of await listDeleted(v.repo, v.st.lastSeq, v.cfg, v.now, rest[0] ?? '')) say(`${iso(d.time)}  ${by(d).padEnd(16)} ${d.path}`);
     return 0;
   }
   if (command === 'log') {
@@ -1128,7 +1129,7 @@ async function main(): Promise<number> {
     const v = await engine.view();
     const by = namer(selfOf(v));
     for (const c of await listCommits(v.repo, v.st.lastSeq, v.cfg, v.now, { limit })) {
-      console.log(`${String(c.seq).padStart(6)}  ${iso(c.time)}  ${by(c).padEnd(16)} ${c.added} added, ${c.changed} changed, ${c.deleted} deleted`);
+      say(`${String(c.seq).padStart(6)}  ${iso(c.time)}  ${by(c).padEnd(16)} ${c.added} added, ${c.changed} changed, ${c.deleted} deleted`);
     }
     return 0;
   }
@@ -1137,22 +1138,22 @@ async function main(): Promise<number> {
   if (command === 'verify') {
     const r = await engine.verify({ deep: flags.has('deep') });
     for (const p of r.problems) {
-      console.log(`problem: ${p.message}${p.object ? ` (${p.object})` : ''}`);
-      for (const path of p.paths ?? []) console.log(`  affects ${path}`);
-      for (const path of p.earlier ?? []) console.log(`  earlier versions of ${path} cannot be restored`);
+      say(`problem: ${p.message}${p.object ? ` (${p.object})` : ''}`);
+      for (const path of p.paths ?? []) say(`  affects ${path}`);
+      for (const path of p.earlier ?? []) say(`  earlier versions of ${path} cannot be restored`);
     }
     const deep = r.deep ? `, ${plural(r.chunks, 'chunk')} (${(r.bytes / 1e6).toFixed(1)} MB downloaded)` : '';
-    console.log(`checked ${plural(r.commits, 'commit')}, ${plural(r.files, 'file')}, ${plural(r.packs, 'pack')}${deep}: ${r.problems.length ? plural(r.problems.length, 'problem') : 'no problems'}`);
+    say(`checked ${plural(r.commits, 'commit')}, ${plural(r.files, 'file')}, ${plural(r.packs, 'pack')}${deep}: ${r.problems.length ? plural(r.problems.length, 'problem') : 'no problems'}`);
     return r.problems.length ? 1 : 0;
   }
   if (command === 'repair') {
     const deep = flags.has('deep');
     const r = await engine.repair({ deep });
-    for (const path of r.repaired) console.log(`repaired: ${path}`);
-    for (const path of r.unrepaired) console.error(`still missing: ${path}`);
-    for (const path of r.historyOnly) console.log(`earlier versions cannot be restored: ${path}`);
+    for (const path of r.repaired) say(`repaired: ${path}`);
+    for (const path of r.unrepaired) warn(`still missing: ${path}`);
+    for (const path of r.historyOnly) say(`earlier versions cannot be restored: ${path}`);
     const lost = r.historyOnly.length ? `, ${plural(r.historyOnly.length, 'file')} with earlier versions that cannot be restored` : '';
-    console.log(
+    say(
       r.repaired.length || r.unrepaired.length || r.historyOnly.length
         ? `repaired ${plural(r.repaired.length, 'file')} (${plural(r.chunks, 'chunk')} stored again), ${r.unrepaired.length} still missing${lost}`
         : `nothing to repair: every stored object is present and whole in size${deep ? ', and the contents the current files use were read and are intact' : ' (repair --deep reads their contents)'}`,
@@ -1167,56 +1168,56 @@ async function main(): Promise<number> {
     } catch (e) {
       if (!(e instanceof PassphraseUnknownError)) {
         // The reason and any hint follow from the shared error handling below.
-        console.error('the passphrase was not changed');
+        warn('the passphrase was not changed');
         throw e;
       }
-      console.error(`${errorText(e)}. If a sync then says the passphrase is wrong, storage took the new one: use COFFER_NEW_PASSPHRASE as COFFER_PASSPHRASE from now on`);
+      warn(`${errorText(e)}. If a sync then says the passphrase is wrong, storage took the new one: use COFFER_NEW_PASSPHRASE as COFFER_PASSPHRASE from now on`);
       return 1;
     }
-    console.log('passphrase changed; update it on every device');
+    say('passphrase changed; update it on every device');
     return 0;
   }
   if (command === 'clean') {
     const r = await engine.gc();
     const deleted = [r.packsDeleted && `${plural(r.packsDeleted, 'pack')} (${sizeLabel(r.bytesFreed)})`, r.snapshotsDeleted && plural(r.snapshotsDeleted, 'snapshot')].filter(Boolean);
-    if (deleted.length) console.log(`deleted ${deleted.join(' and ')} that no kept version needs`);
+    if (deleted.length) say(`deleted ${deleted.join(' and ')} that no kept version needs`);
     if (r.packsCombined) {
-      console.log(
+      say(
         `copied the data still in use out of ${plural(r.packsCombined, 'small or mostly unused pack')} into ${plural(r.packsWritten, 'new pack')} (${sizeLabel(r.bytesMoved)}); ` +
           `a later clean deletes the old ones (${sizeLabel(r.bytesFreedLater)}) once no kept version reads them`,
       );
     }
-    if (!deleted.length && !r.packsCombined) console.log('nothing to clean: no stored version has expired, and no pack is worth combining');
+    if (!deleted.length && !r.packsCombined) say('nothing to clean: no stored version has expired, and no pack is worth combining');
     if (!r.missing) {
-      console.error('could not tell this time whether storage still holds all the data the files need: run clean again later');
+      warn('could not tell this time whether storage still holds all the data the files need: run clean again later');
       return 0;
     }
-    for (const path of r.missing) console.error(`missing from storage: ${path}`);
-    for (const path of r.missingEarlier) console.log(`earlier versions of ${path} cannot be restored`);
+    for (const path of r.missing) warn(`missing from storage: ${path}`);
+    for (const path of r.missingEarlier) say(`earlier versions of ${path} cannot be restored`);
     if (!r.missing.length) return 0;
-    console.error(`run repair on a device that has ${r.missing.length === 1 ? 'this file' : 'these files'}, to store ${r.missing.length === 1 ? 'its' : 'their'} data again`);
+    warn(`run repair on a device that has ${r.missing.length === 1 ? 'this file' : 'these files'}, to store ${r.missing.length === 1 ? 'its' : 'their'} data again`);
     return 1;
   }
   if (command === 'accept-storage') {
     await engine.acceptStorage();
-    console.log('carrying on from storage as it is now');
+    say('carrying on from storage as it is now');
     const r = await syncNow();
     report(r);
     return r.errors.length ? 1 : 0;
   }
-  console.log(USAGE);
+  say(USAGE);
   return 2;
 }
 
 main().then(
   (code) => process.exit(code),
   (e) => {
-    console.error(errorText(e));
-    if (e instanceof HistoryError) console.error(ACCEPT_HINT);
-    if (e instanceof SafetyError) console.error(FORCE_HINT);
-    if (refusedWriting(e)) console.error(READ_ONLY_HINT);
+    warn(errorText(e));
+    if (e instanceof HistoryError) warn(ACCEPT_HINT);
+    if (e instanceof SafetyError) warn(FORCE_HINT);
+    if (refusedWriting(e)) warn(READ_ONLY_HINT);
     const hint = memberHint(e);
-    if (hint) console.error(hint);
+    if (hint) warn(hint);
     process.exit(1);
   },
 );

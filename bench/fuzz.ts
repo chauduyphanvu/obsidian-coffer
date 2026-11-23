@@ -1,4 +1,5 @@
 import { fuzz } from '../src/testing/fuzz.ts';
+import { say } from './io.ts';
 
 const arg = (name: string, def: number) => Number(process.argv.find((a) => a.startsWith(`--${name}=`))?.split('=')[1] ?? def);
 const seeds = arg('seeds', 300);
@@ -18,8 +19,8 @@ for (let seed = 1; seed <= seeds; seed++) {
   total.packsCombined += r.packsCombined;
   if (!r.ok) {
     total.failed++;
-    console.log(`seed ${seed} FAILED: ${r.problems.slice(0, 5).join('; ')}`);
+    say(`seed ${seed} FAILED: ${r.problems.slice(0, 5).join('; ')}`);
   }
 }
-console.log(JSON.stringify({ seeds, ...o, ...total }));
+say(JSON.stringify({ seeds, ...o, ...total }));
 process.exit(total.failed ? 1 : 0);

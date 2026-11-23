@@ -1783,7 +1783,7 @@ export class SyncEngine {
 
   /** Returns true when another device committed first and some of these changes must be re-planned. */
   private async commit(prepared: Prepared[], deletes: string[], res: SyncResult, confirmed = false): Promise<boolean> {
-    const { repo, st } = await this.open();
+    const { st } = await this.open();
     let contended = false;
     while (prepared.length || deletes.length) {
       if (this.book && !this.book.mayWrite(st.members)) {
