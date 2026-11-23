@@ -1,7 +1,7 @@
 {
   "id": "coffer",
   "name": "Coffer",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "minAppVersion": "1.13.1",
   "description": "Sync your vault, share folders and publish notes as a website through storage you control: S3, Cloudflare R2, Backblaze B2, MinIO or WebDAV. End-to-end encrypted, with three-way merges and version history.",
   "author": "chauduyphanvu",
