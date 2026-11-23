@@ -1248,3 +1248,33 @@ test('a base edited on two devices merges by lines, and the same line changed on
   assert.equal(a.fs.text('Projects.base'), base.replace('name: Table', 'name: Projects table').replace('file.inFolder("Projects")', 'file.inFolder("Work")'));
   assert.deepEqual(b.snapshot(), a.snapshot());
 });
+
+test('a download that left an empty file, recorded as fine by an older version, is downloaded again and never sent', async () => {
+  const { devices: [a, b] } = setup();
+  a.fs.put('note.md', 'line one\nline two\n');
+  a.fs.put('other.md', 'other\n');
+  await a.sync();
+
+  // The write reports success and leaves nothing, once.
+  const write = b.fs.write.bind(b.fs);
+  b.fs.write = (path, data, mtime) => write(path, path === 'note.md' ? new Uint8Array() : data, mtime);
+  await b.sync();
+  b.fs.write = write;
+  assert.equal(b.fs.text('note.md'), '');
+
+  for (const restart of [true, false]) {
+    if (restart) b.restart();
+    const r = await b.sync();
+    assert.deepEqual([r.pulled, r.pushed, r.conflictCopies.length, r.errors.length], restart ? [1, 0, 0, 0] : [0, 0, 0, 0]);
+    assert.equal(b.fs.text('note.md'), 'line one\nline two\n');
+  }
+  await a.sync();
+  assert.equal(a.fs.text('note.md'), 'line one\nline two\n');
+
+  // A note the user emptied is an edit like any other.
+  b.fs.put('other.md', '');
+  assert.equal((await b.sync()).pushed, 1);
+  assert.equal((await b.sync()).pulled, 0);
+  await a.sync();
+  assert.equal(a.fs.text('other.md'), '');
+});

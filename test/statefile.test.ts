@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { loadState, removeState, saveState, type StateFiles } from '../src/plugin/statefile.ts';
+import { loadState, removeState, saveState, writeWhole, type StateFiles } from '../src/plugin/statefile.ts';
 
 /** Files in memory. With `crashAt`, the operation of that number stops the app: a write leaves half its text, and nothing after it runs. */
 class Files implements StateFiles {
@@ -75,4 +75,41 @@ test('a state file damaged in place loads the copy saved beside it, when that on
   assert.equal(await loadState(f, 's.json'), OLD.slice(0, 5), 'nothing else to go by: the caller finds it damaged');
   f.files.set('s.json.tmp', NEW);
   assert.equal(await loadState(f, 's.json'), NEW);
+});
+
+test('a write that leaves the file empty, as Android now and then does, is made again; three in a row is an error', async () => {
+  const disk = new Map<string, number>();
+  let writes = 0;
+  const stat = async (path: string) => (disk.has(path) ? { size: disk.get(path)!, mtime: 7 } : null);
+  const flaky = (bad: number) => async () => {
+    disk.set('a.md', ++writes <= bad ? 0 : 28);
+  };
+  assert.deepEqual(await writeWhole(stat, 'a.md', 28, flaky(0)), { size: 28, mtime: 7 });
+  assert.equal(writes, 1, 'a good write is made once');
+  writes = 0;
+  assert.deepEqual(await writeWhole(stat, 'a.md', 28, flaky(2)), { size: 28, mtime: 7 });
+  assert.equal(writes, 3);
+  writes = 0;
+  await assert.rejects(writeWhole(stat, 'a.md', 28, flaky(3)), /Could not write a\.md: it holds 0 of 28 bytes/);
+  assert.deepEqual(await writeWhole(stat, 'empty.md', 0, async () => void disk.set('empty.md', 0)), { size: 0, mtime: 7 }, 'an empty file is a whole one when nothing was to be written');
+});
+
+test('saving the state never puts an empty copy in the place of a whole file', async () => {
+  class Flaky extends Files {
+    bad = 0;
+    async write(path: string, data: string) {
+      await super.write(path, this.bad-- > 0 ? '' : data);
+    }
+    async stat(path: string) {
+      return this.files.has(path) ? { size: this.files.get(path)!.length } : null;
+    }
+  }
+  const f = new Flaky();
+  await saveState(f, 'state.json', '{"n":1}');
+  f.bad = 2;
+  await saveState(f, 'state.json', '{"n":2}');
+  assert.equal(await loadState(f, 'state.json'), '{"n":2}');
+  f.bad = 3;
+  await assert.rejects(saveState(f, 'state.json', '{"n":3}'), /is empty/);
+  assert.equal(await loadState(f, 'state.json'), '{"n":2}', 'the file before stays');
 });

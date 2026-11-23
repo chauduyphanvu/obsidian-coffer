@@ -39,6 +39,7 @@ import { forgetGone, isOffered, lookForOffers, offerKey, offersDue, offersHere, 
 import { OtherSenderError, PropertyFS, isAttachment, isNote, inviteProblem, joinProblem, keptText, noteInShare, onlyShownBy, newEmbeds, otherSender, propertyProblems, sendProblem, sentNotesText, settleChoices, startProblem, unmarkedText, unusedText, withShare, withoutShare, writeProblem, type Survey } from './byproperty.ts';
 import { RemoveModal, WhatsSharedModal } from './byproperty-ui.ts';
 import { ObsidianCatalog, ObsidianFS, PluginState, lookup, obsidianHttp } from './obsidianfs.ts';
+import { writeWhole } from './statefile.ts';
 import { Pauses, Retries, nextPollDelay, pausesOn, pollPlaces, receivedChanges } from './polling.ts';
 import {
   cleanupDue,
@@ -1985,14 +1986,21 @@ export default class CofferPlugin extends Plugin {
     }
     const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
     const file = lookup(this.app, full);
-    if (file instanceof TFile) return vault.modifyBinary(file, buffer);
+    const stat = (p: string) => vault.adapter.stat(p);
+    if (file instanceof TFile) {
+      await writeWhole(stat, full, data.length, () => vault.modifyBinary(file, buffer));
+      return;
+    }
     if (file) throw new Error('A folder has this name');
     for (let i = full.indexOf('/'); i > 0; i = full.indexOf('/', i + 1)) {
       const dir = full.slice(0, i);
       // Can fail when the folder exists on disk but not yet in the vault; creating the file says if it is really missing.
       if (!lookup(this.app, dir)) await vault.createFolder(dir).catch(() => undefined);
     }
-    await vault.createBinary(full, buffer);
+    await writeWhole(stat, full, data.length, () => {
+      const made = lookup(this.app, full);
+      return made instanceof TFile ? vault.modifyBinary(made, buffer) : vault.createBinary(full, buffer);
+    });
   }
 
   /** Puts `version` in place of the file at vault path `path`, or brings it back if there is none; the next sync sends it, unless the place only receives. */

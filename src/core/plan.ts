@@ -52,6 +52,12 @@ export function planChanges(
     const base = s?.entry;
     const localTouched = l ? !s || s.lsize !== l.size || s.lmtime !== l.mtime : !!s;
     const remoteChanged = base ? !r || !sameContent(r, base) : !!r;
+    // An empty file recorded as the download of a version that has bytes: the write left nothing and said so to no one,
+    // as Obsidian on Android now and then does. Untouched since, it is downloaded again rather than kept as that version.
+    if (l && s && r && !localTouched && l.size === 0 && s.entry.size > 0) {
+      pulls.push(key);
+      return;
+    }
     if (!remoteChanged) {
       if (s && r) s.entry = r;
       if (!localTouched) return;

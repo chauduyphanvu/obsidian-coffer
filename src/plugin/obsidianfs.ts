@@ -1,7 +1,7 @@
 import { TFile, TFolder, Vault, getLinkpath, requestUrl, type App, type TAbstractFile } from 'obsidian';
 import { vaultKey } from '../core/paths.ts';
 import { PROPERTY, readAlready, type Catalog } from './byproperty.ts';
-import { loadState, removeState, saveState } from './statefile.ts';
+import { loadState, removeState, saveState, writeWhole } from './statefile.ts';
 import type { FolderFS } from '../core/scopedfs.ts';
 import type { FileStat, LocalFile, StateStore } from '../core/types.ts';
 import { splitContentType, uncachedHeaders, type Http } from '../stores/http.ts';
@@ -104,10 +104,15 @@ export class ObsidianFS implements FolderFS {
   async write(path: string, data: Uint8Array, mtime?: number): Promise<FileStat> {
     const adapter = this.app.vault.adapter;
     await this.makeFolders(path);
-    await adapter.writeBinary(path, toBuffer(data), mtime === undefined ? undefined : { mtime });
-    const s = await adapter.stat(path);
-    if (!s) throw new Error(`Could not write ${path}`);
-    return { size: s.size, mtime: s.mtime };
+    const buffer = toBuffer(data);
+    try {
+      const s = await writeWhole((p) => adapter.stat(p), path, data.length, () => adapter.writeBinary(path, buffer, mtime === undefined ? undefined : { mtime }));
+      return { size: s.size, mtime: s.mtime };
+    } catch (e) {
+      // What is there is neither the old file nor the new one: gone, the next sync downloads it again; left, it would be taken for an edit made here.
+      await adapter.remove(path).catch(() => undefined);
+      throw e;
+    }
   }
 
   async remove(path: string): Promise<void> {
