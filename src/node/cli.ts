@@ -13,6 +13,7 @@ import { listVersions } from '../core/retention.ts';
 import { errorText, plural } from '../core/text.ts';
 import { TooOldError, listActivity, listCommits, listDeleted, operationAt, planRestore, planUndo, tableAt, type Activity, type PastVault } from '../core/timeline.ts';
 import { inUse, linksIn } from '../core/view.ts';
+import { decodeCaptureKey, sendCapture } from '../core/capture.ts';
 import type { Entry, RemoteStore } from '../core/types.ts';
 import { changesOf, preparePublish, publishPrepared, summaryLines, type Prepared } from '../publish/publish.ts';
 import { activityRows, whoLabel, type Self } from '../plugin/activity.ts';
@@ -21,7 +22,7 @@ import { checkStore } from '../stores/doctor.ts';
 import { MemoryStore } from '../stores/memory.ts';
 import { openRemote } from '../stores/open.ts';
 import type { S3Config } from '../stores/s3.ts';
-import { KEYS_FILE, POSITION_FILE, STATE_FILE, credentialsFrom, joinWithLink, loadKeyFile, saveKeyFile, storageProblem, type Credentials, type KeyFile, type MemberRemote } from './member.ts';
+import { KEYS_FILE, POSITION_FILE, STATE_FILE, credentialsFrom, joinWithLink, loadKeyFile, placeOf, saveKeyFile, storageProblem, type Credentials, type KeyFile, type MemberRemote } from './member.ts';
 import { FileState, FolderStore, NodeFS } from './nodefs.ts';
 import { say, warn } from './out.ts';
 import { SyncLoop, watchVault } from './watch.ts';
@@ -63,6 +64,16 @@ const USAGE = `Usage: node coffer.js <command> [--config=coffer.json]
                          the link suggests, here. The other commands then work on it: a writing member sends
                          changes once the owner's device has confirmed it, a reading one and a follower only
                          receive
+  capture <file>... | capture - [--name=<path>]
+                         send notes to a shared folder with a send-only key, which its owner makes in Obsidian
+                         (Members, Invite someone, Only send notes). The key is read from COFFER_CAPTURE_KEY and
+                         needs no config file, no passphrase and no vault here: it can add notes and can read
+                         nothing. A note keeps its file name; --name gives one note another path in the folder,
+                         and is needed for a note read from standard input (-). Notes and canvases only, 1 MB
+                         each. What is sent waits for the owner's device, which adds it or asks the owner first
+  suggest [path]...      a member who reads and sends suggestions: sync, then send the notes changed here to the
+                         owner's device, which takes each in or leaves it out. Without paths, every note that
+                         sync says it did not send
   sync [--force] [--keep-days=N]
                          sync the vault once. --keep-days, with sync.deferAboveMB set: a file over that size is
                          kept on this device only while in use, which is changed in the last N days or linked
@@ -147,7 +158,7 @@ its own, never the vault's: COFFER_SITE_ACCESS_KEY and COFFER_SITE_SECRET_KEY fo
 WebDAV; a folder needs none.`;
 
 /** The options that take a value, as `--name=value` or `--name value`; every other option takes none. */
-const VALUED = ['config', 'poll', 'interval', 'limit', 'vault', 'at', 'keep-days'];
+const VALUED = ['config', 'poll', 'interval', 'limit', 'vault', 'at', 'keep-days', 'name'];
 
 /** Each command's options besides --config (and --help and --version, which stop any command). */
 const OPTIONS: Record<string, string[]> = {
@@ -155,6 +166,8 @@ const OPTIONS: Record<string, string[]> = {
   sync: ['force', 'keep-days'],
   fetch: [],
   evict: [],
+  capture: ['name'],
+  suggest: [],
   watch: ['poll', 'interval', 'publish'],
   check: [],
   status: ['json'],
@@ -407,6 +420,18 @@ async function applySteps(engine: SyncEngine, fs: NodeFS, v: RepoView, steps: St
 }
 
 type Sync = (options?: SyncOptions) => Promise<SyncResult>;
+
+/** What `suggest` sent the owner and the owner has not answered yet: each note's fingerprint, by path. */
+const suggestedFile = (vault: string) => join(vault, STATE_DIR, 'suggested.json');
+
+async function sentSuggestions(vault: string): Promise<Map<string, string>> {
+  try {
+    const kept: unknown = JSON.parse(await readFile(suggestedFile(vault), 'utf8'));
+    return new Map(Object.entries(kept as Record<string, unknown>).filter((e): e is [string, string] => typeof e[1] === 'string'));
+  } catch {
+    return new Map();
+  }
+}
 
 /** Where the removals of a restore or an undo wait when the sync that sends them failed. */
 const askedFile = (vault: string) => join(vault, STATE_DIR, 'asked-deletions.json');
@@ -781,6 +806,21 @@ async function main(): Promise<number> {
     return 2;
   }
   const configFile = flags.get('config') ?? 'coffer.json';
+  if (command === 'capture') {
+    if (!rest.length || (rest.includes('-') && rest.length > 1) || (flags.has('name') && rest.length > 1)) {
+      warn('capture takes the notes to send: capture <file>..., or capture - --name=<path> for one read from standard input; --name names a single note');
+      return 2;
+    }
+    const key = decodeCaptureKey(env('COFFER_CAPTURE_KEY'));
+    const named = flags.get('name')?.trim();
+    if (rest[0] === '-' && !named) throw new Error('a note read from standard input needs --name=<path>, its path in the shared folder, as --name="Inbox/idea.md"');
+    const notes = await Promise.all(rest.map(async (file) => ({ path: named || basename(file), text: file === '-' ? await readStdin() : await readFile(file, 'utf8') })));
+    const place = placeOf(key.storage);
+    await sendCapture(makeStore(place.remote, false, place.creds), key, notes, hostname().split('.')[0]);
+    for (const n of notes) say(`sent “${n.path}” to “${key.share}”`);
+    say('it is with the owner’s device now, which adds it to the folder or asks the owner first');
+    return 0;
+  }
   if (command === 'join') {
     const link = rest.length > 1 ? '' : rest[0] === '-' ? await readStdin() : (rest[0] ?? process.env.COFFER_LINK ?? '');
     if (!link.trim()) {
@@ -926,7 +966,13 @@ async function main(): Promise<number> {
   const syncNow = async (options?: SyncOptions) => {
     // Removals a restore or an undo made and could not send: still deletions the user asked for.
     const asked = await askedDeletions(vault);
-    const r = await engine.sync({ ...options, allowDeletes: [...(options?.allowDeletes ?? []), ...asked] });
+    // What this device sent the owner as suggestions: a note still as sent takes the owner's version, with no conflict copy.
+    const suggested = await sentSuggestions(vault);
+    const r = await engine.sync({ ...options, allowDeletes: [...(options?.allowDeletes ?? []), ...asked], ...(suggested.size && { suggested }) });
+    if (suggested.size) {
+      const still = new Map([...suggested].filter(([path]) => r.unsent.includes(path)));
+      if (still.size < suggested.size) await writeFile(suggestedFile(vault), JSON.stringify(Object.fromEntries(still)));
+    }
     if (asked.length) await rm(askedFile(vault), { force: true });
     await noteStanding();
     return r;
@@ -1078,6 +1124,43 @@ async function main(): Promise<number> {
     const r = await syncNow({ fetch: rest });
     report(r);
     return r.errors.length ? 1 : 0;
+  }
+  if (command === 'suggest') {
+    if (!member?.member.secret || member.member.key) {
+      warn('suggest is for a device that joined a shared folder to read and send suggestions; a device that may write sends its changes with sync');
+      return 1;
+    }
+    const r = await syncNow();
+    const paths = rest.length ? rest : r.unsent;
+    if (!paths.length) {
+      say('nothing to suggest: no note here differs from the shared folder');
+      return 0;
+    }
+    const before = await sentSuggestions(vault);
+    const out = await engine.sendSuggestion(paths, before).catch((e: unknown) => {
+      if (!/HTTP 40[13]\b|AccessDenied/.test(errorText(e))) throw e;
+      return undefined;
+    });
+    if (!out) {
+      warn('not sent: the storage key this device has may only read. Your changes stay here; the owner can send a new invite with a key that may also send suggestions');
+      return 1;
+    }
+    const why = {
+      kind: 'not a note or a canvas',
+      gone: 'not here',
+      large: 'over 1 MB',
+      binary: 'not text',
+      same: 'the same as in the shared folder',
+      sent: 'sent before, and not answered yet',
+      full: 'past what one suggestion holds: run suggest again for the rest',
+    };
+    for (const s of out.sent) say(`suggested to the owner: ${s.path}`);
+    for (const s of out.skipped) warn(`not sent: ${s.path}: ${why[s.why]}`);
+    if (out.sent.length) {
+      for (const s of out.sent) before.set(s.path, s.sum);
+      await writeFile(suggestedFile(vault), JSON.stringify(Object.fromEntries(before)));
+    }
+    return out.skipped.some((s) => s.why !== 'same' && s.why !== 'sent') ? 1 : 0;
   }
   if (command === 'evict' && rest.length) {
     const out = await engine.evict(rest);

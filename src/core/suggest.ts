@@ -20,7 +20,7 @@ const KINDS = new Set(['md', 'markdown', 'canvas']);
 export const SUGGEST_MAX_FILE = 1 << 20;
 /** The most text one suggestion carries in all. */
 export const SUGGEST_MAX_TOTAL = 4 << 20;
-const MAX_FILES = 500;
+export const SUGGEST_MAX_FILES = 500;
 /** More than the most a suggestion holds, sealed: anything larger is not opened, nor downloaded whole. */
 export const MAX_SEALED = SUGGEST_MAX_TOTAL * 2 + (1 << 20);
 /**
@@ -100,7 +100,7 @@ export async function openSuggestion(repo: string, secret: Uint8Array, key: stri
     throw bad();
   }
   if (!d || d.v !== 1 || d.m !== at.member || typeof d.t !== 'number' || typeof d.d !== 'string' || d.d.length > 200) throw bad();
-  if (!Array.isArray(d.f) || !d.f.length || d.f.length > MAX_FILES) throw bad();
+  if (!Array.isArray(d.f) || !d.f.length || d.f.length > SUGGEST_MAX_FILES) throw bad();
   const files: SuggestedFile[] = [];
   const seen = new Set<string>();
   let total = 0;

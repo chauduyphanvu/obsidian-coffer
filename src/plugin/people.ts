@@ -10,6 +10,8 @@ import {
   followNote,
   inviteNote,
   keysOf,
+  captureCommand,
+  captureNote,
   keysProblem,
   memberLine,
   memberError,
@@ -79,6 +81,8 @@ export class MembersModal extends Modal {
   private role: 'write' | 'read' = 'write';
   /** A read member who sends suggestions too: its key may also add them (`policy.ts`, readAndInbox), and re-keys hand it one that may. */
   private suggest = false;
+  /** A send-only key is being made: a member that adds notes and reads nothing (`Member.capture`). */
+  private capture = false;
   private days: number = 7;
   private read = noKeys();
   private link = '';
@@ -161,8 +165,17 @@ export class MembersModal extends Modal {
       const row = list.createDiv({ cls: 'coffer-device' });
       const text = row.createDiv({ cls: 'coffer-device-text' });
       const name = text.createDiv({ cls: 'coffer-device-name', text: m.name });
-      name.createSpan({ cls: 'coffer-device-tag', text: roleLabel(m.role, !!m.follow, !!m.suggest) });
+      name.createSpan({ cls: 'coffer-device-tag', text: roleLabel(m.role, !!m.follow, !!m.suggest, !!m.capture) });
       text.createDiv({ cls: 'coffer-device-meta', text: memberLine(m, now) });
+      if (m.capture) {
+        const on = !!this.share.autoAccept?.includes(m.id);
+        const b = button(row, on ? 'Adds straight to the folder' : 'You look first', async () => {
+          await this.plugin.setAutoAccept(this.share, m.id, !on);
+          this.render();
+        });
+        b.setTooltip(on ? 'New notes it sends are added to the folder as they arrive, beside a file of the same name and never over it. Tap to look at each one first.' : 'What it sends waits for you to take in or leave out. Tap to have new notes added to the folder as they arrive.');
+        b.setDisabled(this.busy);
+      }
       if (m.state === 'confirming') button(row, 'Confirm now', () => this.confirm(), 'cta').setDisabled(this.busy);
       if (!m.self && m.role !== 'owner') {
         button(row, 'Remove', () => {
@@ -178,6 +191,7 @@ export class MembersModal extends Modal {
       // People only read notes shared by a property, or read and suggest.
       this.role = this.share.property ? 'read' : 'write';
       this.suggest = false;
+      this.capture = false;
       this.days = 7;
       this.read = noKeys();
       this.link = '';
@@ -267,19 +281,35 @@ export class MembersModal extends Modal {
   private inviteView(): void {
     const c = this.contentEl;
     this.setTitle(`Invite someone to “${labelOf(this.share)}”`);
-    field(c, 'Name', { value: this.name, placeholder: 'Ann', hint: 'Shown in the member list, and to the others in this folder.' }, (v) => (this.name = v));
-    const roles: ['write' | 'read' | 'suggest', string][] = [['write', 'Edit files'], ['read', 'Only read'], ['suggest', 'Read and suggest']];
-    pick<'write' | 'read' | 'suggest'>(c, 'They can', this.share.property ? roles.slice(1) : roles, this.suggest ? 'suggest' : this.role, (v) => {
+    field(c, 'Name', { value: this.name, placeholder: this.capture ? 'Web clipper' : 'Ann', hint: 'Shown in the member list, and to the others in this folder.' }, (v) => (this.name = v));
+    type Can = 'write' | 'read' | 'suggest' | 'capture';
+    const roles: [Can, string][] = [['write', 'Edit files'], ['read', 'Only read'], ['suggest', 'Read and suggest'], ['capture', 'Only send notes']];
+    // People only read notes shared by a property, or read and suggest.
+    pick<Can>(c, 'They can', this.share.property ? roles.slice(1, 3) : roles, this.capture ? 'capture' : this.suggest ? 'suggest' : this.role, (v) => {
       this.role = v === 'write' ? 'write' : 'read';
       this.suggest = v === 'suggest';
+      this.capture = v === 'capture';
       this.error = '';
       this.render();
     });
-    pick(c, 'The invite works for', INVITE_DAYS.map((d): [number, string] => [d, d === 1 ? '1 day' : `${d} days`]), this.days, (v) => {
-      this.days = v;
-      this.render();
-    });
-    if (this.role === 'read') {
+    if (this.capture) {
+      c.createEl('p', {
+        cls: 'coffer-intro',
+        text:
+          'A send-only key, for a script, an agent or a person who should add notes here and read nothing. It never gets the key that decrypts this folder. ' +
+          'Make a key at your storage provider that can only add files to the inbox of this folder, and enter it here. What it sends waits for you to look at, unless you set it to be added straight away.',
+      });
+      policyBox(c, sharePolicy(this.share, 'inboxOnly'));
+      keyFields(c, this.share, this.read, 'Send-only');
+    } else {
+      pick(c, 'The invite works for', INVITE_DAYS.map((d): [number, string] => [d, d === 1 ? '1 day' : `${d} days`]), this.days, (v) => {
+        this.days = v;
+        this.render();
+      });
+    }
+    if (this.capture) {
+      // Said above.
+    } else if (this.role === 'read') {
       c.createEl('p', {
         cls: 'coffer-intro',
         text: this.suggest
@@ -295,18 +325,19 @@ export class MembersModal extends Modal {
     message(c, this.error);
     const row = buttonRow(c);
     button(row, 'Back', () => this.go('list')).setDisabled(this.busy);
-    button(row, this.busy ? 'Making the link…' : 'Make the link', () => this.makeInvite(), 'cta').setDisabled(this.busy);
+    const make = this.capture ? 'Make the key' : 'Make the link';
+    button(row, this.busy ? (this.capture ? 'Making the key…' : 'Making the link…') : make, () => this.makeInvite(), 'cta').setDisabled(this.busy);
   }
 
   private async makeInvite(): Promise<void> {
     const name = this.name.trim();
     const own = keysOf(this.share, (n) => this.plugin.secret(n));
-    this.error = !name ? 'Enter their name.' : this.role !== 'read' ? '' : readKeyProblem(this.share.storageType, this.read, own, this.suggest);
+    this.error = !name ? (this.capture ? 'Give the key a name, such as what will use it.' : 'Enter their name.') : this.role !== 'read' ? '' : readKeyProblem(this.share.storageType, this.read, own, this.suggest, this.capture);
     if (this.error) return this.render();
     this.busy = true;
     this.render();
     try {
-      const made = await this.plugin.invite(this.share, { name, role: this.role, days: this.days, ...(this.role === 'read' && { read: trimKeys(this.read), suggest: this.suggest }) });
+      const made = await this.plugin.invite(this.share, { name, role: this.role, days: this.days, ...(this.role === 'read' && { read: trimKeys(this.read), suggest: this.suggest, capture: this.capture }) });
       this.link = made.link;
       this.expires = made.expires;
       this.members = undefined;
@@ -321,6 +352,21 @@ export class MembersModal extends Modal {
   /** The invite just made. It is in the member list already, so this screen only copies it. */
   private linkView(): void {
     const c = this.contentEl;
+    if (this.capture) {
+      this.setTitle(`Send-only key “${this.name.trim()}”`);
+      this.intro(captureNote(this.name));
+      c.createEl('p', { cls: 'coffer-hint', text: 'With the command line (coffer.js), a note is sent like this. The key goes in COFFER_CAPTURE_KEY, and a note can come from a file or from standard input:' });
+      c.createEl('pre', { cls: 'coffer-policy-text', text: 'COFFER_CAPTURE_KEY=… node coffer.js capture note.md\necho "Call the dentist" | COFFER_CAPTURE_KEY=… node coffer.js capture - --name="Inbox/dentist.md"' });
+      message(c, this.error);
+      const keyRow = buttonRow(c);
+      button(keyRow, 'Back to members', () => {
+        this.go('list');
+        this.load();
+      });
+      button(keyRow, 'Copy the command with the key', () => void copy(captureCommand(this.link), 'Command copied. It holds the key: paste it only where the key belongs.'));
+      button(keyRow, 'Copy the key', () => void copy(this.link, 'Key copied.'), 'cta');
+      return;
+    }
     this.setTitle(`Invite for ${this.name.trim()}`);
     this.intro(inviteNote(this.name, this.role, this.expires));
     message(c, this.error);
@@ -374,6 +420,10 @@ export class MembersModal extends Modal {
       const what = c.createEl('ul', { cls: 'coffer-what' });
       what.createEl('li', { text: 'Whoever kept the link can still read everything at the public address, now and later. New storage keys do not change that.' });
       what.createEl('li', { text: 'To cut them off, make the address private and start a new shared folder.' });
+    } else if (m.capture) {
+      this.intro(`Notes sent with the key “${m.name}” are no longer added to “${labelOf(this.share)}”, and can not be opened. What it added before stays.`);
+      const what = c.createEl('ul', { cls: 'coffer-what' });
+      what.createEl('li', { text: 'The storage key you made for it can still put files in the inbox until you delete that key at your storage provider. New storage keys for everyone do not change that.' });
     } else {
       this.intro(`${m.name}’s devices stop syncing “${labelOf(this.share)}” at their next sync, and their invite stops working. What they changed before stays.`);
       const what = c.createEl('ul', { cls: 'coffer-what' });
@@ -402,7 +452,8 @@ export class MembersModal extends Modal {
       return;
     }
     // A follow link carried no storage keys, so new ones change nothing for it; a reminder about someone removed before stays.
-    if (!m.follow) this.removed = `${m.name} was removed. To stop the storage keys they had from working, give everyone new storage keys.`;
+    if (m.capture) new Notice(`The send-only key “${m.name}” was removed. Delete its storage key at your storage provider, too.`, 10_000);
+    else if (!m.follow) this.removed = `${m.name} was removed. To stop the storage keys they had from working, give everyone new storage keys.`;
     if (m.follow) new Notice(`${m.name} was removed: the follow link opens nothing new.`);
     this.members = this.members?.filter((x) => x.id !== m.id);
     this.go('list');
@@ -477,7 +528,7 @@ export class RekeyModal extends Modal {
     this.plugin.members(this.share).then(
       (m) => {
         // A follow link's member is handed no keys: it reads the public copy.
-        const readers = m.filter((x) => x.role === 'read' && !x.follow);
+        const readers = m.filter((x) => x.role === 'read' && !x.follow && !x.capture);
         this.readers = readers.filter((x) => !x.suggest).map((x) => x.name);
         this.suggesters = readers.filter((x) => x.suggest).map((x) => x.name);
         this.caveat = followCaveat(m);

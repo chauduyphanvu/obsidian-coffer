@@ -10,11 +10,12 @@ export type PolicyProvider = 'aws' | 'b2' | 'r2' | 's3' | 'webdav';
 
 /**
  * readWrite: a device that syncs. readOnly: a device that only receives. readAndInbox: receives, and may add files
- * under inbox/ for suggestions. publicRead: anyone with the address may download files, for a follow link.
+ * under inbox/ for suggestions. inboxOnly: may only add files under inbox/, for a send-only key. publicRead: anyone with
+ * the address may download files, for a follow link.
  */
-export type PolicyKind = 'readWrite' | 'readOnly' | 'readAndInbox' | 'publicRead';
+export type PolicyKind = 'readWrite' | 'readOnly' | 'readAndInbox' | 'inboxOnly' | 'publicRead';
 
-export const POLICY_KINDS: readonly PolicyKind[] = ['readWrite', 'readOnly', 'readAndInbox', 'publicRead'];
+export const POLICY_KINDS: readonly PolicyKind[] = ['readWrite', 'readOnly', 'readAndInbox', 'inboxOnly', 'publicRead'];
 
 export interface PolicyTarget {
   provider: PolicyProvider;
@@ -56,6 +57,7 @@ const TITLES: Record<PolicyKind, string> = {
   readWrite: 'Read and write this folder only',
   readOnly: 'Read only',
   readAndInbox: 'Read, and send suggestions',
+  inboxOnly: 'Only send notes',
   publicRead: 'Anyone with the link can read',
 };
 
@@ -114,6 +116,16 @@ function s3(aws: boolean, bucket: string, folder: string, kind: PolicyKind): Mad
         steps(`read ${where(folder)} and add files to its inbox folder, nothing more`),
         policy(list, { Effect: 'Allow', Action: 's3:GetObject', Resource: objects() }, { Effect: 'Allow', Action: 's3:PutObject', Resource: objects('inbox/') }),
       );
+    case 'inboxOnly':
+      // The condition allows only a write that replaces nothing (the If-None-Match every send carries), so a note waiting
+      // in the inbox can not be overwritten. A service that does not know it refuses the policy or every write with it,
+      // which the owner sees at once; the weaker rule is then theirs to choose, knowingly.
+      return yes(
+        aws
+          ? steps(`add files to the inbox of ${where(folder)} and nothing else: it can not read, list, replace or delete anything`)
+          : `${lead}; the key can add files to the inbox of ${where(folder)} and nothing else. If your service refuses this policy, or the key can not add to the inbox, take out the Condition part: the key could then replace a note waiting in the inbox if it knew the file's name.`,
+        policy({ Effect: 'Allow', Action: 's3:PutObject', Resource: objects('inbox/'), Condition: { Null: { 's3:if-none-match': 'false' } } }),
+      );
     case 'publicRead':
       return yes(
         aws
@@ -144,6 +156,11 @@ function b2(bucket: string, folder: string, kind: PolicyKind): Made {
         'Backblaze can not do this: a key has one file name prefix and one type of access, so it can not read this folder and write only to its inbox. ' +
           'Give this person a read only key and leave suggestions off, or a read and write key, which can also change and delete what is stored.',
       );
+    case 'inboxOnly':
+      return yes(
+        `${key} The key can add files to the inbox of ${where(folder)} and nothing else.`,
+        [`Allow access to buckets: ${bucket}`, 'Type of access: Write Only', `File name prefix: ${folder ? `${folder}/` : ''}inbox/`, 'Capabilities, if you choose them yourself: writeFiles'].join('\n'),
+      );
     case 'publicRead':
       return folder
         ? no('Backblaze makes a whole bucket public, never one folder. Keep this shared folder in a bucket of its own, set to Public, and share the address of that bucket.')
@@ -168,6 +185,11 @@ function r2(bucket: string, folder: string, kind: PolicyKind): Made {
       return no(
         'Cloudflare R2 can not do this: a token reads or writes a whole bucket, never one folder in it. ' +
           'Give this person a read only token and leave suggestions off, or a read and write token for a bucket of its own, which can also change and delete what is stored.',
+      );
+    case 'inboxOnly':
+      return no(
+        'Cloudflare R2 can not do this: a token reads or writes a whole bucket, never one folder in it. ' +
+          'A send-only key made with a read and write token still can not read any note, since it never holds the key that decrypts them, but it could delete or overwrite what is stored.',
       );
     case 'publicRead':
       return folder
@@ -195,6 +217,11 @@ function webdav(kind: PolicyKind): Made {
       return no(
         'A WebDAV login reaches the whole folder it is given, so it can not read the folder and write only to its inbox. ' +
           'Give this person a read only user and leave suggestions off, or a user who can edit the folder, which can also change and delete what is stored.',
+      );
+    case 'inboxOnly':
+      return no(
+        'A WebDAV login reaches the whole folder it is given, so it can not be limited to adding files to the inbox. ' +
+          'A send-only key made with it still can not read any note, since it never holds the key that decrypts them, but it could delete or overwrite what is stored.',
       );
     case 'publicRead':
       return no(

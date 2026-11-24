@@ -130,11 +130,11 @@ async function refuseWriting(store: RemoteStore): Promise<void> {
  * What is wrong with the keys typed for a read invite, or '': `own` are the keys this device writes with. `suggest`:
  * the invite is to read and send suggestions, whose key may also add to the inbox.
  */
-export function readKeyProblem(type: Storage['storageType'], read: KeySet, own: KeySet, suggest: boolean): string {
+export function readKeyProblem(type: Storage['storageType'], read: KeySet, own: KeySet, suggest: boolean, sendOnly = false): string {
   const missing = keysProblem(type, read);
   if (missing) return missing;
   if (!sameKeySet(type, read, own)) return '';
-  return `That is the key this device writes with. Make another one that can ${suggest ? 'read and add suggestions' : 'only read'}.`;
+  return `That is the key this device writes with. Make another one that can ${sendOnly ? 'only add files to the inbox' : suggest ? 'read and add suggestions' : 'only read'}.`;
 }
 
 /**
@@ -219,7 +219,8 @@ export const isUsedError = (e: unknown) => /already used/i.test(errorText(e));
  * A role in a few words, as a shared folder's row and the member list show it. A follow link's member, or a followed
  * folder, `follows`; a read member invited to send suggestions `suggests`.
  */
-export function roleLabel(role: '' | Role | undefined, follows = false, suggests = false): string {
+export function roleLabel(role: '' | Role | undefined, follows = false, suggests = false, sendsOnly = false): string {
+  if (sendsOnly) return 'Only sends notes';
   if (follows) return 'Follow link';
   if (role === 'read' && suggests) return 'Can read and suggest';
   return role === 'owner' ? 'Owner' : role === 'write' ? 'Can edit' : role === 'read' ? 'Can only read' : '';
@@ -297,7 +298,9 @@ const moment = (time: number) => new Date(time).toLocaleString([], { day: 'numer
 export function memberLine(m: MemberStatus, now: number): string {
   const until = m.expires ? day(m.expires) : '';
   let state: string;
-  if (m.follow) {
+  if (m.capture) {
+    state = 'A send-only key: it adds notes and reads nothing';
+  } else if (m.follow) {
     state = m.state === 'expired' ? 'The link opens nothing new. Devices that followed before keep reading.' : 'Anyone with the link can read';
   } else {
     switch (m.state) {
@@ -325,6 +328,36 @@ export function inviteNote(name: string, role: 'write' | 'read', expires: number
   return role === 'write'
     ? `Send this link to ${who} privately: it is all they need, with no passphrase. It works for one device: once your device confirms the one that joined, it stops working. Unused, it stops working on ${day(expires)}.`
     : `Send this link to ${who} privately: it is all they need, with no passphrase. Their devices only receive changes. It works until ${day(expires)} on any device that opens it, unless you remove ${who} before.`;
+}
+
+/** What a send-only key is, said where it is copied. */
+export const captureNote = (name: string) =>
+  `Give this key to ${name.trim() || 'the script'} and to nothing else. Whoever holds it can add notes to this folder and can read none of it. It works until you remove it from the member list.`;
+
+/** The command that sends a note with a send-only key, for the owner to copy: the key goes in the environment, where other users of the computer do not see it. */
+export const captureCommand = (key: string) => `COFFER_CAPTURE_KEY='${key}' node coffer.js capture note.md`;
+
+/**
+ * Checks keys for a send-only key: `limited` must add to the inbox, and where the provider can limit a key to that
+ * (`mustNotRead`), must not read the folder. What the check added is removed with `own`, the keys this device writes with.
+ */
+export async function testSendOnlyKeys(limited: RemoteStore, own: RemoteStore, mustNotRead: boolean): Promise<void> {
+  const probe = `inbox/key-check-${Math.random().toString(36).slice(2, 10)}`;
+  try {
+    // As a note is sent: a write that replaces nothing, which is all a key held to that may do.
+    await limited.put(probe, new Uint8Array([1]), { ifNoneMatch: true });
+  } catch (e) {
+    throw new Error(`These keys can not add to the inbox of this folder: ${errorText(e)}`);
+  }
+  await own.delete(probe).catch(() => undefined);
+  if (!mustNotRead) return;
+  let reads = false;
+  try {
+    reads = !!(await limited.get('vault.json'));
+  } catch {
+    // Refused, as it should be.
+  }
+  if (reads) throw new Error('These keys can read the folder. Make a key that can only add files to its inbox.');
 }
 
 /** How long a re-key that did not work here waits before it is tried again: new keys can take a while to work at a provider. */

@@ -12,6 +12,7 @@ import { resolveConfig } from '../src/core/config.ts';
 import { listDevices } from '../src/core/devices.ts';
 import { SafetyError, SyncEngine, type SyncResult } from '../src/core/engine.ts';
 import { decodeInvite, encodeFollow, encodeInvite } from '../src/core/members.ts';
+import { encodeCaptureKey } from '../src/core/capture.ts';
 import { createMemberShare } from '../src/core/membership.ts';
 import { seqKey } from '../src/core/repo.ts';
 import type { RemoteStore } from '../src/core/types.ts';
@@ -1460,7 +1461,8 @@ const MEMBER_ENV = { COFFER_PASSPHRASE: '', COFFER_ACCESS_KEY: '', COFFER_SECRET
 
 /** A WebDAV server over `root`. `seen` lists each request with the account that made it ('' for none); with `publicRead`, anyone may GET. */
 async function davServer(root: string) {
-  const accounts = new Map<string, { password: string; write: boolean }>();
+  /** `inboxOnly`: the account may add files under inbox/ and do nothing else, as a provider's key for a send-only key. */
+  const accounts = new Map<string, { password: string; write: boolean; inboxOnly?: boolean }>();
   const seen: { user: string; method: string; key: string }[] = [];
   const state = { publicRead: false };
   const server = createServer((req, res) => {
@@ -1478,6 +1480,7 @@ async function davServer(root: string) {
         res.end(data);
       };
       if (!user && !(method === 'GET' && state.publicRead)) return reply(401);
+      if (accounts.get(user)?.inboxOnly && !((method === 'PUT' && key.startsWith('inbox/')) || (method === 'MKCOL' && key === 'inbox'))) return reply(403);
       if (method !== 'GET' && method !== 'PROPFIND' && !accounts.get(user)?.write) return reply(403);
       if (method === 'GET') {
         if (!existsSync(file) || !statSync(file).isFile()) return reply(404);
@@ -1567,6 +1570,111 @@ function watching(args: string[], env: Record<string, string>) {
 }
 
 const WAITING = "waiting for Vu's device to confirm this device; until then it only receives";
+
+test('cli capture: a send-only key adds notes from a file and from standard input with writes to the inbox alone, and reads nothing', async () => {
+  const h = await memberHarness();
+  try {
+    h.dav.accounts.set('clipper', { password: 'c-pw', write: true, inboxOnly: true });
+    const grant = await h.owner.engine.invite({ name: 'Clipper', role: 'read', expires: 0, capture: true });
+    const key = encodeCaptureKey({ repo: grant.repo, member: grant.member, secret: grant.secret, storage: { storageType: 'webdav', webdavUrl: h.dav.url, webdavUser: 'clipper', webdavPassword: 'c-pw' }, share: 'Family' });
+    const env = { ...MEMBER_ENV, COFFER_CAPTURE_KEY: key };
+    const note = join(h.dir, 'call the dentist.md');
+    writeFileSync(note, 'Call the dentist\n');
+
+    const sent = await bareAsync(['capture', note], env, h.dir);
+    assert.equal(sent.status, 0, sent.stderr);
+    assert.equal(sent.stdout, 'sent “call the dentist.md” to “Family”\nit is with the owner’s device now, which adds it to the folder or asks the owner first\n');
+    const piped = await bareAsync(['capture', '-', '--name=Inbox/idea.md'], env, h.dir, 'An idea\n');
+    assert.equal(piped.status, 0, piped.stderr);
+    assert.match(piped.stdout, /^sent “Inbox\/idea\.md” to “Family”\n/);
+
+    const made = h.dav.seen.filter((r) => r.user === 'clipper');
+    assert.ok(made.length >= 2 && made.every((r) => (r.method === 'PUT' && r.key.startsWith('inbox/')) || (r.method === 'MKCOL' && r.key === 'inbox')), JSON.stringify(made));
+    assert.ok(!existsSync(join(h.dir, 'coffer.json')), 'no config file, no vault here');
+
+    const waiting = (await h.owner.engine.suggestions()).items;
+    assert.deepEqual(waiting.map((w) => [w.name, w.suggestion?.files.map((f) => [f.path, f.text])]).sort(), [
+      ['Clipper', [['Inbox/idea.md', 'An idea\n']]],
+      ['Clipper', [['call the dentist.md', 'Call the dentist\n']]],
+    ]);
+
+    for (const [args, input, want] of [
+      [['capture', '-'], 'x', /a note read from standard input needs --name=<path>/],
+      [['capture', join(h.dir, 'missing.md')], undefined, /ENOENT|no such file/],
+      [['capture', note, '--name=photo.png'], undefined, /not a note or a canvas/],
+      [['capture'], undefined, /capture takes the notes to send/],
+    ] as const) {
+      const r = await bareAsync([...args], env, h.dir, input);
+      assert.notEqual(r.status, 0);
+      assert.match(r.stderr, want);
+    }
+    const noKey = await bareAsync(['capture', note], MEMBER_ENV, h.dir);
+    assert.notEqual(noKey.status, 0);
+    assert.match(noKey.stderr, /COFFER_CAPTURE_KEY/);
+    const wrong = await bareAsync(['capture', note], { ...MEMBER_ENV, COFFER_CAPTURE_KEY: await h.link('Ann', 'read') }, h.dir);
+    assert.match(wrong.stderr, /not a send-only key/);
+  } finally {
+    h.done();
+  }
+});
+
+test('cli suggest: a member who reads sends a changed note to the owner once, and takes the owner’s answer without a conflict copy', async () => {
+  const h = await memberHarness();
+  try {
+    h.owner.fs.put('plan.md', 'v1\n');
+    await h.owner.sync();
+    const grant = await h.owner.engine.invite({ name: 'Mai', role: 'read', expires: h.clock.now + 7 * DAY, suggest: true });
+    const mai = h.device('mai');
+    const joined = await mai.join(encodeInvite({ ...grant, storage: { storageType: 'webdav', webdavUrl: h.dav.url, webdavUser: 'writer', webdavPassword: 'w-pw' }, share: 'Family', folder: 'Family' }));
+    assert.equal(joined.status, 0, joined.stderr);
+    assert.equal((await mai.run(['sync'])).status, 0);
+
+    assert.equal((await mai.run(['suggest'])).stdout, 'nothing to suggest: no note here differs from the shared folder\n');
+    writeFileSync(join(mai.vault, 'plan.md'), 'v1\nand a line from Mai\n');
+    const sent = await mai.run(['suggest']);
+    assert.equal(sent.status, 0, sent.stderr);
+    assert.match(sent.stdout, /suggested to the owner: plan\.md\n$/);
+    const [item] = (await h.owner.engine.suggestions()).items;
+    assert.equal(item.name, 'Mai');
+    assert.equal(item.suggestion?.files[0].text, 'v1\nand a line from Mai\n');
+    assert.ok(item.suggestion?.files[0].base, 'with the version it was changed from');
+
+    const again = await mai.run(['suggest']);
+    assert.equal(again.status, 0);
+    assert.match(again.stderr, /not sent: plan\.md: sent before, and not answered yet/);
+    assert.equal((await h.owner.engine.suggestions()).items.length, 1);
+
+    h.owner.fs.put('plan.md', 'v1\nand a line from Mai\nthanks, taken\n');
+    await h.owner.sync();
+    const after = await mai.run(['sync']);
+    assert.equal(after.status, 0, after.stderr);
+    assert.equal(readFileSync(join(mai.vault, 'plan.md'), 'utf8'), 'v1\nand a line from Mai\nthanks, taken\n');
+    assert.deepEqual(readdirSync(mai.vault).filter((n) => n.includes('conflict')), []);
+  } finally {
+    h.done();
+  }
+});
+
+test('cli suggest: with a key that may only read, it says so and does not tell the member to join again', async () => {
+  const h = await memberHarness();
+  try {
+    h.owner.fs.put('plan.md', 'v1\n');
+    await h.owner.sync();
+    const grant = await h.owner.engine.invite({ name: 'Mai', role: 'read', expires: h.clock.now + 7 * DAY, suggest: true });
+    const mai = h.device('mai');
+    const joined = await mai.join(encodeInvite({ ...grant, storage: { storageType: 'webdav', webdavUrl: h.dav.url, webdavUser: 'reader', webdavPassword: 'r-pw' }, share: 'Family', folder: 'Family' }));
+    assert.equal(joined.status, 0, joined.stderr);
+    assert.equal((await mai.run(['sync'])).status, 0);
+    writeFileSync(join(mai.vault, 'plan.md'), 'v1\nand a line from Mai\n');
+    const sent = await mai.run(['suggest']);
+    assert.equal(sent.status, 1);
+    assert.match(sent.stderr, /not sent: the storage key this device has may only read/);
+    assert.doesNotMatch(sent.stderr, /join|delete/);
+    assert.equal(readFileSync(join(mai.vault, 'plan.md'), 'utf8'), 'v1\nand a line from Mai\n');
+  } finally {
+    h.done();
+  }
+});
 
 test("cli join: a write invite writes a config with no secret in it and keys only its owner can read, waits for the owner's device, then sends signed changes", async () => {
   const h = await memberHarness();

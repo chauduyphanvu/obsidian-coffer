@@ -1,5 +1,6 @@
 import { Notice, Platform, Plugin, TFile, TFolder, TextFileView, debounce, setIcon, type SecretStorage } from 'obsidian';
-import { pool } from '../core/bytes.ts';
+import { pool, utf8 } from '../core/bytes.ts';
+import { encodeCaptureKey, numbered } from '../core/capture.ts';
 import { DEFAULT_CONFIG, compileExcludes, type SyncConfig } from '../core/config.ts';
 import { forgetDevice, heartbeatDue, writeHeartbeat, type Beat } from '../core/devices.ts';
 import {
@@ -24,6 +25,7 @@ import { createMemberShare, joinShare } from '../core/membership.ts';
 import { ext, fileName, vaultKey } from '../core/paths.ts';
 import type { Repo } from '../core/repo.ts';
 import { LocalState } from '../core/state.ts';
+import { INBOX } from '../core/suggest.ts';
 import { errorText, firstSentence, plural } from '../core/text.ts';
 import { operationAt, planRestore, planUndo, type DeletedFile, type Operation } from '../core/timeline.ts';
 import type { Entry, RemoteStore, Version } from '../core/types.ts';
@@ -35,7 +37,7 @@ import { arrivalLine, type Self } from './activity.ts';
 import { ChangeLog, fromEvents, type Why } from './changes.ts';
 import { chooseDeferred } from './deferred.ts';
 import { InUse } from './inuse.ts';
-import { checkFollowAddress, expiresIn, followRekey, isUsedError, joinWithInvite, keysOf, mustNotWrite, rekey, rekeySkip, rekeyTest, standingHere, testKeys, withKeys, type KeySet, type RekeyFailure } from './members.ts';
+import { checkFollowAddress, expiresIn, followRekey, isUsedError, joinWithInvite, keysOf, mustNotWrite, rekey, rekeySkip, rekeyTest, sharePolicy, standingHere, testKeys, testSendOnlyKeys, withKeys, type KeySet, type RekeyFailure } from './members.ts';
 import { forgetGone, isOffered, lookForOffers, offerKey, offersDue, offersHere, offersIn, offersOf, publishOffer, withdrawOffers, type Offer, type OfferCache } from './offers.ts';
 import { OtherSenderError, PropertyFS, isAttachment, isNote, inviteProblem, joinProblem, keptText, noteInShare, onlyShownBy, newEmbeds, otherSender, propertyProblems, sendProblem, sentNotesText, settleChoices, startProblem, unmarkedText, unusedText, withShare, withoutShare, writeProblem, type Survey } from './byproperty.ts';
 import { RemoveModal, WhatsSharedModal } from './byproperty-ui.ts';
@@ -189,6 +191,8 @@ interface Tracked {
   /** The owner's devices: how many suggestions wait in storage, and when that was last looked at. */
   suggestions?: number;
   inboxLooked?: number;
+  /** Suggestions from send-only keys that hold nothing more to add by itself, so they are not downloaded at every look. */
+  inboxLeft?: Set<string>;
 }
 
 /** `true` lets the vault's sync delete many files; a share's id lets that shared folder's. */
@@ -1071,13 +1075,23 @@ export default class CofferPlugin extends Plugin {
     return r;
   }
 
-  /** Owner: counts the suggestions waiting for `share`, for its row. One listing; best effort. */
+  /**
+   * Owner: counts the suggestions waiting for `share`, for its row, after taking in what send-only keys set to add
+   * straight away have sent. Says so when more wait than before. One listing when nothing is there; best effort.
+   */
   private async lookInbox(share: Share): Promise<void> {
     const t = this.tracked(share);
     t.inboxLooked = Date.now();
     try {
-      const n = (await this.getEngine(share).inbox()).length;
+      const engine = this.getEngine(share);
+      let keys = await engine.inbox();
+      // Only when a key set to add straight away has sent something not looked at yet. The inbox is opened some at a
+      // time (`INBOX_OPENED`): carry on while a pass still adds notes, so a burst does not leave the rest to be announced as waiting.
+      const fresh = () => keys.some((key) => !t.inboxLeft?.has(key) && share.autoAccept?.some((id) => key.startsWith(`${INBOX}${id}-`)));
+      for (let pass = 0; pass < 5 && fresh() && (await this.takeCaptured(share)); pass++) keys = await engine.inbox();
+      const n = keys.length;
       if (n === t.suggestions) return;
+      if (n > (t.suggestions ?? 0)) new Notice(`${plural(n, 'suggestion')} for “${labelOf(share)}” ${n === 1 ? 'waits' : 'wait'} for you to look at. Sync status lists them.`, 10_000);
       t.suggestions = n;
       this.updateStatus();
     } catch {
@@ -1637,11 +1651,18 @@ export default class CofferPlugin extends Plugin {
    * to add suggestions, which marks the member as one who sends them), tested first; a write invite carries this
    * device's own. Returns the link, ready to copy.
    */
-  async invite(share: Share, o: { name: string; role: 'write' | 'read'; days: number; read?: KeySet; suggest?: boolean }): Promise<{ link: string; expires: number }> {
+  async invite(share: Share, o: { name: string; role: 'write' | 'read'; days: number; read?: KeySet; suggest?: boolean; capture?: boolean }): Promise<{ link: string; expires: number }> {
     const refused = inviteProblem(share, o.role);
     if (refused) throw new Error(refused);
     const keys = this.memberKeysOf(share);
     const reach = o.role === 'read' ? withKeys(share, o.read!) : { storage: share, secret: this.lookup };
+    if (o.capture) {
+      if (share.property || o.role !== 'read') throw new Error('A send-only key adds notes to a shared folder.');
+      await testSendOnlyKeys(this.storeWith(share, o.read!), this.storeWith(share, keysOf(share, this.lookup)), sharePolicy(share, 'inboxOnly').possible);
+      const grant = await this.exclusive('Making a send-only key…', () => this.getEngine(share).invite({ name: o.name, role: 'read', expires: 0, capture: true }));
+      const key = encodeCaptureKey({ repo: grant.repo, member: grant.member, secret: grant.secret, storage: storagePayload(reach.storage, reach.secret), share: fileName(share.folder) });
+      return { link: key, expires: 0 };
+    }
     if (o.role === 'read') await testKeys(this.storeWith(share, o.read!), { repo: keys.repo, write: false, onlyRead: mustNotWrite(share, !!o.suggest), storageType: share.storageType });
     const expires = expiresIn(o.days, Date.now());
     const suggest = o.role === 'read' && !!o.suggest;
@@ -1809,6 +1830,75 @@ export default class CofferPlugin extends Plugin {
     await this.writeFile(share, at, data);
     await this.settleSuggested(share, key, suggested);
     return true;
+  }
+
+  /**
+   * Owner: adds the new notes that send-only keys in `share.autoAccept` have sent to the folder, each beside a file
+   * of its name and never over it, and takes them out of the inbox. A change to a file that exists stays there to be
+   * looked at, as every other member's suggestion does. Returns how many notes it added.
+   */
+  private async takeCaptured(share: Share): Promise<number> {
+    const engine = this.getEngine(share);
+    const t = this.tracked(share);
+    const left = (t.inboxLeft ??= new Set());
+    const added: string[] = [];
+    const from = new Set<string>();
+    const failed: string[] = [];
+    // By lower-cased path, as most devices keep one file for names that differ only in case.
+    let here: Map<string, string> | undefined;
+    for (const item of (await engine.suggestions({ members: new Set(share.autoAccept), skip: left })).items) {
+      const s = item.suggestion;
+      let stays = !s;
+      for (const f of s?.files ?? []) {
+        if (f.base) {
+          stays = true;
+          continue;
+        }
+        try {
+          here ??= new Map([...(await this.localPaths(share)).values()].map((p) => [p.toLowerCase(), p]));
+          // The first free name; or a file that holds this very text already: added by a run that stopped ahead of
+          // taking it out of the inbox, or sent twice because the sender's first try got no answer.
+          let at = f.path;
+          let same = false;
+          for (let n = 2; ; n++) {
+            const there = here.get(at.toLowerCase());
+            if (there === undefined) break;
+            const file = lookup(this.app, vaultPath(share, there));
+            same = file instanceof TFile && (await this.app.vault.read(file)) === f.text;
+            if (same) break;
+            at = numbered(f.path, n);
+          }
+          if (!same) {
+            await this.writeFile(share, at, utf8.encode(f.text));
+            here.set(at.toLowerCase(), at);
+          }
+          await engine.settleSuggestion(s!.key, f.path);
+          added.push(vaultPath(share, at));
+          from.add(item.name ?? 'A send-only key');
+        } catch {
+          // One note this device can not write, a name it does not allow for one, does not hold up the rest.
+          stays = true;
+          failed.push(`“${f.path}”`);
+        }
+      }
+      if (stays) left.add(item.key);
+    }
+    if (added.length) {
+      new Notice(`${[...from].join(', ')} added ${added.length === 1 ? `“${added[0]}”` : `${plural(added.length, 'note')} to “${labelOf(share)}”`}.`, 8000);
+    }
+    if (failed.length) {
+      new Notice(`This device could not write ${failed.length === 1 ? failed[0] : `${plural(failed.length, 'note')}, the first ${failed[0]},`} into “${labelOf(share)}”. ${failed.length === 1 ? 'It waits' : 'They wait'} with the suggestions.`, 12_000);
+    }
+    return added.length;
+  }
+
+  /** Owner: sets whether what send-only key `member` of `share` sends is added to the folder as it arrives. */
+  async setAutoAccept(share: Share, member: string, on: boolean): Promise<void> {
+    const rest = (share.autoAccept ?? []).filter((id) => id !== member);
+    share.autoAccept = on ? [...rest, member] : rest;
+    this.tracked(share).inboxLeft = undefined;
+    // Not `saveSettings`, which makes every engine again.
+    await this.saveData(this.settings);
   }
 
   /** Owner: file `path` of suggestion `key` was dealt with, taken in or left out. */

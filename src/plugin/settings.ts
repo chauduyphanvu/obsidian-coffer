@@ -34,6 +34,11 @@ export interface Storage {
 export interface Share extends Storage {
   /** Made on this device when the share is added. Names its state file and its secrets. */
   id: string;
+  /**
+   * The owner's device: the send-only keys, by member id, whose new notes are added to the folder as they arrive, with
+   * no look first. Kept on this device alone: the member list says nothing of it.
+   */
+  autoAccept?: string[];
   /** Where it is in this vault, without slashes at either end. */
   folder: string;
   lastSuccess: number;

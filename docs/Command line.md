@@ -25,6 +25,8 @@ Secrets come from environment variables: `COFFER_PASSPHRASE`, and `COFFER_ACCESS
 - `fetch <path>...` and `evict <path>...`: download a file that `sync.deferAboveMB` leaves in storage, or remove one from this device again; storage keeps it. `sync --keep-days=N` keeps the large files changed in the last N days, or linked from a note changed in that time, and removes the others from this device.
 - `publish`: publish the website from the `site` part of `coffer.json`. Add `--dry-run` to see what would change.
 - `join -`: join or follow a shared folder from an invite link on standard input.
+- `capture <file>...`: send notes to a shared folder with a send-only key from `COFFER_CAPTURE_KEY`. It needs no config file, passphrase or vault, and can read nothing. From standard input: `echo "Call the dentist" | node coffer.js capture - --name="Inbox/dentist.md"`.
+- `suggest`: on a device that joined to read and suggest, send the notes changed here to the owner's device.
 
 Run `node coffer.js --help` for every command.
 

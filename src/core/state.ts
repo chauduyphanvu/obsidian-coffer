@@ -41,7 +41,8 @@ export class LocalState {
       if (s) st.synced.set(path, { entry: s[2] ? decEntry(s[2], w.p) : remote!, lsize: s[0], lmtime: s[1] });
     }
     st.confirmed = new Set(w.c);
-    st.members = w.m ?? [];
+    // A version before send-only keys saved one as a member with both marks, as the list in storage carries it.
+    st.members = (w.m ?? []).map((c) => ({ ...c, members: c.members.map((m) => (m.follow && m.suggest ? { id: m.id, name: m.name, role: m.role, capture: true as const } : m)) }));
     st.lastBy = new Map(w.b);
     return st;
   }

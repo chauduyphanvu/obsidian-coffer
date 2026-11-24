@@ -128,8 +128,8 @@ async function refuseOrphans(store: RemoteStore): Promise<void> {
   }
 }
 
-const encMember = (m: Member): WireMember => ({ i: m.id, n: m.name, r: m.role, ...(m.pub && { p: m.pub }), ...(m.expires && { x: m.expires }), ...(m.follow && { f: 1 as const }), ...(m.suggest && { s: 1 as const }) });
-const decMember = (w: WireMember): Member => ({ id: w.i, name: w.n, role: w.r, ...(w.p && { pub: w.p }), ...(w.x && { expires: w.x }), ...(w.f === 1 && { follow: true as const }), ...(w.s === 1 && { suggest: true as const }) });
+const encMember = (m: Member): WireMember => ({ i: m.id, n: m.name, r: m.role, ...(m.pub && { p: m.pub }), ...(m.expires && { x: m.expires }), ...((m.follow || m.capture) && { f: 1 as const }), ...((m.suggest || m.capture) && { s: 1 as const }) });
+const decMember = (w: WireMember): Member => ({ id: w.i, name: w.n, role: w.r, ...(w.p && { pub: w.p }), ...(w.x && { expires: w.x }), ...(w.f === 1 && w.s === 1 ? { capture: true as const } : { ...(w.f === 1 && { follow: true as const }), ...(w.s === 1 && { suggest: true as const }) }) });
 
 function encCommit(c: Commit): WireCommit {
   const pt = new PackTable();

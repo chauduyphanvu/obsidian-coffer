@@ -31,6 +31,13 @@ export interface Member {
    * one for members who only read. Unset in lists made before the mark existed, which read as not sending them.
    */
   suggest?: true;
+  /**
+   * A send-only key: a member with a secret and no invite slot, so it never holds the master key and reads nothing. It
+   * sends suggestions, and re-keys hand it no storage keys. Signed and stored as both marks above set at once, which no
+   * invite makes, so a list holding one still verifies on versions that do not know it; `follow` and `suggest` are
+   * then left unset here.
+   */
+  capture?: true;
 }
 
 /** What a member change carries: the whole list from then on, its generation, and where every earlier change is. */
@@ -124,7 +131,7 @@ const writes = (m: Member | undefined): m is Member & { pub: string } => !!m?.pu
 // their own encoding. Each kind of object has its own tag, so a signature on one can never pass for another.
 const entryTuple = (e: Entry) => [e.size, e.mtime, e.chunks.map((c) => [c.id, c.pack, c.off, c.len, c.size])];
 // The follow and suggest marks are signed only where they are set, so lists signed before them still verify.
-const memberTuple = (m: Member) => [m.id, m.name, m.role, m.pub ?? '', m.expires ?? 0, ...(m.follow ? [1] : []), ...(m.suggest ? ['suggest'] : [])];
+const memberTuple = (m: Member) => [m.id, m.name, m.role, m.pub ?? '', m.expires ?? 0, ...(m.follow || m.capture ? [1] : []), ...(m.suggest || m.capture ? ['suggest'] : [])];
 const tupleBytes = (t: unknown[]) => utf8.encode(JSON.stringify(t));
 
 function commitBytes(repo: string, c: Commit): Uint8Array {

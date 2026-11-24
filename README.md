@@ -261,6 +261,7 @@ flowchart LR
 
 - **Members.** Invite each person with a link that expires. No passphrase is necessary. An edit invite works for one device. That device only gets changes until one of your devices confirms it on the next sync. Members can edit, only read, or read and suggest. Devices sign all changes and accept changes only from current editors. This rule holds if a storage key can write.
 - **Suggestions.** Members who suggest send changes from their device for you to check. You decide which files to accept.
+- **Send-only keys.** Give a script, an agent or a person a key that can add notes to a shared folder and read none of it. What it sends waits for you, or is added straight away if you set that.
 - **Removal.** Remove a member under **Members** to stop their future changes. To prevent access to new data, replace the storage keys with **Give everyone new storage keys**.
 - **Limited keys and follow links.** For S3, R2, and B2, Coffer shows limited key rules for each role where the provider supports them. Give members a limited key, not your own key. For public read-only storage, a follow link gives access without storage keys. You cannot remove a follower without a new share in different storage.
 - **Share by property.** Select a name (for example, `Family`) to share notes with `share: Family` and their embedded attachments. This share is one-way (read, or read and suggest) from one device. If you remove `share: Family` from a note, the note stays shared until you remove it under **What's shared**.
@@ -311,7 +312,8 @@ Run `node coffer.js --help` for all commands. Other commands include `sync`, `ch
 - `publish`: Publish the website from `site` in `coffer.json` without a passphrase or sync keys. It supports `s3`, `webdav`, or an external `folder`. It uploads without a prompt. Add `--dry-run` to preview changes without upload.
 - `fetch <path>...`: Download files that `sync.deferAboveMB` keeps in storage.
 - `evict <path>...`: Remove files over `sync.deferAboveMB` from this device. Storage and other devices keep them. `sync --keep-days=N` does both by itself: it downloads the large files in use and removes the rest.
-- `join -`: Join or follow a shared folder through standard input. Example: `pbpaste | node coffer.js join - --config=family.json --vault=Family`. The CLI cannot be the owner of a shared folder, send suggestions, or share by property.
+- `join -`: Join or follow a shared folder through standard input. Example: `pbpaste | node coffer.js join - --config=family.json --vault=Family`. The CLI cannot be the owner of a shared folder or share by property.
+- `capture <file>...`: Send notes to a shared folder with a send-only key (`COFFER_CAPTURE_KEY`). No config file, passphrase or vault is needed, and the key reads nothing. `suggest` sends changed notes from a device that joined to read and suggest.
 
 Set `"readOnly": true` under `sync` for a read-only computer. To publish a website, add a `site` block to `coffer.json`. Include `remote`. You can also add `title`, `home`, `"whole": true`, and `exclude`.
 

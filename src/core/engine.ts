@@ -14,7 +14,7 @@ import {
 } from './members.ts';
 import { findDamage, repairReport, storeAgain, type RepairOptions, type RepairReport } from './repair.ts';
 import { Repo, StorageGoneError } from './repo.ts';
-import { INBOX, INBOX_OPENED, MAX_SEALED, SUGGEST_MAX_FILE, SUGGEST_MAX_TOTAL, inboxKey, openSuggestion, parseInboxKey, sealSuggestion, suggestKind, type SuggestedFile, type Suggestion } from './suggest.ts';
+import { INBOX, INBOX_OPENED, MAX_SEALED, SUGGEST_MAX_FILE, SUGGEST_MAX_FILES, SUGGEST_MAX_TOTAL, inboxKey, openSuggestion, parseInboxKey, sealSuggestion, suggestKind, type SuggestedFile, type Suggestion } from './suggest.ts';
 import { collectGarbage, listVersions, type CleanupResult } from './retention.ts';
 import { LocalState, type Synced } from './state.ts';
 import { errorText } from './text.ts';
@@ -251,6 +251,8 @@ export interface MemberStatus {
   follow?: true;
   /** A read member invited to send suggestions too. */
   suggest?: true;
+  /** A send-only key (`Member.capture`). */
+  capture?: true;
 }
 
 /** What a cleanup did, in counts. */
@@ -2295,7 +2297,7 @@ export class SyncEngine {
         const expires = m.expires || slots.get(m.id) || undefined;
         const opens = slots.has(m.id) && !(expires && now > expires);
         let state: MemberStatus['state'];
-        if (m.role === 'owner' || (m.role === 'write' && m.pub)) state = 'joined';
+        if (m.role === 'owner' || (m.role === 'write' && m.pub) || m.capture) state = 'joined';
         else if (!book.isOwner) state = 'waiting';
         else if (m.role === 'write' && joins.has(m.id)) state = 'confirming';
         else state = opens ? 'waiting' : 'expired';
@@ -2303,7 +2305,7 @@ export class SyncEngine {
         return {
           id: m.id, name: m.name, role: m.role, state, self: m.id === book.self,
           ...(expires && state !== 'joined' && { expires }), ...(last && { lastChange: last }), ...(m.follow && { follow: true as const }),
-          ...(m.suggest && { suggest: true as const }),
+          ...(m.suggest && { suggest: true as const }), ...(m.capture && { capture: true as const }),
         };
       });
     });
@@ -2314,9 +2316,10 @@ export class SyncEngine {
    * for a follow link). A write member's device only receives until the owner's device confirms its join. Returns the
    * member's part of the link (`MemberInvite`): add the storage keys for the role, the share's name and the folder.
    * `follow` makes a read member for a follow link (`FollowInvite`), which re-keys hand no storage keys. `suggest`
-   * marks a read member who sends suggestions too, whom re-keys hand keys that may add to the inbox.
+   * marks a read member who sends suggestions too, whom re-keys hand keys that may add to the inbox. `capture` makes a
+   * send-only key (`Member.capture`): no invite is opened for it, so its secret unwraps nothing, and it never expires.
    */
-  invite(o: { name: string; role: 'write' | 'read'; expires: number; follow?: boolean; suggest?: boolean }): Promise<MemberGrant> {
+  invite(o: { name: string; role: 'write' | 'read'; expires: number; follow?: boolean; suggest?: boolean; capture?: boolean }): Promise<MemberGrant> {
     return this.exclusive(async () => {
       const { repo } = await this.open();
       const { book, master, root } = this.ownerKeys();
@@ -2324,14 +2327,18 @@ export class SyncEngine {
       if (!name) throw new Error('A member needs a name');
       if (o.follow && o.role !== 'read') throw new Error('A follow link only reads');
       if (o.suggest && (o.role !== 'read' || o.follow)) throw new Error('Only a member invited to read sends suggestions');
+      if (o.capture && (o.role !== 'read' || o.follow || o.suggest)) throw new Error('A send-only key is a kind of its own');
       const id = newMemberId();
       const secret = await memberSecret(root, id);
-      await writeSlot(repo.objects, repo.id, id, master, secret, o.expires);
+      if (!o.capture) await writeSlot(repo.objects, repo.id, id, master, secret, o.expires);
       let since: number | undefined;
       try {
         since = await this.changeMembers((list) => [
           ...list,
-          { id, name, role: o.role, ...(o.role === 'write' && o.expires ? { expires: o.expires } : {}), ...(o.follow && { follow: true as const }), ...(o.suggest && { suggest: true as const }) },
+          {
+            id, name, role: o.role, ...(o.role === 'write' && o.expires ? { expires: o.expires } : {}),
+            ...(o.capture ? { capture: true as const } : { ...(o.follow && { follow: true as const }), ...(o.suggest && { suggest: true as const }) }),
+          },
         ]);
       } catch (e) {
         await deleteSlot(repo.objects, id).catch(() => undefined);
@@ -2545,7 +2552,7 @@ export class SyncEngine {
    * open, signed and numbered. Test the keys before: a device switches only to keys that work for it. `read` is needed
    * while some read members only read, and `suggest` while some are marked to send suggestions, who get it instead. A
    * follow link's member gets none: anyone may hold that link, and it reads the public copy, which new keys do not
-   * change. Nor does a write invite that expired before any device joined with it: its link, which may have leaked,
+   * change; nor does a send-only key, whose own storage key the owner replaces by making a new one. Nor does a write invite that expired before any device joined with it: its link, which may have leaked,
    * would read them with the old keys it carries. Returns the document's number.
    */
   writeRekey(storage: { write: Record<string, unknown>; read?: Record<string, unknown>; suggest?: Record<string, unknown> }): Promise<number> {
@@ -2555,7 +2562,7 @@ export class SyncEngine {
       await this.fetchVerified();
       const store = repo.objects;
       const now = this.now();
-      const all = book.current(st.members).filter((m) => m.role !== 'owner' && !m.follow);
+      const all = book.current(st.members).filter((m) => m.role !== 'owner' && !m.follow && !m.capture);
       const lapsed = all.filter((m) => m.role === 'write' && !m.pub && !!m.expires && m.expires <= now);
       // A join made before the invite expired is still confirmed at the owner's next sync (`confirmHeld`), by storage's clock.
       const made = lapsed.length ? new Map((await store.list('join/')).map((o) => [o.key.slice(5), o.modified])) : new Map<string, number>();
@@ -2654,7 +2661,7 @@ export class SyncEngine {
           skip('sent');
           continue;
         }
-        if (total + data.length > SUGGEST_MAX_TOTAL) {
+        if (total + data.length > SUGGEST_MAX_TOTAL || files.length >= SUGGEST_MAX_FILES) {
           skip('full');
           continue;
         }
@@ -2685,8 +2692,9 @@ export class SyncEngine {
    * Owner: the newest `INBOX_OPENED` suggestions waiting in storage, newest first by the time their keys name, each
    * opened with the secret of the member its key names, and how many more wait. One whose member is not on the member
    * list now, or that does not open, comes without its content; an object whose key names no time comes last.
+   * With `only`, just those from the members in `only.members` whose keys are not in `only.skip` are looked at.
    */
-  suggestions(): Promise<WaitingSuggestions> {
+  suggestions(only?: { members: ReadonlySet<string>; skip: ReadonlySet<string> }): Promise<WaitingSuggestions> {
     return this.exclusive(async () => {
       const { repo, st } = await this.open();
       const { book, root } = this.ownerKeys();
@@ -2695,6 +2703,7 @@ export class SyncEngine {
       const listed = (await repo.objects.list(INBOX))
         .filter((o) => inInbox(o.key))
         .map((o) => ({ ...o, at: parseInboxKey(o.key) }))
+        .filter((o) => !only || (!!o.at && only.members.has(o.at.member) && !only.skip.has(o.key)))
         .sort((a, b) => (b.at?.time ?? -1) - (a.at?.time ?? -1) || (a.key < b.key ? -1 : 1));
       const opened = listed.slice(0, INBOX_OPENED);
       const out: (WaitingSuggestion | undefined)[] = [];

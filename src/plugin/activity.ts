@@ -53,10 +53,11 @@ export function memberEvents(before: Member[], after: Member[]): string[] {
     if (!old) {
       if (m.role === 'owner') out.push(`${m.name} started sharing this folder`);
       else if (m.follow) out.push(`A follow link, “${m.name}”, was made`);
+      else if (m.capture) out.push(`A send-only key, “${m.name}”, was made`);
       else out.push(`${m.name} was invited to ${m.role === 'write' ? 'edit' : 'read'}`);
     } else if (m.pub && !old.pub) out.push(`${m.name} joined`);
   }
-  for (const m of before) if (!is.has(m.id)) out.push(m.follow ? `The follow link “${m.name}” was removed` : `${m.name} was removed`);
+  for (const m of before) if (!is.has(m.id)) out.push(m.follow ? `The follow link “${m.name}” was removed` : m.capture ? `The send-only key “${m.name}” was removed` : `${m.name} was removed`);
   return out;
 }
 

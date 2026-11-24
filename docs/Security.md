@@ -15,6 +15,8 @@ Coffer needs no lock and no server. Each commit has a number and contains the ha
 
 Every device in a shared folder signs its changes with ECDSA P-256, and accepts changes only from current editors. See [[Shared folders]].
 
+A send-only key is a member's secret with no copy of the folder's master key: the owner's device stores no invite for it, so the secret unwraps nothing. It seals what it sends under a key derived from that secret, which only the owner's devices can derive too. With a storage key limited to the folder's inbox it can not list, read or delete anything in storage either. The rule Coffer gives also refuses a write that would replace a file, so a note waiting in the inbox can not be overwritten. This was checked at Amazon S3; a service that does not know that part of the rule refuses it, and without it someone who knows a waiting file's name could replace it.
+
 ## Code you can check
 
 Coffer has no runtime dependencies and sends no telemetry. The tests include fuzz tests, where three devices make random changes while requests fail and the app stops at random. Every release file has a GitHub build attestation. The code is on [GitHub](https://github.com/chauduyphanvu/obsidian-coffer).
