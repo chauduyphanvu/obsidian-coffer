@@ -23,6 +23,9 @@ async function load(box: HTMLElement, plugin: CofferPlugin): Promise<void> {
   try {
     const view = await plugin.getEngine().view();
     const devices = await listDevices(view);
+    // Names for the lines devices are on: asked only when one of them is on a branch.
+    const lines = devices.some((d) => d.line) ? await plugin.getEngine().branches().then((l) => l.branches, () => []) : [];
+    const on = (d: DeviceStatus) => (d.line ? `On “${lines.find((b) => b.id === d.line)?.name ?? 'a branch'}”` : devices.some((x) => x.line) ? 'On the main line' : '');
     box.empty();
     const receivesOnly = view.cfg.readOnly;
     if (receivesOnly) note('This device only receives changes, so it does not report here, and it cannot forget a device.');
@@ -30,19 +33,20 @@ async function load(box: HTMLElement, plugin: CofferPlugin): Promise<void> {
     // This device's record is written at most every 30 minutes; when it last synced is known here exactly.
     const seen = (d: DeviceStatus) => (d.isSelf ? { ...d, lastSeen: Math.max(d.lastSeen, plugin.settings.lastSuccess) } : d);
     const linked = new Set(plugin.linkedDevices());
-    for (const d of devices) row(box, seen(d), view, linked.has(d.name), receivesOnly ? undefined : () => confirmForget(plugin, box, view, d.name));
+    for (const d of devices) row(box, seen(d), view, linked.has(d.name), on(d), receivesOnly ? undefined : () => confirmForget(plugin, box, view, d.name));
   } catch (e) {
     box.empty();
     note(`Could not load the devices: ${errorText(e)}`);
   }
 }
 
-function row(box: HTMLElement, d: DeviceStatus, view: RepoView, linked: boolean, forget?: () => void): void {
+function row(box: HTMLElement, d: DeviceStatus, view: RepoView, linked: boolean, line: string, forget?: () => void): void {
   const el = box.createDiv({ cls: `coffer-device is-${statusTone(d)}` });
   const text = el.createDiv({ cls: 'coffer-device-text' });
   const name = text.createDiv({ cls: 'coffer-device-name', text: d.name });
   if (d.isSelf) name.createSpan({ cls: 'coffer-device-tag', text: 'This device' });
   if (linked) name.createSpan({ cls: 'coffer-device-tag', text: 'Linked now' });
+  if (line) name.createSpan({ cls: 'coffer-device-tag', text: line });
   const about = [d.platform, d.version && `v${d.version}`].filter(Boolean).join(' · ');
   if (about) text.createDiv({ cls: 'coffer-device-meta', text: about });
   text.createDiv({ cls: 'coffer-device-meta', text: `Last synced ${agoText(view.now - d.lastSeen)}` });

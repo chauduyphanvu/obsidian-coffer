@@ -52,6 +52,11 @@ export interface Commit {
    * over it, and carries the whole member list from here on.
    */
   members?: MemberList;
+  /**
+   * The last commit of a branch that was closed (`lines.ts`): it changes no file, and nothing follows it. A device still
+   * on the branch learns from it, at its next sync, that the branch is closed.
+   */
+  closed?: boolean;
 }
 
 export interface Version {

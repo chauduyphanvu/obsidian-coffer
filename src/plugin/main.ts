@@ -13,6 +13,8 @@ import {
   type GcCounts,
   type MemberStanding,
   type MemberStatus,
+  type MergeDraft,
+  type MergeResult,
   type RepairOptions,
   type RepairReport,
   type RepoView,
@@ -28,6 +30,7 @@ import type { Repo } from '../core/repo.ts';
 import { LocalState } from '../core/state.ts';
 import { INBOX } from '../core/suggest.ts';
 import { errorText, firstSentence, plural } from '../core/text.ts';
+import type { Branch } from '../core/lines.ts';
 import { operationAt, planRestore, planUndo, type DeletedFile, type Operation } from '../core/timeline.ts';
 import type { Entry, RemoteStore, Version } from '../core/types.ts';
 import { checkStore } from '../stores/doctor.ts';
@@ -35,6 +38,7 @@ import { openRemote } from '../stores/open.ts';
 import { preparePublish, publishPrepared, type Prepared } from '../publish/publish.ts';
 import { PUBLISH, type VaultReader } from '../publish/site.ts';
 import { arrivalLine, type Self } from './activity.ts';
+import { BranchesModal } from './branches.ts';
 import { ChangeLog, fromEvents, type Why } from './changes.ts';
 import { liveSupported, rtcWire, stunUrl } from './live.ts';
 import { chooseDeferred } from './deferred.ts';
@@ -158,6 +162,13 @@ export interface Look {
 }
 
 export type { Failed };
+
+/** How a branch operation went: `problem` when the sync before it failed and nothing was changed, else its result and the sync after it. */
+export interface LineOutcome<T> {
+  problem?: Problem;
+  value?: T;
+  sent?: SyncOutcome;
+}
 
 /** How a restore to an earlier time, or an undo of one change, went. */
 export interface RestoreOutcome {
@@ -342,6 +353,7 @@ export default class CofferPlugin extends Plugin {
         return true;
       },
     });
+    this.addCommand({ id: 'branches', name: 'Branches: start, switch, merge or close', callback: () => new BranchesModal(this.app, this).open() });
     this.addCommand({ id: 'resolve-conflict', name: 'Resolve a file changed on two devices', callback: () => resolveFirstConflict(this) });
     this.addCommand({
       id: 'history',
@@ -615,6 +627,7 @@ export default class CofferPlugin extends Plugin {
         return () => window.clearTimeout(t);
       },
       position: () => this.liveAt,
+      line: () => this.getEngine().lineId(),
       onBehind: () => void this.auto('poll'),
       onChange: () => this.updateStatus(),
     });
@@ -853,7 +866,8 @@ export default class CofferPlugin extends Plugin {
   private updateStatus(): void {
     const { text, tone } = this.statusLine();
     if (this.statusEl) {
-      this.statusEl.setText(tone === 'critical' ? `⚠ ${text}` : `Sync: ${text}`);
+      const on = this.settings.branchName && this.configured() ? ` · on “${this.settings.branchName}”` : '';
+      this.statusEl.setText(`${tone === 'critical' ? `⚠ ${text}` : `Sync: ${text}`}${on}`);
       this.statusEl.toggleClass('is-critical', tone === 'critical');
       this.statusEl.toggleClass('is-warning', tone === 'warning');
     }
@@ -2363,6 +2377,85 @@ export default class CofferPlugin extends Plugin {
       const sent = this.outcomeOf(await this.syncHeld(true, false, true, 'manual'), share);
       return { done, failed, skipped, sent, olderPause: deleteLimitCrossed(done.length - removed.length, removed.length, synced, cfg) !== undefined };
     });
+  }
+
+  // Branches of the vault (`lines.ts` in core). Each runs with syncs held off; what the engine refuses is thrown.
+
+  /**
+   * What the branch operations share: editors saved and a sync first when `first` (a failed one stops it, but for a
+   * branch found closed when `closedOk`), then `task`, then a sync when `after`.
+   */
+  private lineWork<T>(label: string, o: { first: boolean; after: boolean; closedOk?: boolean }, task: (engine: SyncEngine) => Promise<T>): Promise<LineOutcome<T>> {
+    return this.exclusive(label, async () => {
+      if (o.first) {
+        this.say('Syncing recent changes first…');
+        const saving: Promise<void>[] = [];
+        this.app.workspace.iterateAllLeaves((leaf) => {
+          if (leaf.view instanceof TextFileView && leaf.view.file) saving.push(leaf.view.save().catch(() => undefined));
+        });
+        await Promise.all(saving);
+        const before = await this.syncHeld(true, false, true, 'manual');
+        if (!before.result && !(o.closedOk && before.problem?.id === 'branch-closed')) return { problem: before.problem };
+        if (before.result?.errors.length) {
+          const unsent = before.result.errors;
+          return {
+            problem: {
+              id: 'branch-unsent',
+              severity: 'critical',
+              title: `${plural(unsent.length, 'file')} could not sync first`,
+              detail: `Nothing was changed, so that what is not saved anywhere else stays where it is.\n${unsent.map((e) => `${e.path}: ${e.message}`).join('\n')}`,
+            },
+          };
+        }
+      }
+      this.say(label);
+      const value = await task(this.getEngine());
+      if (!o.after) return { value };
+      this.say('Syncing…');
+      return { value, sent: await this.syncHeld(true, false, true, 'manual') };
+    });
+  }
+
+  /** This device is on another line now: the status bar says so, its record is written again, and its live links start over. */
+  private async onLine(name: string): Promise<void> {
+    this.settings.branchName = name;
+    await this.saveData(this.settings);
+    this.lastHeartbeat = undefined;
+    this.liveWith = '';
+    this.applyLive();
+    this.updateStatus();
+  }
+
+  /** Starts a branch and puts this device on it; with `upgrade`, upgrades the vault for branches first, which is not undone. */
+  startBranch(name: string, upgrade: boolean): Promise<LineOutcome<Branch>> {
+    return this.lineWork('Starting the branch…', { first: true, after: false }, async (engine) => {
+      if (upgrade) await engine.upgrade();
+      const b = await engine.startBranch(name);
+      await this.onLine(b.name);
+      return b;
+    });
+  }
+
+  /** Puts this device on `to`, or on the main line without one, and syncs so its files become that line's. */
+  switchBranch(to?: Branch): Promise<LineOutcome<{ changed: number }>> {
+    return this.lineWork('Switching…', { first: true, after: true, closedOk: true }, async (engine) => {
+      const out = await engine.switchLine(to);
+      await this.onLine(to?.name ?? '');
+      return out;
+    });
+  }
+
+  /** What merging `b` with the main line would bring into the line this device is on, after a sync. Changes nothing. */
+  mergeDraft(b: Branch): Promise<LineOutcome<MergeDraft>> {
+    return this.lineWork('Working out the merge…', { first: true, after: false }, (engine) => engine.mergePlan(b));
+  }
+
+  mergeBranch(d: MergeDraft): Promise<LineOutcome<MergeResult>> {
+    return this.lineWork('Merging…', { first: false, after: true }, (engine) => engine.mergeApply(d));
+  }
+
+  closeBranch(b: Branch): Promise<LineOutcome<Branch>> {
+    return this.lineWork('Closing the branch…', { first: false, after: false }, (engine) => engine.closeBranch(b));
   }
 
   // Notes shared by a property (byproperty.ts): one per vault, sent only from this device.

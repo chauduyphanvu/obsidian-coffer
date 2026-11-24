@@ -40,3 +40,14 @@ test('devices that keep large files only while they want them delete none of the
   }
   assert.ok(evicted > 100, `${evicted} files were evicted`);
 });
+
+test('devices that start, switch, merge and close branches end with every line that was written, with and without failures and crashes', async () => {
+  const total = { branches: 0, switches: 0, lineMerges: 0, closed: 0 };
+  for (let seed = 1; seed <= 60; seed++) {
+    const r = await fuzz(seed, { devices: 3, steps: 200, branchRate: 0.12, ...(seed % 2 ? { faultRate: 0, crashRate: 0 } : { faultRate: 0.08, crashRate: 0.15 }) });
+    assert.deepEqual(r.problems, [], `seed ${seed}`);
+    for (const k of Object.keys(total) as (keyof typeof total)[]) total[k] += r[k];
+  }
+  // Enough of each to mean something; how many a run makes varies with the order its requests finish in.
+  assert.ok(total.branches > 40 && total.switches > 250 && total.lineMerges > 150 && total.closed > 8, JSON.stringify(total));
+});

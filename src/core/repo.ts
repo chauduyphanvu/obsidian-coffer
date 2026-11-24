@@ -7,13 +7,15 @@ import { putNew, type ChunkParams, type Commit, type Entry, type RemoteStore } f
 import { PackTable, decEntry, encEntry, type WireEntry } from './wire.ts';
 
 const FORMAT = 1;
+/** A vault that may have branches (`lines.ts`). A version from before them refuses it: its cleanup would delete what a branch still reads. */
+export const LINES_FORMAT = 3;
 /** A shared folder with members, whose every change is signed (`members.ts`). A version that reads only format 1 refuses it. */
 export const MEMBER_FORMAT = 2;
 const HEADER_KEY = 'vault.json';
 const PRUNED_KEY = 'pruned';
 /** A member share's plaintext hint for a reader that cannot list: the newest snapshot. Only a hint: the snapshot itself is checked. */
 const FOLLOW_KEY = 'follow';
-const RESERVED = /^(log|snap|idx|pack|slot|join|rekey|inbox)\//;
+const RESERVED = /^(log|snap|idx|pack|slot|join|rekey|inbox|line)\//;
 const reserved = (key: string) => key === HEADER_KEY || key === PRUNED_KEY || key === FOLLOW_KEY || RESERVED.test(key);
 /** Commits asked for at once by a reader that cannot list, until one is missing. */
 const PROBE_WINDOW = 6;
@@ -33,6 +35,12 @@ export class PassphraseUnknownError extends Error {
   constructor(cause: unknown) {
     super(`Could not tell whether storage took the new passphrase: the connection failed (${cause instanceof Error ? cause.message : String(cause)})`);
   }
+}
+
+/** A branch as a repo reads it: its id, and the commit of the main line it started at. */
+export interface Line {
+  id: string;
+  fork: number;
 }
 
 export interface Header {
@@ -64,6 +72,8 @@ interface WireCommit {
   g?: number;
   /** A member change: `Commit.members`. */
   l?: { n: number; m: WireMember[]; e: number[] };
+  /** `Commit.closed`. Only in a vault with branches, which no version from before them opens. */
+  x?: 1;
 }
 
 interface WireMember {
@@ -135,7 +145,7 @@ function encCommit(c: Commit): WireCommit {
   const pt = new PackTable();
   const changes = c.changes.map((ch): [string, WireEntry | null] => [ch.path, ch.entry && encEntry(ch.entry, pt)]);
   return {
-    d: c.device, t: c.time, p: pt.list, c: changes, h: c.prev, ...(c.moved && { m: 1 as const }), ...(c.confirmed && { a: 1 as const }),
+    d: c.device, t: c.time, p: pt.list, c: changes, h: c.prev, ...(c.moved && { m: 1 as const }), ...(c.confirmed && { a: 1 as const }), ...(c.closed && { x: 1 as const }),
     ...(c.signer !== undefined && { k: c.signer, s: c.sig, g: c.listSeq }),
     ...(c.members && { l: { n: c.members.gen, m: c.members.members.map(encMember), e: c.members.earlier } }),
   };
@@ -145,6 +155,7 @@ function decCommit(seq: number, w: WireCommit, hash?: string): Commit {
   const c: Commit = { seq, device: w.d, time: w.t, changes: w.c.map(([path, e]) => ({ path, entry: e && decEntry(e, w.p) })), prev: w.h, hash };
   if (w.m) c.moved = true;
   if (w.a) c.confirmed = true;
+  if (w.x) c.closed = true;
   if (typeof w.k === 'string') {
     c.signer = w.k;
     c.sig = w.s;
@@ -168,6 +179,13 @@ const seqOf = (key: string) => Number(key.slice(key.lastIndexOf('/') + 1));
  *   pruned       how far back cleanup has removed history (`prunedTo`), so no device offers what is gone
  *   dev/<id>     one device's heartbeat, an encrypted document
  *   any other    encrypted documents outside the log (readDoc, writeDoc)
+ * A vault with branches (format 3) also has, for each branch (`lines.ts`):
+ *   branch/<id>        its record, an encrypted document
+ *   line/<id>/log/, snap/, idx/, pruned   its own commits, snapshots, digests and cleanup record
+ *   line/<id>/base     the file table it and the main line last had in common
+ * A branch's sequence numbers go on from the commit it started at, and the packs are shared. A repo on a branch
+ * (`onLine`) reads commits and digests up to that commit from the main line's objects and later ones from the branch's,
+ * so the branch reads as one log from its first commit.
  * A shared folder with members (format 2) also has, each sealed for one member or plaintext as said (`members.ts`):
  *   slot/<id>    an invite: the master key wrapped under that member's secret, and when it expires (plaintext)
  *   join/<id>    a joining device's public key, for the owner's device to confirm
@@ -185,19 +203,77 @@ export class Repo {
   private iter: number;
   /** Only a member share caps what a document unpacks to: in a vault or a share of the older kind, only key holders write. */
   private docCap: number;
+  /** Shared by every repo made from this one (`onLine`), so that all learn of an upgrade when one reads the key file again. */
+  private shared: { header: Header };
+  /** The branch this repo reads and writes; undefined for the main line. */
+  readonly line?: Line;
   private members?: { book: MemberBook; log: () => MemberLog };
   /** Commits a reader that cannot list has fetched while finding the log's end, until they are read. */
   private probed = new Map<number, Uint8Array>();
   /** Member shares: snapshots found not to verify, left out of `snapshots()`. A device that writes deletes them. */
   readonly forged = new Set<number>();
 
-  private constructor(store: RemoteStore, header: Header, keys: Keys) {
+  private constructor(store: RemoteStore, header: Header, keys: Keys, line?: Line, shared?: { header: Header }) {
     this.store = store;
+    this.shared = shared ?? { header };
+    this.line = line;
     this.id = header.id;
     this.chunk = header.chunk;
     this.keys = keys;
     this.iter = header.kdf.iter;
     this.docCap = header.format === MEMBER_FORMAT ? MAX_DOC : Infinity;
+  }
+
+  /** The vault's format: 1, 2 for a shared folder with members, 3 once it may have branches. */
+  get format(): number {
+    return this.shared.header.format;
+  }
+
+  /** This vault as read on branch `line`, or on the main line without one. Asks storage nothing. */
+  onLine(line?: Line): Repo {
+    if (line && this.format !== LINES_FORMAT) throw new Error('This vault has no branches: it has not been upgraded for them');
+    return new Repo(this.store, this.shared.header, this.keys, line, this.shared);
+  }
+
+  /** As `onLine`, for a device that may have opened the vault before another upgraded it: it reads the key file again first. */
+  async toLine(line: Line): Promise<Repo> {
+    if (this.format !== LINES_FORMAT) await this.reread();
+    return this.onLine(line);
+  }
+
+  private linePrefix(): string {
+    return `line/${this.line!.id}/`;
+  }
+
+  /** Where commit `seq`, or the digest of the interval ending at it, is stored: on a branch, its own from the commit after it started. */
+  private logKey(prefix: 'log' | 'idx', seq: number): string {
+    return this.line && seq > this.line.fork ? this.linePrefix() + seqKey(prefix, seq) : seqKey(prefix, seq);
+  }
+
+  /** A branch starts with its own snapshot at the commit it started at, which the main line may have none at. */
+  private snapKey(seq: number): string {
+    return this.line && seq >= this.line.fork ? this.linePrefix() + seqKey('snap', seq) : seqKey('snap', seq);
+  }
+
+  /** Reads the key file again: another device may have upgraded the vault since this one opened it. Resolves to the format. */
+  async reread(): Promise<number> {
+    const header = await Repo.header(this.store);
+    if (header && header.id === this.id && (header.format === FORMAT || header.format === LINES_FORMAT)) this.shared.header = header;
+    return this.format;
+  }
+
+  /**
+   * Makes a vault of format 1 one that may have branches. Not undone: every version from before branches then refuses
+   * the vault, so the caller first makes sure no device runs one. Does nothing to a vault already upgraded.
+   */
+  async upgrade(): Promise<void> {
+    const header = await Repo.header(this.store);
+    if (!header) throw new StorageGoneError();
+    if (header.format === LINES_FORMAT) return void (this.shared.header = header);
+    if (header.format !== FORMAT || header.id !== this.id) throw new Error('Only a vault can be upgraded for branches, not a shared folder with members');
+    header.format = LINES_FORMAT;
+    await this.store.put(HEADER_KEY, utf8.encode(JSON.stringify(header)));
+    this.shared.header = header;
   }
 
   /** The PBKDF2 cost of the passphrase that wraps this vault's key. */
@@ -255,7 +331,7 @@ export class Repo {
     }
     const header = JSON.parse(new TextDecoder().decode(raw)) as Header;
     if (header.format === MEMBER_FORMAT) throw new Error('This storage holds a shared folder with members, which a device joins with an invite link rather than a passphrase');
-    if (header.format !== FORMAT) throw new Error(`Remote vault uses format ${header.format}; this version reads format ${MEMBER_FORMAT}`);
+    if (header.format !== FORMAT && header.format !== LINES_FORMAT) throw new Error(`Remote vault uses format ${header.format}; this version reads up to format ${LINES_FORMAT}. Update Coffer on this device`);
     return new Repo(store, header, await unlockKeys(header.kdf, passphrase));
   }
 
@@ -352,7 +428,7 @@ export class Repo {
   }
 
   async readCommit(seq: number, opts: { unchecked?: boolean } = {}): Promise<Commit | null> {
-    const key = seqKey('log', seq);
+    const key = this.logKey('log', seq);
     const held = this.probed.get(seq);
     this.probed.delete(seq);
     const raw = held ?? (await this.store.get(key));
@@ -372,13 +448,13 @@ export class Repo {
 
   /** The digest of commit `seq` as stored, without reading what it holds; null when there is none. */
   async storedHash(seq: number): Promise<string | null> {
-    const raw = await this.store.get(seqKey('log', seq));
+    const raw = await this.store.get(this.logKey('log', seq));
     return raw && digest(raw);
   }
 
   /** True when another device has committed past `seq - 1`. Costs one tiny request. */
   async hasCommit(seq: number): Promise<boolean> {
-    return (await this.store.get(seqKey('log', seq), { start: 0, end: 1 })) !== null;
+    return (await this.store.get(this.logKey('log', seq), { start: 0, end: 1 })) !== null;
   }
 
   /**
@@ -387,7 +463,8 @@ export class Repo {
    */
   async writeCommit(c: Commit): Promise<string | null> {
     if (this.members) await this.members.book.signCommit(c, this.members.log().changes);
-    const key = seqKey('log', c.seq);
+    if (this.line && c.seq <= this.line.fork) throw new Error(`Commit ${c.seq} is from before this branch started`);
+    const key = this.logKey('log', c.seq);
     const sealed = await this.sealJson(key, encCommit(c));
     const hash = await digest(sealed);
     return (await putNew(this.store, key, sealed)) ? hash : null;
@@ -399,7 +476,7 @@ export class Repo {
    * after its reply was lost would remove whatever another device committed at this number since.
    */
   async retractCommit(seq: number, hash: string): Promise<void> {
-    const key = seqKey('log', seq);
+    const key = this.logKey('log', seq);
     const raw = await this.store.get(key);
     if (!raw) return;
     if ((await digest(raw)) !== hash) throw new Error(`commit ${seq} in storage is not the one this device wrote`);
@@ -408,12 +485,12 @@ export class Repo {
 
   /** Member shares: removes a commit from the log's end that no member who may write made, for the owner. */
   async removeCommit(seq: number): Promise<void> {
-    await this.store.delete(seqKey('log', seq));
+    await this.store.delete(this.logKey('log', seq));
   }
 
   /** The `count` commits ending at `seq` in one object, so history does not fetch them one by one. In a member share, signed. */
   async writeDigest(seq: number, commits: Commit[]): Promise<void> {
-    const key = seqKey('idx', seq);
+    const key = this.logKey('idx', seq);
     const c = commits.map((x) => ({ ...encCommit(x), f: 1 as const }));
     const body: WireCommit[] | WireDigest = this.members ? { c, ...(await this.members.book.signDigest(seq, commits)) } : c;
     await this.store.put(key, await this.sealJson(key, body));
@@ -432,7 +509,7 @@ export class Repo {
    * too; one past what this device's member changes cover is not used.
    */
   async loadDigest(seq: number, count: number): Promise<{ commits: Commit[] | null; stale: boolean }> {
-    const body = await this.openMemberJson<WireCommit[] | WireDigest>(seqKey('idx', seq));
+    const body = await this.openMemberJson<WireCommit[] | WireDigest>(this.logKey('idx', seq));
     const stale = { commits: null, stale: true };
     const other = { commits: null, stale: false };
     if (!body || body === 'bad') return stale;
@@ -470,6 +547,11 @@ export class Repo {
    * that a member who may write did not sign, or that cannot be opened, counts for nothing, and cleanup writes it again.
    */
   async prunedTo(): Promise<number> {
+    if (this.line) {
+      // A branch keeps its own record. What the main line's cleanup removed from before the branch started is gone for it too.
+      const [own, main] = await Promise.all([this.openJson<{ floor: number }>(this.linePrefix() + PRUNED_KEY), this.onLine().prunedTo()]);
+      return Math.max(own?.floor ?? 0, Math.min(main, this.line.fork));
+    }
     const p = await this.openMemberJson<{ floor: number; k?: string; s?: string }>(PRUNED_KEY);
     if (!p || p === 'bad' || typeof p !== 'object') return 0;
     if (this.members && !(await this.members.book.checkPruned(p, this.members.log().changes))) return 0;
@@ -477,8 +559,9 @@ export class Repo {
   }
 
   async setPrunedTo(floor: number): Promise<void> {
+    const key = this.line ? this.linePrefix() + PRUNED_KEY : PRUNED_KEY;
     const body = this.members ? { floor, ...(await this.members.book.signPruned(floor)) } : { floor };
-    await this.store.put(PRUNED_KEY, await this.sealJson(PRUNED_KEY, body));
+    await this.store.put(key, await this.sealJson(key, body));
   }
 
   /**
@@ -505,7 +588,14 @@ export class Repo {
   /** Sequence numbers of the commits after `seq`. A store that cannot list is asked for each in turn until one is missing. */
   async commitSeqsAfter(seq: number): Promise<number[]> {
     if (this.store.noList) return this.probeLog(seq);
-    return (await this.store.list('log/', seqKey('log', seq))).map((o) => seqOf(o.key));
+    const line = this.line;
+    if (!line) return (await this.store.list('log/', seqKey('log', seq))).map((o) => seqOf(o.key));
+    const p = this.linePrefix();
+    const [before, own] = await Promise.all([
+      seq < line.fork ? this.store.list('log/', seqKey('log', seq)) : [],
+      this.store.list(`${p}log/`, p + seqKey('log', Math.max(seq, line.fork))),
+    ]);
+    return [...before.map((o) => seqOf(o.key)).filter((s) => s <= line.fork), ...own.map((o) => seqOf(o.key))];
   }
 
   /** Keys are dense, so the first missing one is the end. Fetched in small windows, and kept for `readCommit`. */
@@ -513,7 +603,7 @@ export class Repo {
     this.probed.clear();
     const out: number[] = [];
     for (let next = seq + 1; ; next += PROBE_WINDOW) {
-      const got = await Promise.all(Array.from({ length: PROBE_WINDOW }, (_, i) => this.store.get(seqKey('log', next + i))));
+      const got = await Promise.all(Array.from({ length: PROBE_WINDOW }, (_, i) => this.store.get(this.logKey('log', next + i))));
       for (let i = 0; i < got.length; i++) {
         const raw = got[i];
         if (!raw) return out;
@@ -528,7 +618,13 @@ export class Repo {
       const snap = await this.followHint();
       return snap ? [{ seq: snap, modified: 0 }] : [];
     }
-    const all = (await this.store.list('snap/')).map((o) => ({ seq: seqOf(o.key), modified: o.modified }));
+    const of = async (prefix: string) => (await this.store.list(prefix)).map((o) => ({ seq: seqOf(o.key), modified: o.modified }));
+    const line = this.line;
+    if (line) {
+      const [main, own] = await Promise.all([of('snap/'), of(`${this.linePrefix()}snap/`)]);
+      return [...main.filter((s) => s.seq < line.fork), ...own];
+    }
+    const all = await of('snap/');
     return this.forged.size ? all.filter((s) => !this.forged.has(s.seq)) : all;
   }
 
@@ -559,7 +655,7 @@ export class Repo {
    * it itself.
    */
   async readSnapshotWithHead(seq: number, opts: { unchecked?: boolean } = {}): Promise<SignedSnapshot | null> {
-    const w = await this.openMemberJson<WireSnapshot>(seqKey('snap', seq));
+    const w = await this.openMemberJson<WireSnapshot>(this.snapKey(seq));
     if (!w) return null;
     let files: Map<string, Entry> | undefined;
     if (w !== 'bad') {
@@ -596,7 +692,7 @@ export class Repo {
     const pt = new PackTable();
     const f: WireEntry[] = [];
     for (const [path, e] of files) f.push([path, ...encEntry(e, pt)]);
-    const key = seqKey('snap', seq);
+    const key = this.snapKey(seq);
     if (!this.members) {
       await this.store.put(key, await this.sealJson(key, { p: pt.list, f, h: head }), { ifNoneMatch: true });
       return;
@@ -633,8 +729,31 @@ export class Repo {
     return this.store.delete(`pack/${id}`);
   }
 
-  deleteSnapshot(seq: number): Promise<void> {
-    return this.store.delete(seqKey('snap', seq));
+  /** On a branch, only its own: one from before it started is the main line's to delete. */
+  async deleteSnapshot(seq: number): Promise<void> {
+    if (this.line && seq < this.line.fork) return;
+    await this.store.delete(this.snapKey(seq));
+  }
+
+  /** The file table branch `id` and the main line last had in common, or null when storage holds none. */
+  async readBase(id: string): Promise<Map<string, Entry> | null> {
+    const w = await this.openJson<WireSnapshot>(`line/${id}/base`);
+    return w && new Map(w.f.map((f) => [f[0] as string, decEntry(f, w.p, 1)]));
+  }
+
+  async writeBase(id: string, files: Map<string, Entry>): Promise<void> {
+    const pt = new PackTable();
+    const f: WireEntry[] = [];
+    for (const [path, e] of files) f.push([path, ...encEntry(e, pt)]);
+    const key = `line/${id}/base`;
+    await this.store.put(key, await this.sealJson(key, { p: pt.list, f }));
+  }
+
+  /** Deletes everything branch `id` stored of its own, for cleanup once it has long been closed. Returns how many objects. */
+  async deleteLine(id: string): Promise<number> {
+    const found = await this.store.list(`line/${id}/`);
+    for (const o of found) await this.store.delete(o.key);
+    return found.length;
   }
 
   /** Cuts content where every device cuts it and names each piece by a hash keyed with the vault key. */

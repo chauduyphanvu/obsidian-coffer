@@ -1,5 +1,6 @@
 import { resolveConfig } from '../core/config.ts';
-import { SyncEngine } from '../core/engine.ts';
+import { BranchClosedError, SyncEngine } from '../core/engine.ts';
+import type { Branch } from '../core/lines.ts';
 import { MemoryStore } from '../stores/memory.ts';
 import { MemFS, MemState } from './memfs.ts';
 import { FlakyStore, rng } from './netsim.ts';
@@ -16,6 +17,11 @@ export interface FuzzOptions {
    * more stay in storage unless wanted, and the quiet period wants them all.
    */
   evictRate?: number;
+  /**
+   * Chance per step that a device starts a branch, switches line (with whatever it has not sent), merges, or merges and
+   * closes one. The quiet period merges every branch into the main line and puts every device back on it.
+   */
+  branchRate?: number;
 }
 
 export interface FuzzReport {
@@ -36,6 +42,11 @@ export interface FuzzReport {
   unlisted: number;
   /** Files removed from a device that storage kept (`evictRate`). */
   evicted: number;
+  /** Branches started, switches of line, merges applied and branches closed (`branchRate`). */
+  branches: number;
+  switches: number;
+  lineMerges: number;
+  closed: number;
 }
 
 /**
@@ -46,6 +57,11 @@ export interface FuzzReport {
  * verify must find nothing wrong, and every line anyone wrote must still exist somewhere unless a
  * device that had seen that line deleted it.
  */
+const TRACE = process.env.FUZZ_TRACE ?? '';
+const traced: string[] = [];
+const tlog = (...parts: unknown[]) => void traced.push(parts.map((p) => (typeof p === 'string' ? p : JSON.stringify(p))).join(' '));
+export const takeTrace = () => traced.splice(0);
+
 export async function fuzz(seed: number, o: FuzzOptions): Promise<FuzzReport> {
   const rand = rng(seed);
   const pick = (n: number) => (rand() * n) | 0;
@@ -101,11 +117,22 @@ export async function fuzz(seed: number, o: FuzzOptions): Promise<FuzzReport> {
     return d;
   });
 
+  if (o.branchRate) {
+    const first = devices[0];
+    const rate = first.store.rate;
+    const crash = first.crash;
+    first.store.rate = 0;
+    first.crash = 0;
+    await first.engine.upgrade();
+    first.store.rate = rate;
+    first.crash = crash;
+  }
+
   let nextToken = 0;
   const allowedLost = new Set<string>();
   const report: FuzzReport = {
     seed, ok: true, problems: [], syncs: 0, failedSyncs: 0, merges: 0, conflictCopies: 0, files: 0, tokens: 0, cleanups: 0, packsCombined: 0,
-    hinted: 0, unlisted: 0, evicted: 0,
+    hinted: 0, unlisted: 0, evicted: 0, branches: 0, switches: 0, lineMerges: 0, closed: 0,
   };
   const bins = new Set<string>();
   /** A sync, told what changed or not. A log the device itself saw out of order is damage, never a fault. */
@@ -129,7 +156,58 @@ export async function fuzz(seed: number, o: FuzzOptions): Promise<FuzzReport> {
       x.restart();
     }
   };
-  const token = () => `tok${nextToken++}`;
+  type Dev = (typeof devices)[number];
+  const openBranches = async (x: Dev): Promise<Branch[]> => (await x.engine.branches()).branches.filter((b) => !b.closed);
+  /** Merges `b` with the main line on `x`, which is on one of the two. True when nothing was left out. */
+  const mergeLine = async (x: Dev, b: Branch): Promise<boolean> => {
+    const draft = await x.engine.mergePlan(b);
+    if (TRACE) tlog('  merge plan', b.id.slice(0, 4), 'into', draft.into.slice(0, 4) || 'main', JSON.stringify({ take: draft.take.map((t) => [t.path, !!t.entry, !!t.expect]), merged: draft.merged.map((m) => m.path), copies: draft.copies.map((c) => c.path) }));
+    const res = await x.engine.mergeApply(draft);
+    if (TRACE) tlog('  merge applied', JSON.stringify(res));
+    report.lineMerges++;
+    report.conflictCopies += res.copies.length;
+    return res.skipped.length === 0;
+  };
+  /** One random thing a device does with branches. A failure is a fault or a branch found closed: the device starts over. */
+  const branchStep = async (x: Dev) => {
+    try {
+      if (TRACE) tlog('  branchStep', x.name, 'on', x.engine.lineId().slice(0, 4) || 'main');
+      const open = await openBranches(x);
+      const on = x.engine.lineId();
+      const what = pick(8);
+      if (what === 0 && !on && open.length < 2) {
+        await x.engine.startBranch(`b${report.branches++}`);
+        if (TRACE) tlog('  started');
+      } else if (what < 4) {
+        const to = pick(open.length + 1);
+        await x.engine.switchLine(open[to]);
+        if (TRACE) tlog('  switched to', open[to]?.id.slice(0, 4) ?? 'main');
+        report.switches++;
+      } else if (what < 7 && open.length) {
+        const b = on ? open.find((o) => o.id === on) : open[pick(open.length)];
+        if (b) await mergeLine(x, b);
+      } else if (!on && open.length) {
+        // Closed only once all of it is on the main line, and nothing else runs in between.
+        const b = open[pick(open.length)];
+        if (await mergeLine(x, b)) {
+          await x.engine.closeBranch(b);
+          report.closed++;
+        }
+      }
+    } catch (e) {
+      if (TRACE) tlog('  branchStep failed', (e as Error).message);
+      if (damage(e)) report.problems.push(`${x.name}: ${(e as Error).message}`);
+      x.restart();
+    }
+  };
+  const seenAt = new Map<string, string>();
+  const lineOn = (x: Dev) => /"l":\{"id":"(\w{4})/.exec(x.state.data ?? '')?.[1] ?? 'main';
+  const dump = (x: Dev, what: string) => {
+    if (TRACE) tlog(`  ${what} ${x.name}@${lineOn(x)} files: ${[...x.fs.files].filter(([p]) => p.endsWith('.md')).map(([p, f]) => `${p}=[${tokensIn(new TextDecoder().decode(f.data)).join(',')}]`).join(' ')}`);
+  };
+  // Ended with a mark, so that no token is the start of another: a line that only starts like another line reads to
+  // `mergeAdded` as that line carried on, which would make this run's own tokens stand in for each other.
+  const token = () => `tok${nextToken++};`;
   const tokensIn = (text: string) => text.match(/tok\d+/g) ?? [];
   const paths = Array.from({ length: 10 }, (_, i) => `${['', 'dir/', 'dir/sub/'][i % 3]}n${i}.md`);
 
@@ -158,12 +236,16 @@ export async function fuzz(seed: number, o: FuzzOptions): Promise<FuzzReport> {
           }
           try {
             const r = await sync(x, hinted);
+            if (TRACE) tlog('  sync', x.name, x.engine.lineId().slice(0, 4) || 'main', JSON.stringify({ pushed: r.pushed, pulled: r.pulled, dl: r.deletedLocal, dr: r.deletedRemote, merged: r.merged, copies: r.conflictCopies, errors: r.errors.length }));
             report.merges += r.merged;
             report.conflictCopies += r.conflictCopies.length;
           } catch (e) {
             if (damage(e)) report.problems.push(`${x.name}: ${(e as Error).message}`);
+            if (TRACE) tlog('  sync failed', x.name, (e as Error).message.slice(0, 80));
             report.failedSyncs++;
             if (!keep) x.restart();
+            // What the user does when told the branch was closed. What the device had not sent goes with it.
+            if (e instanceof BranchClosedError) await x.engine.switchLine().catch(() => x.restart());
           }
           await Promise.allSettled(reads);
         }),
@@ -202,6 +284,12 @@ export async function fuzz(seed: number, o: FuzzOptions): Promise<FuzzReport> {
       d.touched.add(bin);
       bins.add(bin);
     }
+    if (o.branchRate && rand() < o.branchRate) await branchStep(d);
+    if (TRACE) {
+      tlog(step, d.name, 'op', op, devices.map((x) => `${x.name}@${lineOn(x)}`).join(' '));
+      if (process.env.FUZZ_PATH) tlog('   ', devices.map((x) => `${x.name}:${[...x.fs.files].filter(([p]) => p.includes(process.env.FUZZ_PATH!)).map(([p, f]) => `${p}=[${f.data.length > 400 ? 'bin' : tokensIn(new TextDecoder().decode(f.data)).join(',')}]`).join(' ') || '-'}`).join(' | '));
+      for (const x of devices) for (const [p, f] of x.fs.files) if (p.endsWith('.md')) for (const t of tokensIn(new TextDecoder().decode(f.data))) seenAt.set(t, `step ${step} ${x.name}@${lineOn(x)} ${p}`);
+    }
     if (o.evictRate && rand() < o.evictRate) {
       const bin = `bin${pick(3)}.dat`;
       if (!d.wanted.delete(bin)) d.wanted.add(bin);
@@ -221,6 +309,36 @@ export async function fuzz(seed: number, o: FuzzOptions): Promise<FuzzReport> {
     d.crash = 0;
     d.wantAll = true;
     d.restart();
+  }
+  if (o.branchRate) {
+    // Every device sends what it has to the line it is on, then goes to the main line, which takes every branch.
+    for (const d of devices) {
+      dump(d, 'quiet start');
+      try {
+        const r = await sync(d, false);
+        if (TRACE) tlog('  quiet sync', d.name, JSON.stringify({ pushed: r.pushed, pulled: r.pulled, dl: r.deletedLocal, dr: r.deletedRemote, merged: r.merged, copies: r.conflictCopies, errors: r.errors }));
+      } catch (e) {
+        if (TRACE) tlog('  quiet sync failed', d.name, (e as Error).message.slice(0, 60));
+        if (!(e instanceof BranchClosedError)) report.problems.push(`${d.name}: ${(e as Error).message}`);
+      }
+      const sw = await d.engine.switchLine();
+      const r = await sync(d, false);
+      if (TRACE) tlog('  quiet switch', d.name, sw.changed, JSON.stringify({ pushed: r.pushed, pulled: r.pulled, dl: r.deletedLocal, dr: r.deletedRemote, merged: r.merged, copies: r.conflictCopies, errors: r.errors }));
+      dump(d, 'quiet after');
+    }
+    const d = devices[0];
+    for (const b of await openBranches(d)) {
+      let whole = false;
+      for (let i = 0; i < 4 && !whole; i++) {
+        // Closing one was cut short after its log was ended: it was merged whole just before.
+        whole = await mergeLine(d, b).catch((e: unknown) => {
+          if (e instanceof BranchClosedError) return true;
+          throw e;
+        });
+        await sync(d, false);
+      }
+      if (!whole) report.problems.push(`branch ${b.name} never merged whole`);
+    }
   }
   clock.now += 3 * 86_400_000;
   await cleanup(devices[pick(devices.length)]);
@@ -255,7 +373,7 @@ export async function fuzz(seed: number, o: FuzzOptions): Promise<FuzzReport> {
   const everything = [...devices[0].fs.files.values()].map((f) => new TextDecoder().decode(f.data)).join('\n');
   const present = new Set(tokensIn(everything));
   for (let i = 0; i < nextToken; i++) {
-    if (!present.has(`tok${i}`) && !allowedLost.has(`tok${i}`)) report.problems.push(`lost tok${i}`);
+    if (!present.has(`tok${i}`) && !allowedLost.has(`tok${i}`)) report.problems.push(`lost tok${i}${TRACE ? ` last seen ${seenAt.get(`tok${i}`)}` : ''}`);
   }
   report.files = devices[0].fs.files.size;
   report.tokens = nextToken;

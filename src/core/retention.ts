@@ -1,6 +1,7 @@
 import { pool } from './bytes.ts';
 import type { SyncConfig } from './config.ts';
-import type { Repo } from './repo.ts';
+import { BRANCH_PREFIX, CLOSED_KEPT, lineOf, listBranches, tipOf } from './lines.ts';
+import { MEMBER_FORMAT, type Repo } from './repo.ts';
 import type { LocalState } from './state.ts';
 import type { Commit, Entry, Version } from './types.ts';
 
@@ -422,6 +423,13 @@ export async function keptVersions(
  * removes nothing such a device offers for a day after: see GC_SKEW). Storage cannot write only if unchanged,
  * so two cleanups at once could put the record back: each reads it again just before writing it and once more
  * after deleting, and writes it again if it is behind its own floor.
+ *
+ * A vault's branches share its packs, so what is kept is what any line keeps: the line `repo` is on, read from `st`,
+ * and every other open one (the main line too), read from storage as it is now, each by its own floor and record,
+ * as well as the table each branch last had in common with the main line. A line that cannot be read stops the
+ * cleanup before anything is deleted. Snapshots go from the line that wrote them only. A branch closed for
+ * `CLOSED_KEPT` is removed, record and all. Whether there are branches is asked of storage each time, never taken from
+ * the format this device read when it opened the vault, which another device may have upgraded since.
  */
 export async function collectGarbage(
   repo: Repo,
@@ -430,11 +438,26 @@ export async function collectGarbage(
   now: number,
 ): Promise<{ result: CleanupResult; packs: { id: string; size: number; modified: number }[]; missing: string[]; unsure: boolean }> {
   const live = new Set<string>();
-  const { floor, pruned, snaps, base } = await keptVersions(repo, st, cfg, now - GC_SKEW, (_, e) => e.chunks.forEach((c) => live.add(c.pack)));
+  const keep = (_: string, e: Entry) => e.chunks.forEach((c) => live.add(c.pack));
+  const passes = [{ repo, ...(await keptVersions(repo, st, cfg, now - GC_SKEW, keep)) }];
+  const branches = repo.format === MEMBER_FORMAT ? [] : await listBranches(repo, cfg.concurrency);
+  const others: Repo[] = repo.line ? [repo.onLine()] : [];
+  for (const b of branches) if (!b.closed && b.id !== repo.line?.id) others.push(await repo.toLine(lineOf(b)));
+  for (const other of others) {
+    // One closed in its log whose record does not say so yet (closing was cut short) is kept this time; `SyncEngine` marks it when it meets it.
+    const tip = await tipOf(other, cfg.concurrency);
+    passes.push({ repo: other, ...(await keptVersions(other, { lastSeq: tip.seq, remote: tip.files }, cfg, now - GC_SKEW, keep)) });
+  }
+  for (const b of branches) {
+    if (b.closed) continue;
+    const common = await repo.readBase(b.id);
+    if (!common) throw new Error(`Storage is missing what the branch “${b.name}” and the main line last had in common, so nothing was cleaned up`);
+    for (const [path, e] of common) keep(path, e);
+  }
 
   const result: CleanupResult = { packsDeleted: 0, bytesFreed: 0, snapshotsDeleted: 0 };
   const advance = async () => {
-    if (floor > pruned && (await repo.prunedTo()) < floor) await repo.setPrunedTo(floor);
+    for (const p of passes) if (p.floor > p.pruned && (await p.repo.prunedTo()) < p.floor) await p.repo.setPrunedTo(p.floor);
   };
   await advance();
   const listing = await repo.listPacks();
@@ -455,10 +478,19 @@ export async function collectGarbage(
     result.packsDeleted++;
     result.bytesFreed += o.size;
   });
-  for (const s of snaps) {
-    if (s.seq >= base) break;
-    await repo.deleteSnapshot(s.seq);
-    result.snapshotsDeleted++;
+  for (const p of passes) {
+    for (const s of p.snaps) {
+      if (s.seq >= p.base) break;
+      // One from before a branch started is the main line's.
+      if (p.repo.line && s.seq < p.repo.line.fork) continue;
+      await p.repo.deleteSnapshot(s.seq);
+      result.snapshotsDeleted++;
+    }
+  }
+  for (const b of branches) {
+    if (!b.closed || now - b.closed < CLOSED_KEPT || b.id === repo.line?.id) continue;
+    await repo.deleteLine(b.id);
+    await repo.deleteDoc(BRANCH_PREFIX + b.id);
   }
   await advance();
   const gone = new Set(dead.map((o) => o.id));

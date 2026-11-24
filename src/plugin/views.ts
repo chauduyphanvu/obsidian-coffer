@@ -10,6 +10,7 @@ import { WhatsSharedModal } from './byproperty-ui.ts';
 import { PublishModal } from './publish-ui.ts';
 import { momentLabel } from './restore.ts';
 import { SetupModal } from './setup.ts';
+import { BranchesModal, switchToMain } from './branches.ts';
 import { renderDevices } from './devices.ts';
 import { RemoveUnverifiedModal } from './people.ts';
 import { confirmStopSharing, downloadAgain, renderShares } from './sharing.ts';
@@ -189,7 +190,10 @@ export class SettingsTab extends PluginSettingTab {
       {
         type: 'group',
         heading: 'Devices',
-        items: [{ name: 'Devices', aliases: ['forget a device'], render: (setting) => renderDevices(block(setting), plugin) }],
+        items: [
+          { name: 'Devices', aliases: ['forget a device'], render: (setting) => renderDevices(block(setting), plugin) },
+          action('Branches', 'A second line of the vault’s history: try a change on some devices, then merge it back or drop it.', 'Branches…', () => new BranchesModal(this.app, plugin).open(), () => !plugin.configured()),
+        ],
       },
       {
         type: 'group',
@@ -596,6 +600,10 @@ export class ProblemsModal extends Modal {
         break;
       case 'accept-storage':
         button(row, 'Carry on from storage as it is…', () => new AcceptStorageModal(this.app, plugin, share).open(), 'warning');
+        break;
+      case 'switch-main':
+        button(row, 'Switch to the main line', () => switchToMain(plugin), 'cta');
+        button(row, 'Branches…', () => new BranchesModal(this.app, plugin).open());
         break;
       case 'remove-unverified':
         if (!share) break;

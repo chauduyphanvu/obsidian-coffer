@@ -221,6 +221,70 @@ test('cli: undo takes one change back out by its number from activity, keeps wha
   }
 });
 
+test('cli: upgrade waits for every device, then a branch is started, switched to, merged and closed', () => {
+  const a = setup({ deviceName: 'laptop' });
+  const b = setup({ deviceName: 'phone' }, a);
+  try {
+    put(a.vault, 'note.md', 'one\ntwo\nthree\n');
+    put(a.vault, 'old.md', 'goes on the branch\n');
+    a.cli('sync');
+    b.cli('sync');
+    assert.match(a.cli('branch'), /has not been upgraded for branches/);
+    assert.match(a.run('branch', 'start', 'Tidy up').stderr, /run upgrade first/);
+    const up = a.run('upgrade');
+    assert.equal(up.status, 0, up.stderr);
+    assert.match(up.stdout, /upgraded: this vault can have branches now/);
+    assert.match(a.cli('upgrade'), /can already have branches/);
+
+    const started = a.run('branch', 'start', 'Tidy', 'up');
+    assert.equal(started.status, 0, started.stderr);
+    assert.match(started.stdout, /started "Tidy up" from change \d+; this device is on it now/);
+    put(a.vault, 'note.md', 'one\ntwo\nthree\nfrom the branch\n');
+    put(a.vault, 'new.md', 'new\n');
+    rmSync(join(a.vault, 'old.md'));
+    a.cli('sync');
+    assert.match(a.cli('branch'), /this device is on: Tidy up\n {2}\* Tidy up, started \S+ by laptop at change \d+/);
+    assert.match(a.cli('status'), /branch: this device is on "Tidy up"/);
+
+    // The other device carries on with the main line, and sees where the first one is.
+    put(b.vault, 'note.md', 'ONE\ntwo\nthree\n');
+    b.cli('sync');
+    assert.deepEqual(Object.keys(files(b.vault)).sort(), ['note.md', 'old.md']);
+    assert.match(b.cli('status'), /laptop, .*on the branch "Tidy up"/);
+
+    const dry = b.run('branch', 'merge', 'tidy up', '--dry-run');
+    assert.equal(dry.status, 0, dry.stderr);
+    assert.deepEqual(dry.stdout.trim().split('\n'), [
+      'from "Tidy up" into the main line:',
+      '  remove       old.md',
+      '  add          new.md',
+      '  combine      note.md',
+      'dry run: would change 3 files; nothing changed',
+    ]);
+    assert.deepEqual(Object.keys(files(b.vault)).sort(), ['note.md', 'old.md']);
+    const merged = b.run('branch', 'merge', 'Tidy up');
+    assert.equal(merged.status, 0, merged.stderr);
+    assert.match(merged.stdout, /merged: 1 taken, 1 combined, 1 removed, 0 kept as copies\nthen synced: /);
+    assert.deepEqual(files(b.vault), { 'new.md': 'new\n', 'note.md': 'ONE\ntwo\nthree\nfrom the branch\n' });
+
+    // Closed from the main line while the laptop is still on it: its next sync says so, and switching carries on.
+    assert.match(a.run('branch', 'close', 'Tidy up').stderr, /switch to another line first/);
+    assert.match(b.cli('branch', 'close', 'Tidy up'), /closed "Tidy up"/);
+    put(a.vault, 'late.md', 'written after the branch closed\n');
+    const stopped = a.run('sync');
+    assert.equal(stopped.status, 1);
+    assert.match(stopped.stderr, /was closed on another device[\s\S]*run branch switch main/);
+    const back = a.run('branch', 'switch', 'main');
+    assert.equal(back.status, 0, back.stderr);
+    assert.match(back.stdout, /this device is on main now/);
+    assert.deepEqual(files(a.vault), { 'late.md': 'written after the branch closed\n', 'new.md': 'new\n', 'note.md': 'ONE\ntwo\nthree\nfrom the branch\n' });
+    assert.match(a.cli('branch'), /this device is on: main\nbranches: none/);
+    assert.match(a.run('branch', 'switch', 'Tidy up').stderr, /no branch called "Tidy up"/);
+  } finally {
+    a.done();
+  }
+});
+
 test('cli: when the sync that sends an undo fails, the next sync sends it with its removals still asked for, and a version storage lost is said in plain words', () => {
   const a = setup({ deviceName: 'laptop' });
   const b = setup({ deviceName: 'phone' }, a);

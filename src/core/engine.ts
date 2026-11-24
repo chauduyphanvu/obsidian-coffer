@@ -12,19 +12,25 @@ import {
   readJoin, readRekey, serializePosition, slotExpiry, writeJoin, writeRekey, writeSlot, type Member, type MemberChange, type MemberGrant, type MemberKeys,
   type RekeyOffer, type Role,
 } from './members.ts';
+import { listDevices } from './devices.ts';
+import {
+  BRANCHES_SINCE, BranchClosedError, MAIN_NAME, UpgradeBlockedError, branchNameProblem, lineOf, listBranches, newBranchId, planMerge, readBranch, tipOf, versionAtLeast, writeBranch,
+  type Branch, type Take,
+} from './lines.ts';
 import { findDamage, repairReport, storeAgain, type RepairOptions, type RepairReport } from './repair.ts';
-import { Repo, StorageGoneError } from './repo.ts';
+import { LINES_FORMAT, Repo, StorageGoneError } from './repo.ts';
 import { INBOX, INBOX_OPENED, MAX_SEALED, SUGGEST_MAX_FILE, SUGGEST_MAX_FILES, SUGGEST_MAX_TOTAL, inboxKey, openSuggestion, parseInboxKey, sealSuggestion, suggestKind, type SuggestedFile, type Suggestion } from './suggest.ts';
 import { collectGarbage, listVersions, type CleanupResult } from './retention.ts';
 import { LocalState, type Synced } from './state.ts';
 import { errorText } from './text.ts';
-import { ReadOnlyError, contentKey, hasChunks, putNew, readOnlyStore, sameContent, type Change, type ChunkRef, type Commit, type Entry, type FileStat, type Held, type LocalFS, type RemoteStore, type StateStore, type Version } from './types.ts';
+import { ReadOnlyError, contentKey, hasChunks, putNew, readOnlyStore, sameContent, type Change, type ChunkRef, type Commit, type Entry, type FileStat, type Held, type LocalFS, type LocalFile, type RemoteStore, type StateStore, type Version } from './types.ts';
 import { affectedBy, missingFiles, verifyRepo, type VerifyOptions, type VerifyReport } from './verify.ts';
 
 export type { VerifyOptions, VerifyProblem, VerifyReport } from './verify.ts';
 export type { RepairOptions, RepairReport } from './repair.ts';
 export { RemovedError, UnverifiedError } from './members.ts';
 export { PassphraseUnknownError, StorageGoneError } from './repo.ts';
+export { BranchClosedError, UpgradeBlockedError } from './lines.ts';
 
 /** What a device of a shared folder with members holds (`members.ts`). */
 export interface MemberOptions {
@@ -204,6 +210,49 @@ export interface WaitingSuggestions {
 }
 
 /** The repo with the remote file table brought up to date, for features that only read. */
+/** The vault's branches as one device sees them. */
+export interface BranchList {
+  /** The vault has been upgraded for branches. */
+  upgraded: boolean;
+  /** The branch this device is on, by id; undefined on the main line. */
+  current?: string;
+  /** Oldest first, closed ones included. */
+  branches: Branch[];
+}
+
+/** A merge worked out and not yet applied (`SyncEngine.mergePlan`): nothing in storage or on this device has changed. */
+export interface MergeDraft {
+  /** The branch the merge is between the main line and. */
+  branch: Branch;
+  /** The line this device is on, which takes the changes: a branch id, or '' for the main line. */
+  into: string;
+  /** The line whose changes come in, by name. */
+  from: string;
+  /** Their versions taken as they are, and files removed or given a new name. */
+  take: Take[];
+  /** Files changed on both lines and combined: what each then holds. */
+  merged: { path: string; data: Uint8Array; expect: Entry }[];
+  /** Files changed on both lines that cannot be combined: their version is added beside ours, as `path`. */
+  copies: { path: string; of: string; entry: Entry }[];
+  /** Settings changed on both lines that cannot be combined: ours stay. */
+  kept: string[];
+  /** Their file table, which becomes what the two lines last had in common. */
+  theirs: Map<string, Entry>;
+}
+
+export interface MergeResult {
+  /** Files that took their version or a new name, files removed, files combined. */
+  taken: number;
+  removed: number;
+  merged: number;
+  /** Copies added, by path. */
+  copies: string[];
+  /** Files left as they are because this line changed them after the merge was worked out. Merge again to take them. */
+  skipped: string[];
+  /** The commit that applied it, when it changed anything. */
+  commitSeq?: number;
+}
+
 export interface RepoView {
   repo: Repo;
   /**
@@ -327,6 +376,9 @@ interface Prepared {
   file: Local;
   entry: Entry;
 }
+
+/** Two versions of a file hold the same content, or there is neither. */
+const sameOrNone = (a: Entry | null | undefined, b: Entry | null | undefined) => (a && b ? sameContent(a, b) : !a && !b);
 
 const MAX_ROUNDS = 5;
 /** Arrivals kept for the next sync to report, at most. */
@@ -622,6 +674,7 @@ export class SyncEngine {
       } else this.st = st;
       this.book?.accept(this.st.members.at(-1));
     }
+    if (this.st.line && this.repo.line?.id !== this.st.line.id) this.repo = this.repo.onLine(this.st.line);
   }
 
   /**
@@ -691,6 +744,7 @@ export class SyncEngine {
       this.unplanned = true;
     };
     const add = async (c: Commit) => {
+      if (c.closed) throw new BranchClosedError();
       // A commit without `prev` comes from a version that did not chain the log. It is taken as it
       // is, and the chain restarts from it: the next chained commit names its digest like any other.
       if (c.prev !== undefined && st.head !== undefined && c.prev !== st.head) {
@@ -783,11 +837,14 @@ export class SyncEngine {
       // checks that the vault's key file is still there.
       const checkHead = this.headDue(st);
       const checkHeader = this.gone || (checkHead && this.now() - this.headerSeen >= HEAD_CHECK_EVERY);
-      const [first, second, head, header] = await Promise.all([
+      // On a branch, with the head check: that the branch is still open. Its last commit says so too (`Commit.closed`),
+      // but a device away for long finds a closed branch's commits removed.
+      const [first, second, head, header, open] = await Promise.all([
         repo.readCommit(st.lastSeq + 1, UNCHECKED),
         repo.readCommit(st.lastSeq + 2, UNCHECKED),
         checkHead ? repo.readCommit(st.lastSeq, UNCHECKED) : undefined,
         checkHeader ? repo.hasHeader() : undefined,
+        checkHead && st.line ? this.lineOpen(repo, st.line.id) : undefined,
       ]);
       if (header === false) {
         this.gone = true;
@@ -797,6 +854,7 @@ export class SyncEngine {
         this.headerSeen = this.now();
         this.gone = false;
       }
+      if (open === false) throw new BranchClosedError();
       if (head !== undefined) this.checkHead(st, head, first ?? second);
       if (!first) return settle(true) ? touched : again();
       await add(first);
@@ -900,6 +958,12 @@ export class SyncEngine {
       }
     }
     return undefined;
+  }
+
+  /** Whether storage still has branch `id` as an open one. */
+  private async lineOpen(repo: Repo, id: string): Promise<boolean> {
+    const b = await readBranch(repo, id);
+    return !!b && !b.closed;
   }
 
   private headDue(st: LocalState): boolean {
@@ -1121,6 +1185,7 @@ export class SyncEngine {
     this.uploaded = new Map();
     this.syncing = true;
     try {
+      if (st.unsettled === 2) await this.settleFiles((await this.open()).repo, st);
       let again = true;
       for (let round = 0; round < MAX_ROUNDS && again; round++) {
         res.rounds++;
@@ -1128,6 +1193,11 @@ export class SyncEngine {
       }
       for (const p of st.confirmed) if (!st.synced.has(p) || st.remote.has(p)) st.confirmed.delete(p);
       res.arrived = this.takeArrived();
+      if (!again && !res.errors.length && st.unsettled) {
+        st.unsettled = 0;
+        this.unsaved = true;
+        await this.save();
+      }
       if (!again) {
         this.known = run.known;
         this.recheck = new Set([...res.errors.map((e) => e.path), ...run.unsettled]);
@@ -1163,7 +1233,7 @@ export class SyncEngine {
     // itself fails if it did, and the next pass sorts it out. Saves a round trip on the common case.
     // The commit also checks that storage still holds the commit before it (`put`), so it need not wait for the hourly check.
     const optimistic =
-      first && !this.gone && st.lastSeq > 0 && st.head !== undefined && this.adopted?.st !== st &&
+      first && !this.gone && st.lastSeq > 0 && st.head !== undefined && this.adopted?.st !== st && !(st.line && this.headDue(st)) &&
       p.pushes.length + p.pushDeletes.length > 0 && !p.pulls.length && !p.pullDeletes.length && !p.conflicts.length &&
       p.pushes.reduce((n, f) => n + f.size, 0) <= OPTIMISTIC_BYTES && !this.readOnly();
     if (!optimistic && (await this.fetchRemote()).size) {
@@ -1173,6 +1243,13 @@ export class SyncEngine {
     if (this.book?.removed(st.members)) throw new RemovedError();
     res.tooLarge = this.tooLarge(st, v.tooLarge);
     res.deferred = this.deferredKeys(st, v, defer);
+    // The first sync since this device changed lines is about to change its files: said in the saved state first, so a
+    // sync cut short from here on is known to have left them of two lines (`settleFiles`).
+    if (st.unsettled === 1 && !nothingToDo(p)) {
+      st.unsettled = 2;
+      this.unsaved = true;
+      await this.save();
+    }
     if (await this.followMoves(repo, st, v.local, v.keys, p, res)) p = planChanges(v.local, st, this.excluded, maxSize, v.tooLarge, v.keys, defer);
 
     if (nothingToDo(p)) return false;
@@ -1808,6 +1885,7 @@ export class SyncEngine {
         this.gone = true;
         throw new StorageGoneError();
       }
+      if (!before && st.line && !(await this.lineOpen(repo, st.line.id))) throw new BranchClosedError();
       this.checkHead(st, before, null);
     } catch (e) {
       await repo.retractCommit(c.seq, hash).catch((x) => this.log(`Could not take back commit ${c.seq}: ${errorText(x)}`));
@@ -2224,6 +2302,7 @@ export class SyncEngine {
       const { repo } = await this.open();
       const st = new LocalState();
       st.vaultId = repo.id;
+      if (repo.line) st.line = repo.line;
       this.st = st;
       this.headSeen = -Infinity;
       this.known = undefined;
@@ -2234,6 +2313,331 @@ export class SyncEngine {
       await this.fetchRemote();
       this.unsaved = true;
       await this.save();
+    });
+  }
+
+  // Branches (`lines.ts`), for a vault. Each of these throws for a shared folder with members.
+
+  private async vaultOnly(): Promise<{ repo: Repo; st: LocalState }> {
+    const v = await this.open();
+    if (this.book) throw new Error('A shared folder with members has no branches');
+    return v;
+  }
+
+  /** The branch this device is on, by id; '' on the main line, or before its state is loaded. Asks storage nothing. */
+  lineId(): string {
+    return this.st?.line?.id ?? '';
+  }
+
+  /** The vault's branches and the one this device is on. One list and a read per branch; none before the upgrade but one of the key file. */
+  async branches(): Promise<BranchList> {
+    const { repo, st } = await this.vaultOnly();
+    const upgraded = repo.format === LINES_FORMAT || (await repo.reread()) === LINES_FORMAT;
+    return { upgraded, ...(st.line && { current: st.line.id }), branches: upgraded ? await listBranches(repo, this.cfg.concurrency) : [] };
+  }
+
+  /** The other devices whose last record names a version from before branches: while there are any, the vault is not upgraded. */
+  private async outdated(): Promise<{ name: string; version: string }[]> {
+    const devices = await listDevices(await this.refresh());
+    return devices.filter((d) => !d.isSelf && !versionAtLeast(d.version, BRANCHES_SINCE)).map((d) => ({ name: d.name, version: d.version }));
+  }
+
+  upgradeBlockers(): Promise<{ name: string; version: string }[]> {
+    return this.exclusive(async () => {
+      await this.vaultOnly();
+      return this.outdated();
+    });
+  }
+
+  /**
+   * Upgrades the vault so it may have branches (`Repo.upgrade`), which is not undone. Throws an `UpgradeBlockedError`
+   * while another device's record names a version that could not open the vault afterwards.
+   */
+  upgrade(): Promise<void> {
+    return this.exclusive(async () => {
+      const { repo } = await this.vaultOnly();
+      if (this.readOnly()) throw new Error('A device that only receives cannot upgrade the vault');
+      if ((await repo.reread()) === LINES_FORMAT) return;
+      const old = await this.outdated();
+      if (old.length) throw new UpgradeBlockedError(old);
+      await repo.upgrade();
+    });
+  }
+
+  /**
+   * Starts a branch from the main line as storage has it now and puts this device on it. No file changes: sync
+   * first, so that what this device has not sent is on the main line too and not only on the branch.
+   */
+  startBranch(name: string): Promise<Branch> {
+    return this.exclusive(async () => {
+      const { repo } = await this.vaultOnly();
+      if (this.readOnly()) throw new Error('A device that only receives cannot start a branch');
+      if ((await repo.reread()) !== LINES_FORMAT) throw new Error('This vault has not been upgraded for branches yet');
+      const { st, now } = await this.refresh();
+      if (st.line) throw new Error('A branch starts from the main line: switch to it first');
+      const problem = branchNameProblem(name, await listBranches(repo, this.cfg.concurrency));
+      if (problem) throw new Error(problem);
+      const b: Branch = { id: newBranchId(), name: name.trim(), fork: st.lastSeq, created: now, by: this.cfg.deviceName };
+      const on = repo.onLine(lineOf(b));
+      // The record last: a branch half made is no branch.
+      await on.writeSnapshot(b.fork, st.remote, st.head);
+      await repo.writeBase(b.id, st.remote);
+      await writeBranch(repo, b);
+      st.line = lineOf(b);
+      this.repo = on;
+      this.unsaved = true;
+      await this.save();
+      return b;
+    });
+  }
+
+  /**
+   * Puts this device on another line: `to`, or the main line without one. Only its state changes here: it takes the
+   * other line's file table as what storage holds, and keeps what its files last agreed with. The next sync then
+   * changes exactly the files that differ, the way it takes any change from storage, and what the other line does not
+   * have is removed without counting as a mass deletion. A file edited here and not sent is merged or kept as a copy.
+   * Returns how many files differ. Works from a branch that was closed, which reading its log would refuse.
+   */
+  switchLine(to?: Branch): Promise<{ changed: number }> {
+    return this.exclusive(async () => {
+      const { repo, st } = await this.vaultOnly();
+      if ((to?.id ?? '') === (st.line?.id ?? '')) return { changed: 0 };
+      if (to?.closed) throw new BranchClosedError(to.name);
+      const on = to ? await repo.toLine(lineOf(to)) : repo.onLine();
+      const tip = await tipOf(on, this.cfg.concurrency);
+      if (tip.closed) throw await this.foundClosed(repo, to!, tip.closed);
+      await this.settleFiles(repo, st);
+      st.unsettled = 1;
+      let changed = 0;
+      for (const path of new Set([...st.remote.keys(), ...tip.files.keys()])) {
+        if (sameOrNone(st.remote.get(path), tip.files.get(path))) continue;
+        changed++;
+        this.recheck.add(path);
+      }
+      st.confirmed = new Set([...st.synced.keys()].filter((p) => !tip.files.has(p)));
+      st.remote = tip.files;
+      st.lastSeq = tip.seq;
+      st.head = tip.head;
+      st.line = to ? lineOf(to) : undefined;
+      this.repo = on;
+      this.headSeen = this.now();
+      this.large = undefined;
+      this.arrived = [];
+      this.unplanned = true;
+      this.stuck = false;
+      this.unsaved = true;
+      await this.save();
+      return { changed };
+    });
+  }
+
+  /**
+   * A branch whose log says it is closed while its record does not, as when closing it was cut short between the two:
+   * the record is brought up to date, and the error to throw is returned.
+   */
+  private async foundClosed(repo: Repo, b: Branch, by: Commit): Promise<Error> {
+    if (!b.closed && !this.readOnly()) await writeBranch(repo, { ...b, closed: by.time, closedBy: by.device }).catch(() => undefined);
+    return new BranchClosedError(b.name);
+  }
+
+  /**
+   * Before this device leaves a line: brings what it records as agreed with storage up to its files, where a sync of
+   * this line changed files and was cut short before saving that, as when the app is closed mid-download. A file that
+   * already holds this line's version is recorded as that version, and one that neither this line nor this device has
+   * any more is forgotten. Left as they were, each would read on the next line as an edit or a deletion made here, and
+   * be sent there. Reads only files whose record does not match them; a file really edited here stays as it is.
+   *
+   * Once a sync after a change of lines began changing files and none has finished cleanly (`LocalState.unsettled`
+   * at 2), a file that does not match its record may as well be the other line's version, edited since: which version
+   * it descends from is not known. Its record is dropped, so the sync meets it as a file made here beside the line's
+   * own: the fuller of the two is kept, or both are. Taken as an edit of the record, it would replace a version that
+   * matches the record again, as after going back to the first line or after a merge, with one that never held that
+   * version's changes. Run before leaving a line, and before every sync while in that state.
+   */
+  private async settleFiles(repo: Repo, st: LocalState): Promise<void> {
+    const local = new Map<string, LocalFile>();
+    for (const f of await this.o.fs.list(heldIn(st, repo))) {
+      const key = vaultKey(f.path);
+      if (!this.excluded(key) && !local.has(key)) local.set(key, f);
+    }
+    for (const key of [...st.synced.keys()]) {
+      if (local.has(key) || st.remote.has(key) || this.excluded(key)) continue;
+      st.synced.delete(key);
+      this.unsaved = true;
+    }
+    const unsure = st.unsettled === 2;
+    await pool([...local], this.cfg.concurrency, async ([key, f]) => {
+      const s = st.synced.get(key);
+      const r = st.remote.get(key);
+      if (s && s.lsize === f.size && s.lmtime === f.mtime) return;
+      let held = false;
+      if (r && r.size === f.size && !(s && sameContent(s.entry, r))) {
+        try {
+          const data = await this.o.fs.read(f.path);
+          const now = await this.o.fs.stat(f.path);
+          held = !!now && now.size === f.size && now.mtime === f.mtime && hasChunks(r, (await repo.split(data)).ids);
+        } catch {
+          // Not readable now: left as it is recorded.
+        }
+      }
+      if (held) st.synced.set(key, { entry: r!, lsize: f.size, lmtime: f.mtime });
+      else if (unsure && s) st.synced.delete(key);
+      else return;
+      this.recheck.add(key);
+      this.unplanned = true;
+      this.unsaved = true;
+    });
+  }
+
+  /**
+   * Closes a branch: its log ends with a commit that says so, which a device still on it meets at its next sync
+   * (`BranchClosedError`) before it can send anything more there, and its record is marked. What it changed and was
+   * never merged stays readable for `CLOSED_KEPT`, then cleanup removes it. Not for the branch this device is on.
+   */
+  closeBranch(b: Branch): Promise<Branch> {
+    return this.exclusive(async () => {
+      const { repo, st } = await this.vaultOnly();
+      if (this.readOnly()) throw new Error('A device that only receives cannot close a branch');
+      if (st.line?.id === b.id) throw new Error('This device is on that branch: switch to another line first');
+      if (b.closed) return b;
+      const on = await repo.toLine(lineOf(b));
+      for (let round = 0; ; round++) {
+        const tip = await tipOf(on, this.cfg.concurrency);
+        if (tip.closed) break;
+        if (await on.writeCommit({ seq: tip.seq + 1, device: this.cfg.deviceName, time: this.now(), changes: [], prev: tip.head, closed: true })) break;
+        if (round >= MAX_ROUNDS) throw new Error('The branch kept changing while it was being closed. Try again.');
+      }
+      const closed: Branch = { ...b, closed: this.now(), closedBy: this.cfg.deviceName };
+      await writeBranch(repo, closed);
+      return closed;
+    });
+  }
+
+  /**
+   * Works out what merging brings into the line this device is on: `branch`'s changes when it is on the main line,
+   * the main line's when it is on `branch`. Reads the versions of files changed on both lines and combines those it
+   * can, as a sync does for that kind of file. Changes nothing: `mergeApply` does.
+   */
+  mergePlan(branch: Branch): Promise<MergeDraft> {
+    return this.exclusive(async () => {
+      const { repo } = await this.vaultOnly();
+      if (this.readOnly()) throw new Error('A device that only receives cannot merge');
+      const { st, now } = await this.refresh();
+      if (st.line && st.line.id !== branch.id) throw new Error('A branch merges with the main line only: switch to the main line or to that branch first');
+      if (branch.closed) throw new Error(`The branch “${branch.name}” is closed`);
+      const theirs = await tipOf(st.line ? repo.onLine() : await repo.toLine(lineOf(branch)), this.cfg.concurrency);
+      if (theirs.closed) throw await this.foundClosed(repo, branch, theirs.closed);
+      const base = await repo.readBase(branch.id);
+      if (!base) throw new Error(`Storage no longer holds what the branch “${branch.name}” and the main line last had in common`);
+      const plan = planMerge(base, st.remote, theirs.files);
+      const d: MergeDraft = { branch, into: st.line?.id ?? '', from: st.line ? MAIN_NAME : branch.name, take: plan.take, merged: [], copies: [], kept: [], theirs: theirs.files };
+      const names = new Set([...st.remote.keys(), ...theirs.files.keys(), ...plan.take.map((t) => t.path)]);
+      const at = new Date(now);
+      await pool(plan.both, this.cfg.concurrency, async (m) => {
+        const data = await this.combine(m.path, m.base, m.ours, m.theirs);
+        if (!data) {
+          if (m.path.startsWith(`${this.cfg.configDir}/`)) return void d.kept.push(m.path);
+          let copy = conflictCopyName(m.path, d.from, at);
+          for (let n = 2; names.has(copy); n++) copy = conflictCopyName(m.path, d.from, at, n);
+          names.add(copy);
+          return void d.copies.push({ path: copy, of: m.path, entry: m.theirs });
+        }
+        const { ids } = await repo.split(data);
+        if (data.length === m.ours.size && hasChunks(m.ours, ids)) return;
+        if (data.length === m.theirs.size && hasChunks(m.theirs, ids)) d.take.push({ path: m.path, entry: m.theirs, expect: m.ours });
+        else d.merged.push({ path: m.path, data, expect: m.ours });
+      });
+      const byPath = (x: { path: string }, y: { path: string }) => (x.path < y.path ? -1 : x.path > y.path ? 1 : 0);
+      d.take.sort((x, y) => Number(!!x.entry) - Number(!!y.entry) || byPath(x, y));
+      d.merged.sort(byPath);
+      d.copies.sort(byPath);
+      d.kept.sort();
+      return d;
+    });
+  }
+
+  /** Two versions of one file changed on two lines, combined as a sync combines that kind of file; null when they cannot be. */
+  private async combine(path: string, base: Entry | null, ours: Entry, theirs: Entry): Promise<Uint8Array | null> {
+    const settings = path.startsWith(`${this.cfg.configDir}/`);
+    const json = settings && ext(path) === 'json';
+    const mergeable = this.cfg.conflictStrategy === 'merge' && this.cfg.mergeExtensions.includes(ext(path));
+    if (settings ? !json && !base : !mergeable || (!base && ext(path) === 'canvas')) return null;
+    const text = (data: Uint8Array) => new TextDecoder('utf-8', { fatal: true }).decode(data);
+    try {
+      const [o, t, b] = await Promise.all([
+        this.readVersion(ours).then(text),
+        this.readVersion(theirs).then(text),
+        // A common version past the retention window only loses the three-way view of JSON settings; for the rest there is then no merge.
+        base ? this.readVersion(base).then(text, () => undefined) : undefined,
+      ]);
+      let merged: string | null;
+      if (json) merged = mergeJson(b, o, t);
+      else if (b === undefined) merged = base ? null : mergeAdded(o, t);
+      else merged = (settings && !path.startsWith(`${this.cfg.configDir}/snippets/`) ? mergeStrict : mergeFor(path))(b, o, t);
+      return merged === null ? null : new TextEncoder().encode(merged);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Applies a merge as one commit on this device's line: their versions point at the data storage already holds, so
+   * nothing is downloaded and only combined files are uploaded. This device's own files are not touched: the next
+   * sync brings the commit to them like any other, files left in storage stay there, and its removals are marked as
+   * asked for. A change is left out when this line changed the file after the merge was worked out; with none left
+   * out, the two lines' common table moves on to theirs. Running the same merge again is harmless.
+   */
+  mergeApply(d: MergeDraft): Promise<MergeResult> {
+    return this.exclusive(async () => {
+      const { repo } = await this.vaultOnly();
+      if (this.readOnly()) throw new Error('A device that only receives cannot merge');
+      const { st } = await this.refresh();
+      if ((st.line?.id ?? '') !== d.into) throw new Error('This device changed lines since the merge was worked out');
+      const still = (t: Take) => sameOrNone(st.remote.get(t.path), t.expect);
+      const stored: Take[] = [];
+      const here = this.placed(st);
+      const packer = new Packer(repo, this.cfg.packTargetBytes, this.cfg.packMaxBlobBytes, this.cfg.concurrency);
+      for (const m of d.merged) {
+        if (!sameOrNone(st.remote.get(m.path), m.expect)) continue;
+        const { parts, ids } = await repo.split(m.data);
+        const compress = this.cfg.compression && worthCompressing(m.path, m.data.length);
+        const chunks: ChunkRef[] = [];
+        for (let i = 0; i < parts.length; i++) {
+          chunks.push(here.get(ids[i]) ?? packer.add(ids[i], await repo.sealChunk(ids[i], parts[i], compress), parts[i].length));
+          await packer.backpressure();
+        }
+        stored.push({ path: m.path, entry: { size: m.data.length, mtime: this.now(), chunks }, expect: m.expect });
+      }
+      await packer.flush();
+      const all: Take[] = [...d.take, ...stored, ...d.copies.map((c) => ({ path: c.path, entry: c.entry, expect: null }))];
+      const copies = new Set(d.copies.map((c) => c.path));
+      const res: MergeResult = { taken: 0, removed: 0, merged: 0, copies: [], skipped: [] };
+      const made = (t: Take) => sameOrNone(st.remote.get(t.path), t.entry);
+      for (let round = 0; round < MAX_ROUNDS; round++) {
+        const apply = all.filter((t) => still(t) && !made(t));
+        if (!apply.length) break;
+        const c: Commit = { seq: st.lastSeq + 1, device: this.cfg.deviceName, time: this.now(), changes: apply.map((t) => ({ path: t.path, entry: t.entry })), prev: st.head, confirmed: true };
+        const hash = await this.put(c);
+        if (!hash) {
+          await this.fetchRemote();
+          continue;
+        }
+        st.apply({ ...c, hash });
+        for (const t of apply) {
+          this.recheck.add(t.path);
+          if (!t.entry) res.removed++;
+          else if (copies.has(t.path)) res.copies.push(t.path);
+          else if (stored.includes(t)) res.merged++;
+          else res.taken++;
+        }
+        this.unplanned = true;
+        res.commitSeq = c.seq;
+        await this.committed(c.seq, hash);
+        break;
+      }
+      res.skipped = [...new Set([...all.filter((t) => !made(t)).map((t) => t.path), ...d.merged.filter((m) => !stored.some((x) => x.path === m.path)).map((m) => m.path)])].sort();
+      if (!res.skipped.length) await repo.writeBase(d.branch.id, d.theirs);
+      return res;
     });
   }
 

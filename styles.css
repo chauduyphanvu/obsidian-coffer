@@ -563,3 +563,20 @@ body.is-phone .coffer-share-actions { flex-basis: 100%; }
 .is-phone .coffer-rewind-body { flex-direction: column; }
 .is-phone .coffer-rewind-side { flex: 0 0 34%; max-width: none; border-inline-end: none; border-bottom: 1px solid var(--background-modifier-border); }
 .coffer-notice-button { margin-top: 8px; }
+
+/* Branches */
+.coffer-branches .coffer-device { align-items: center; }
+.coffer-branch-actions { display: flex; flex-wrap: wrap; gap: var(--size-4-2); justify-content: flex-end; }
+.coffer-branch-actions > button { flex: none; width: auto; }
+.is-mobile .coffer-branch-actions > button { min-height: 44px; }
+.coffer-merge-list {
+  max-height: 40vh;
+  overflow-y: auto;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  padding: var(--size-4-2) var(--size-4-3);
+  margin-bottom: var(--size-4-3);
+}
+.coffer-merge-row { display: flex; gap: var(--size-4-3); padding: var(--size-2-1) 0; font-size: var(--font-ui-small); }
+.coffer-merge-kind { flex: none; width: 7.5em; color: var(--text-muted); }
+.coffer-merge-path { min-width: 0; overflow-wrap: anywhere; }

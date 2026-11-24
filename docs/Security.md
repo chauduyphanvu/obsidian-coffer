@@ -11,6 +11,10 @@ Coffer encrypts on your device, before anything goes to storage.
 
 Coffer needs no lock and no server. Each commit has a number and contains the hash of the commit before it. A device writes a commit only if its number is still free, which storage checks for it. Two devices cannot write over each other.
 
+## Branches
+
+A vault that has branches is marked as a newer format in its key file. A version of Coffer from before branches reads that mark and refuses to open the vault, since its cleanup would delete data a branch still reads. A branch's commits are sealed with the vault's key under their own names, so a commit cannot be moved from one line to another, and each line's commits are chained as the main line's are. Every line shares the vault's key: a branch is not a way to give someone part of a vault.
+
 ## Live link
 
 The live link is off unless you turn it on. Two devices set one up through documents in your storage, sealed with the vault's key like everything else, so only a device that holds the key can start or accept a link. Each document holds the device's network addresses and a fingerprint of the connection's key, and the connection (WebRTC, encrypted with DTLS) accepts only that key. What is sent over it is the number of the newest change a device has synced, which makes the other device sync; no file content, no file names, and no keys. Someone who can write to your storage but has no key can not start a link, and at worst can delete the documents, so that no link forms and sync carries on at its usual pace.

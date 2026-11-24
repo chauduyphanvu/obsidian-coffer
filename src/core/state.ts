@@ -1,4 +1,5 @@
 import type { MemberChange } from './members.ts';
+import type { Line } from './repo.ts';
 import { sameContent, type Commit, type Entry } from './types.ts';
 import { PackTable, decEntry, encEntry, type WireEntry } from './wire.ts';
 
@@ -24,13 +25,22 @@ export class LocalState {
   members: MemberChange[] = [];
   /** A shared folder with members: when each member's newest commit this device has taken was made, by member id. */
   lastBy = new Map<string, number>();
+  /** The branch this device is on (`lines.ts`), which `lastSeq`, `head` and `remote` are of; undefined on the main line. */
+  line?: Line;
+  /**
+   * Since this device changed lines, no sync has finished cleanly: 1 while none has begun to change its files either,
+   * 2 once one has. At 2 the files may be partly the other line's with `synced` not saying so, as when the app was
+   * closed mid-download, and a file that does not match its record is not taken to descend from that record
+   * (`SyncEngine.settleFiles`). 0 otherwise.
+   */
+  unsettled: 0 | 1 | 2 = 0;
 
   static parse(json: string | null): LocalState {
     const st = new LocalState();
     if (!json) return st;
     const w = JSON.parse(json) as {
       id: string; seq: number; h?: string; p: string[]; f: [string, WireEntry | 0, 0 | [number, number] | [number, number, WireEntry]][]; c?: string[];
-      m?: MemberChange[]; b?: [string, number][];
+      m?: MemberChange[]; b?: [string, number][]; l?: Line; u?: number;
     };
     st.vaultId = w.id;
     st.lastSeq = w.seq;
@@ -44,6 +54,8 @@ export class LocalState {
     // A version before send-only keys saved one as a member with both marks, as the list in storage carries it.
     st.members = (w.m ?? []).map((c) => ({ ...c, members: c.members.map((m) => (m.follow && m.suggest ? { id: m.id, name: m.name, role: m.role, capture: true as const } : m)) }));
     st.lastBy = new Map(w.b);
+    if (w.l && typeof w.l.id === 'string' && Number.isInteger(w.l.fork)) st.line = { id: w.l.id, fork: w.l.fork };
+    st.unsettled = w.u === 1 || w.u === 2 ? w.u : 0;
     return st;
   }
 
@@ -103,7 +115,8 @@ export class LocalState {
     const confirmed = this.confirmed.size ? `,"c":${JSON.stringify([...this.confirmed])}` : '';
     const members = this.members.length ? `,"m":${JSON.stringify(this.members)}` : '';
     const lastBy = this.lastBy.size ? `,"b":${JSON.stringify([...this.lastBy])}` : '';
-    return `{"id":${JSON.stringify(this.vaultId)},"seq":${this.lastSeq}${head},"p":${JSON.stringify(pt.list)},"f":[${out.join(',')}]${confirmed}${members}${lastBy}}`;
+    const line = (this.line ? `,"l":${JSON.stringify(this.line)}` : '') + (this.unsettled ? `,"u":${this.unsettled}` : '');
+    return `{"id":${JSON.stringify(this.vaultId)},"seq":${this.lastSeq}${head},"p":${JSON.stringify(pt.list)},"f":[${out.join(',')}]${confirmed}${members}${lastBy}${line}}`;
   }
 }
 

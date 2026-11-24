@@ -1,7 +1,7 @@
 // What a sync did, what went wrong and what a conflict leaves to choose, in words a user can act on.
 // No Obsidian import, so it runs under plain Node tests.
 import { WrongPassphraseError } from '../core/crypto.ts';
-import { HistoryError, RemovedError, SafetyError, StorageGoneError, UnverifiedError, type MemberStanding, type SyncResult } from '../core/engine.ts';
+import { BranchClosedError, HistoryError, RemovedError, SafetyError, StorageGoneError, UnverifiedError, type MemberStanding, type SyncResult } from '../core/engine.ts';
 import { lineDiff, type DiffRegion } from '../core/merge.ts';
 import { ext } from '../core/paths.ts';
 import { DAY } from '../core/retention.ts';
@@ -26,7 +26,7 @@ export function summarize(r: SyncResult): string {
   return parts.join(', ');
 }
 
-export type Action = 'settings' | 'passphrase' | 'resolve-deletes' | 'files' | 'retry' | 'missing-folder' | 'accept-storage' | 'remove-unverified' | 'stop-sharing' | 'whats-shared' | 'repair';
+export type Action = 'settings' | 'passphrase' | 'resolve-deletes' | 'files' | 'retry' | 'missing-folder' | 'accept-storage' | 'remove-unverified' | 'stop-sharing' | 'whats-shared' | 'repair' | 'switch-main';
 
 export interface Problem {
   /** A notice is shown once per id, so the same problem does not nag on every sync. */
@@ -345,6 +345,17 @@ export function describeFailure(e: unknown, member?: MemberContext, share = fals
         `This sync would delete ${[e.localDeletes && `${plural(e.localDeletes, 'file')} on this device`, e.remoteDeletes && `${plural(e.remoteDeletes, 'file')} from storage`].filter(Boolean).join(' and ')}. ` +
         'If that was not you, keep the files: nothing is lost yet.',
       action: 'resolve-deletes',
+    };
+  }
+  if (e instanceof BranchClosedError) {
+    return {
+      id: 'branch-closed',
+      severity: 'critical',
+      title: 'This branch was closed',
+      detail:
+        'Sync is stopped. The branch this device is on was closed on another device, so nothing more is sent to it. ' +
+        'Switch to the main line to carry on: this device then takes the main line’s files, and what it has not sent is merged in there or kept as a copy.',
+      action: 'switch-main',
     };
   }
   if (e instanceof HistoryError) {

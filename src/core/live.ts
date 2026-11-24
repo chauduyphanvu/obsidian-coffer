@@ -112,6 +112,8 @@ export interface LiveOptions {
   later: (ms: number, fn: () => void) => () => void;
   /** The newest commit this device's files are at: one it has only read does not count. */
   position: () => number;
+  /** The branch this device is on, by id ('' on the main line): commit numbers of two lines do not compare. */
+  line?: () => string;
   /** A linked device says it has synced up to `seq`, which is past this device's position. */
   onBehind: (peer: string, seq: number) => void;
   /** The set of open links changed. Not called for the links `close` ends. */
@@ -187,7 +189,7 @@ export class LiveLinks {
     for (const [peer, l] of this.links) {
       if (l.state !== 'open') continue;
       try {
-        l.wire.send(JSON.stringify({ t: 'at', seq }));
+        l.wire.send(JSON.stringify({ t: 'at', seq, l: this.o.line?.() ?? '' }));
       } catch {
         this.drop(peer);
       }
@@ -234,7 +236,7 @@ export class LiveLinks {
       link.state = 'open';
       this.failed.delete(peer);
       try {
-        wire.send(JSON.stringify({ t: 'at', seq: this.o.position() }));
+        wire.send(JSON.stringify({ t: 'at', seq: this.o.position(), l: this.o.line?.() ?? '' }));
       } catch {
         this.drop(peer);
         return;
@@ -243,13 +245,14 @@ export class LiveLinks {
     };
     wire.onmessage = (text) => {
       if (this.links.get(peer) !== link) return;
-      let m: { t?: unknown; seq?: unknown } | null = null;
+      let m: { t?: unknown; seq?: unknown; l?: unknown } | null = null;
       try {
-        m = JSON.parse(text) as { t?: unknown; seq?: unknown } | null;
+        m = JSON.parse(text) as { t?: unknown; seq?: unknown; l?: unknown } | null;
       } catch {
         return;
       }
-      if (m && m.t === 'at' && typeof m.seq === 'number' && m.seq > this.o.position()) this.o.onBehind(peer, m.seq);
+      // A version from before branches names no line: it is on the main one.
+      if (m && m.t === 'at' && typeof m.seq === 'number' && (m.l ?? '') === (this.o.line?.() ?? '') && m.seq > this.o.position()) this.o.onBehind(peer, m.seq);
     };
     wire.onclose = () => {
       if (this.links.get(peer) === link) this.drop(peer);

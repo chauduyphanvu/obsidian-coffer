@@ -21,6 +21,8 @@ interface Heartbeat {
   /** The newest commit it had seen, and that commit's digest when its state held one. */
   seq: number;
   head?: string;
+  /** The branch it is on, by id; absent on the main line. `seq` and `head` are of that line. */
+  line?: string;
 }
 
 export type DeviceState = 'current' | 'behind' | 'quiet' | 'diverged';
@@ -34,6 +36,8 @@ export interface DeviceStatus {
   behind: number;
   isSelf: boolean;
   state: DeviceState;
+  /** The branch it is on, by id; undefined on the main line. `behind` is 0 for a device on another line than this one. */
+  line?: string;
 }
 
 /** Keyed with the vault key, so storage cannot test a guessed device name, and safe as an object key whatever the name holds. */
@@ -51,7 +55,8 @@ function parse(v: unknown): Heartbeat | null {
     typeof r.time === 'number' &&
     typeof r.seq === 'number' &&
     r.seq >= 0 &&
-    (r.head === undefined || typeof r.head === 'string');
+    (r.head === undefined || typeof r.head === 'string') &&
+    (r.line === undefined || typeof r.line === 'string');
   return ok ? (r as Heartbeat) : null;
 }
 
@@ -60,6 +65,7 @@ export async function writeHeartbeat(view: RepoView, info: { platform: string; v
   const { repo, st, cfg, now } = view;
   const record: Heartbeat = { name: cfg.deviceName, platform: info.platform, version: info.version, time: now, seq: st.lastSeq };
   if (st.head) record.head = st.head;
+  if (st.line) record.line = st.line.id;
   await repo.writeDoc(await deviceKey(repo, cfg.deviceName), record);
   return record.seq;
 }
@@ -81,10 +87,12 @@ export async function listDevices(view: RepoView): Promise<DeviceStatus[]> {
     .map((r): DeviceStatus => {
       const isSelf = r.name === cfg.deviceName;
       // This device's own record can be older than the view, which has just been brought up to date.
-      const behind = isSelf ? 0 : Math.max(0, st.lastSeq - r.seq);
-      const diverged = !isSelf && !!st.head && !!r.head && r.seq === st.lastSeq && r.head !== st.head;
+      // Numbers of two lines do not compare.
+      const together = r.line === st.line?.id;
+      const behind = isSelf || !together ? 0 : Math.max(0, st.lastSeq - r.seq);
+      const diverged = !isSelf && together && !!st.head && !!r.head && r.seq === st.lastSeq && r.head !== st.head;
       const state: DeviceState = diverged ? 'diverged' : isSelf ? 'current' : now - r.time > QUIET_AFTER ? 'quiet' : behind ? 'behind' : 'current';
-      return { name: r.name, platform: r.platform, version: r.version, lastSeen: r.time, behind, isSelf, state };
+      return { name: r.name, platform: r.platform, version: r.version, lastSeen: r.time, behind, isSelf, state, ...(r.line && { line: r.line }) };
     })
     .sort((a, b) => Number(b.isSelf) - Number(a.isSelf) || b.lastSeen - a.lastSeen || (a.name < b.name ? -1 : 1));
 }

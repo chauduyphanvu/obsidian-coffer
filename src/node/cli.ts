@@ -6,7 +6,8 @@ import { pool } from '../core/bytes.ts';
 import { DEFAULT_CONFIG, compileExcludes, resolveConfig, type SyncConfig } from '../core/config.ts';
 import { MIN_PASSPHRASE, WrongPassphraseError } from '../core/crypto.ts';
 import { agoText, heartbeatDue, listDevices, statusText, writeHeartbeat, type Beat } from '../core/devices.ts';
-import { HistoryError, NoVaultError, PassphraseUnknownError, RemovedError, SafetyError, StorageGoneError, SyncEngine, UnverifiedError, type RepoView, type SyncOptions, type SyncResult } from '../core/engine.ts';
+import { BranchClosedError, HistoryError, NoVaultError, PassphraseUnknownError, RemovedError, SafetyError, StorageGoneError, SyncEngine, UnverifiedError, type RepoView, type SyncOptions, type SyncResult } from '../core/engine.ts';
+import { BRANCHES_SINCE, MAIN_NAME, findBranch, takeRows, type Branch } from '../core/lines.ts';
 import { conflictOriginal, ext, vaultKey } from '../core/paths.ts';
 import { Repo } from '../core/repo.ts';
 import { listVersions } from '../core/retention.ts';
@@ -111,6 +112,29 @@ const USAGE = `Usage: node coffer.js <command> [--config=coffer.json]
                          since goes back to what it was, a note edited since keeps those edits, a moved file
                          goes back to its old name; what cannot be undone safely is left as it is and named.
                          Syncs first and again after, as restore-at does
+  branch                 list the vault's branches and say which line this device is on. A branch is a second line
+                         of the vault's history: a device on it has the branch's files and syncs with the other
+                         devices on it, while the rest carry on with the main line. Stored data is shared, so a
+                         branch costs only what changes on it. The vault must be upgraded first (see upgrade)
+  branch start <name>    sync, start a branch from the main line as it is now and put this device on it; no
+                         file changes. Other devices stay where they are until they switch
+  branch switch <name>   sync, then put this device on that branch, or on the main line with the name main: its
+                         files become that line's, and nothing is sent as a deletion. An edit it could not
+                         send first is merged in, or kept as a copy
+  branch merge <name> [--dry-run]
+                         bring changes across between the main line and that branch, into the line this
+                         device is on: on the main line it takes the branch's changes, on the branch the main
+                         line's. Taken as they are where only the other line changed a file; notes changed on
+                         both are combined; what cannot be combined keeps both, theirs as a conflict copy; a
+                         file edited on one line and deleted on the other stays; a file or folder moved on one
+                         takes the other's edits and new files with it. Syncs first and after. --dry-run
+                         prints what it would do. The branch stays open and can be merged again
+  branch close <name>    close a branch, from a device that is not on it: it takes no more changes, and a
+                         device still on it is told at its next sync to switch. What it holds that was never
+                         merged can no longer be reached, and its data is removed 30 days later
+  upgrade                make the vault one that can have branches. Not undone, and versions before
+                         ${BRANCHES_SINCE} can then no longer open it, so it is refused while any device's last
+                         record names an older version: update Coffer there and sync once first
   restore-at <time> [folder] [--dry-run]
                          bring the vault, or one folder, back to how it was at <time> (ISO 8601,
                          like 2026-11-10T14:30, or a number from log, which names that moment even
@@ -178,6 +202,8 @@ const OPTIONS: Record<string, string[]> = {
   activity: ['limit'],
   'restore-at': ['dry-run'],
   undo: ['dry-run'],
+  branch: ['dry-run'],
+  upgrade: [],
   export: ['at'],
   verify: ['deep'],
   repair: ['deep'],
@@ -203,6 +229,8 @@ const LOOKS = new Set(['export', 'status']);
 /** What a device that is a member of a shared folder cannot do, as each command's reason. */
 const NOT_FOR_MEMBERS: Record<string, string> = {
   'change-passphrase': 'a device joins it with the keys of an invite and has no passphrase to change',
+  branch: 'a shared folder has one line of history',
+  upgrade: 'a shared folder has one line of history',
 };
 
 /** What a followed folder cannot do: it is read over a public address, by name. */
@@ -463,6 +491,101 @@ async function sendResult(sync: Sync, vault: string, removed: string[]): Promise
   }
 }
 
+/** `branch` and its sub-commands. */
+async function branch(engine: SyncEngine, sync: Sync, rest: string[], dry: boolean, receivesOnly: boolean): Promise<number> {
+  const [what, ...words] = rest;
+  const name = words.join(' ').trim();
+  const list = await engine.branches();
+  const open = list.branches.filter((b) => !b.closed);
+  const here = list.branches.find((b) => b.id === list.current);
+  const named = (): Branch => {
+    if (!name) throw new Error(`branch ${what} needs the name of a branch`);
+    const b = findBranch(list.branches, name);
+    if (!b) throw new Error(`there is no branch called "${name}"${open.length ? `; the open ones are ${open.map((o) => o.name).join(', ')}` : ''}`);
+    return b;
+  };
+  /** A sync before the lines change, so nothing unsent rides along by accident. False when it left files unsent or failed. */
+  const settled = async (why: string): Promise<boolean> => {
+    const r = await sync();
+    report(r, 'synced first: ');
+    if (r.errors.length) warn(`not ${why}: some files could not sync`);
+    return !r.errors.length;
+  };
+  if (!what) {
+    if (!list.upgraded) {
+      say('this vault has not been upgraded for branches; upgrade does that, once every device runs a version that has them');
+      return 0;
+    }
+    say(`this device is on: ${here ? here.name : list.current ? 'a branch storage no longer lists' : MAIN_NAME}`);
+    if (!open.length) say('branches: none');
+    for (const b of open) say(`  ${b.id === list.current ? '*' : ' '} ${b.name}, started ${iso(b.created)} by ${b.by} at change ${b.fork}`);
+    return 0;
+  }
+  if (what !== 'switch' && receivesOnly) {
+    warn(`this device only receives changes, so it cannot ${what} a branch; it can switch to one`);
+    return 1;
+  }
+  if (what === 'start') {
+    if (!name) throw new Error('branch start needs a name for the branch');
+    if (!list.upgraded) throw new Error('this vault has not been upgraded for branches yet: run upgrade first');
+    if (!(await settled('starting a branch'))) return 1;
+    const b = await engine.startBranch(name);
+    say(`started "${b.name}" from change ${b.fork}; this device is on it now, and the others stay where they are until they switch`);
+    return 0;
+  }
+  if (what === 'switch') {
+    if (!name) throw new Error('branch switch needs the name of a branch, or main');
+    const to = name.toLowerCase() === MAIN_NAME ? undefined : named();
+    if ((to?.id ?? '') === (list.current ?? '')) {
+      say(`this device is already on ${to ? `"${to.name}"` : MAIN_NAME}`);
+      return 0;
+    }
+    try {
+      if (!(await settled('switching'))) return 1;
+    } catch (e) {
+      // The line this device is on is closed: there is nothing to send to it, and the switch takes what was not sent along.
+      if (!(e instanceof BranchClosedError)) throw e;
+      say('the branch this device was on is closed, so nothing more was sent to it');
+    }
+    const { changed } = await engine.switchLine(to);
+    say(`this device is on ${to ? `"${to.name}"` : MAIN_NAME} now; ${plural(changed, 'file')} ${changed === 1 ? 'differs' : 'differ'}`);
+    const r = await sync();
+    report(r, 'then synced: ');
+    return r.errors.length ? 1 : 0;
+  }
+  if (what === 'merge') {
+    const b = named();
+    if (!dry && !(await settled('merging'))) return 1;
+    const d = await engine.mergePlan(b);
+    say(`from ${d.from === MAIN_NAME ? 'the main line' : `"${d.from}"`} into ${d.into ? `"${b.name}"` : 'the main line'}:`);
+    const word = { move: 'move', add: 'add', take: 'take theirs', remove: 'remove' } as const;
+    for (const r of takeRows(d.take)) say(`  ${word[r.kind]}`.padEnd(15) + r.path + (r.to ? ` -> ${r.to}` : ''));
+    for (const m of d.merged) say(`  ${'combine'.padEnd(13)}${m.path}`);
+    for (const c of d.copies) say(`  ${'keep both'.padEnd(13)}${c.of}, theirs as ${c.path}`);
+    for (const path of d.kept) say(`  ${'keep ours'.padEnd(13)}${path} (settings changed on both lines that cannot be combined)`);
+    const n = d.take.length + d.merged.length + d.copies.length;
+    if (!n) say('  nothing to bring in');
+    if (dry) {
+      say(`dry run: would change ${plural(n, 'file')}; nothing changed`);
+      return 0;
+    }
+    const res = await engine.mergeApply(d);
+    for (const path of res.skipped) warn(`left as it is, changed here since the merge was worked out: ${path}`);
+    say(`merged: ${res.taken} taken, ${res.merged} combined, ${res.removed} removed, ${res.copies.length} kept as copies`);
+    if (res.skipped.length) warn('run branch merge again to take the files that were left');
+    const r = await sync();
+    report(r, 'then synced: ');
+    return res.skipped.length || r.errors.length ? 1 : 0;
+  }
+  if (what === 'close') {
+    const b = named();
+    await engine.closeBranch(b);
+    say(`closed "${b.name}": it takes no more changes, and its data is removed in 30 days`);
+    return 0;
+  }
+  throw new Error(`branch ${what} is not a command: use start, switch, merge or close, or none to list`);
+}
+
 /**
  * Takes the operation commit `which` belongs to back out of the vault, keeping what was done since (`planUndo`). Syncs
  * first and after, as `restoreAt` does; a file it cannot undo safely is left as it is and named. With `dry`, only prints the plan.
@@ -683,6 +806,7 @@ function unreadable(e: unknown): { problem: string; but: string } | undefined {
   if (e instanceof HistoryError) return { problem: 'history', but: `its history is not the one this device saw: ${errorText(e)}\n${ACCEPT_HINT}` };
   if (e instanceof NoVaultError) return { problem: 'empty', but: 'it holds no synced vault yet' };
   if (e instanceof StorageGoneError) return { problem: 'gone', but: `the vault is gone from it: ${errorText(e)}` };
+  if (e instanceof BranchClosedError) return { problem: 'branch-closed', but: 'the branch this device is on was closed on another device: run branch switch main to carry on' };
   return undefined;
 }
 
@@ -706,7 +830,8 @@ async function status(
   try {
     const v = await engine.view();
     const [newest] = v.st.lastSeq ? await listCommits(v.repo, v.st.lastSeq, v.cfg, v.now, { limit: 1 }) : [];
-    read = { v, newest, devices: noDevices ? undefined : await listDevices(v), left: await engine.deferred({ refresh: false }) };
+    const lines = noDevices ? undefined : await engine.branches();
+    read = { v, newest, devices: noDevices ? undefined : await listDevices(v), left: await engine.deferred({ refresh: false }), lines };
   } catch (e) {
     const error = errorText(e);
     // Anything else, such as a log with a hole or a member list that does not verify, is told apart from storage that
@@ -716,7 +841,9 @@ async function status(
     else say(why ? `storage: reachable, ${where}, but ${why.but}` : `storage: not reachable, ${where}: ${error}`);
     return 1;
   }
-  const { v, newest, devices, left } = read;
+  const { v, newest, devices, left, lines } = read;
+  /** The line a device is on, by the branch's name; undefined on the main line. */
+  const lineName = (id: string | undefined) => (id ? (lines?.branches.find((b) => b.id === id)?.name ?? 'a branch') : undefined);
   const by = newest && namer(selfOf(v))(newest);
   // Only those sync would look at: a copy deleted to Obsidian's .trash is done with.
   const copies = (await fs.list()).map((f) => f.path).filter((path) => conflictOriginal(path) !== path && !engine.ignores(path)).sort();
@@ -740,6 +867,7 @@ async function status(
           lastSeen: iso(d.lastSeen),
           ago: agoText(v.now - d.lastSeen),
           behind: d.behind,
+          ...(d.line && { branch: lineName(d.line) }),
         })) ?? null,
       ...(noDevices && { devicesNote: noDevices }),
       leftInStorage: left,
@@ -750,12 +878,14 @@ async function status(
   }
   say(`storage: reachable, ${where}`);
   say(`newest change: ${newest ? `number ${newest.seq}, ${iso(newest.time)}, by ${by}` : 'none yet'}`);
+  if (v.st.line) say(`branch: this device is on "${lineName(v.st.line.id)}"`);
   if (!devices) say(`devices: ${noDevices}`);
   else if (!devices.length) say('devices: none has reported yet; each appears after its next sync');
   else say('devices:');
   for (const d of devices ?? []) {
     const about = [d.platform, d.version && `v${d.version}`].filter(Boolean).join(' ');
-    say(`  ${d.name}${d.isSelf ? ' (this device)' : ''}${about ? `, ${about}` : ''}, last synced ${agoText(v.now - d.lastSeen)}: ${statusText(d, v.now)}`);
+    const on = d.line !== v.st.line?.id ? `, on ${d.line ? `the branch "${lineName(d.line)}"` : 'the main line'}` : '';
+    say(`  ${d.name}${d.isSelf ? ' (this device)' : ''}${about ? `, ${about}` : ''}${on}, last synced ${agoText(v.now - d.lastSeen)}: ${statusText(d, v.now)}`);
   }
   say(`files left in storage: ${left.length ? `${left.length}, which fetch downloads` : 'none'}`);
   for (const f of left) say(`  ${f.path} (${sizeLabel(f.size)})`);
@@ -1075,15 +1205,17 @@ async function main(): Promise<number> {
       },
       onFailure: (e, retryMs) => {
         const message = errorText(e);
-        const why = e instanceof SafetyError ? `${message} Not retrying until something changes.` : e instanceof RemovedError ? `${message}. Not watching any more.` : `sync failed: ${message}; retrying in ${retryMs! / 1000}s`;
+        const stops = e instanceof RemovedError || e instanceof BranchClosedError;
+        const why = e instanceof SafetyError ? `${message} Not retrying until something changes.` : stops ? `${message}${e instanceof RemovedError ? '.' : ''} Not watching any more.` : `sync failed: ${message}; retrying in ${retryMs! / 1000}s`;
         warn(`${stamp()} ${why}`);
         if (e instanceof SafetyError) warn(`${stamp()} ${FORCE_HINT}`);
         if (e instanceof HistoryError) warn(`${stamp()} ${ACCEPT_HINT}`);
+        if (e instanceof BranchClosedError) warn(`${stamp()} run branch switch main, then watch again`);
         if (refusedWriting(e)) warn(`${stamp()} ${READ_ONLY_HINT}`);
         const hint = memberHint(e);
         if (hint) warn(`${stamp()} ${hint}`);
-        // Nothing a removed device does is ever accepted again.
-        if (e instanceof RemovedError) {
+        // Nothing a removed device does is ever accepted again, and a closed branch takes nothing more.
+        if (stops) {
           removed = true;
           leave();
         }
@@ -1254,6 +1386,26 @@ async function main(): Promise<number> {
   }
   if (command === 'restore-at' && rest[0]) return restoreAt(engine, syncNow, vault, fs, rest[0], rest[1] ?? '', flags.has('dry-run'));
   if (command === 'undo' && rest[0]) return undo(engine, syncNow, vault, fs, rest[0], flags.has('dry-run'));
+  if (command === 'branch') {
+    const code = await branch(engine, syncNow, rest, flags.has('dry-run'), receivesOnly);
+    // So the other devices' lists say where this one is now.
+    if (rest[0] === 'start' || rest[0] === 'switch') await heartbeat();
+    return code;
+  }
+  if (command === 'upgrade') {
+    if (receivesOnly) {
+      warn('this device only receives changes, so it cannot upgrade the vault');
+      return 1;
+    }
+    if ((await engine.branches()).upgraded) {
+      say('this vault can already have branches');
+      return 0;
+    }
+    await heartbeat();
+    await engine.upgrade();
+    say(`upgraded: this vault can have branches now, and versions before ${BRANCHES_SINCE} can no longer open it`);
+    return 0;
+  }
   if (command === 'verify') {
     const r = await engine.verify({ deep: flags.has('deep') });
     for (const p of r.problems) {
@@ -1334,6 +1486,7 @@ main().then(
     warn(errorText(e));
     if (e instanceof HistoryError) warn(ACCEPT_HINT);
     if (e instanceof SafetyError) warn(FORCE_HINT);
+    if (e instanceof BranchClosedError) warn('run branch switch main');
     if (refusedWriting(e)) warn(READ_ONLY_HINT);
     const hint = memberHint(e);
     if (hint) warn(hint);

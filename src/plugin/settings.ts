@@ -133,6 +133,8 @@ export interface Settings extends Storage {
   liveLink: boolean;
   /** A server a link asks for this device's public address, to connect across networks; '' connects on the same network only. */
   liveStun: string;
+  /** The branch this device is on, by name, for the status bar; '' on the main line. What the sync state says decides. */
+  branchName: string;
   /** Expired versions are removed this often. 0 leaves it to the manual command. */
   autoCleanDays: number;
   lastCleanup: number;
@@ -218,6 +220,7 @@ export function defaultSettings(isMobile: boolean): Settings {
     pollSeconds: 30,
     liveLink: false,
     liveStun: '',
+    branchName: '',
     autoCleanDays: 7,
     lastCleanup: 0,
     lost: { current: [], earlier: [] },
