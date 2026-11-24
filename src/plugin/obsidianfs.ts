@@ -124,6 +124,14 @@ export class ObsidianFS implements FolderFS {
     await this.tidy(path);
   }
 
+  /** Gone at once, past the trash: storage still holds the file. Its folder stays, also when empty. */
+  async discard(path: string): Promise<void> {
+    const adapter = this.app.vault.adapter;
+    const file = lookup(this.app, path);
+    if (file) await this.app.vault.delete(file);
+    else if (await adapter.exists(path)) await adapter.remove(path);
+  }
+
   /** Through the vault, so a tab showing the file follows it; links to it are left as they are, since the device that moved it updates them. */
   async rename(from: string, to: string): Promise<FileStat> {
     const adapter = this.app.vault.adapter;

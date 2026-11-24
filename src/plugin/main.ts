@@ -34,6 +34,7 @@ import { PUBLISH, type VaultReader } from '../publish/site.ts';
 import { arrivalLine, type Self } from './activity.ts';
 import { ChangeLog, fromEvents, type Why } from './changes.ts';
 import { chooseDeferred } from './deferred.ts';
+import { InUse } from './inuse.ts';
 import { checkFollowAddress, expiresIn, followRekey, isUsedError, joinWithInvite, keysOf, mustNotWrite, rekey, rekeySkip, rekeyTest, standingHere, testKeys, withKeys, type KeySet, type RekeyFailure } from './members.ts';
 import { forgetGone, isOffered, lookForOffers, offerKey, offersDue, offersHere, offersIn, offersOf, publishOffer, withdrawOffers, type Offer, type OfferCache } from './offers.ts';
 import { OtherSenderError, PropertyFS, isAttachment, isNote, inviteProblem, joinProblem, keptText, noteInShare, onlyShownBy, newEmbeds, otherSender, propertyProblems, sendProblem, sentNotesText, settleChoices, startProblem, unmarkedText, unusedText, withShare, withoutShare, writeProblem, type Survey } from './byproperty.ts';
@@ -210,6 +211,8 @@ export default class CofferPlugin extends Plugin {
   private files?: ObsidianFS;
   /** What Obsidian has read of the vault's notes, for notes shared by a property. */
   catalog!: ObsidianCatalog;
+  /** Large files kept on this device only while in use. */
+  readonly inUse = new InUse(this);
   /** The vault's engine under '', each share's under its id. */
   private engines = new Map<string, { engine: SyncEngine; fs: ShareFS }>();
   private tracking = new Map<string, Tracked>();
@@ -259,7 +262,12 @@ export default class CofferPlugin extends Plugin {
     this.settings = loadSettings((await this.loadData()) as Partial<Settings> | null, Platform.isMobile);
     // Registered before the layout is ready, so that the first time Obsidian has read the whole vault is not missed.
     this.catalog = new ObsidianCatalog(this.app);
-    this.registerEvent(this.app.metadataCache.on('resolved', () => this.catalogReady()));
+    this.registerEvent(
+      this.app.metadataCache.on('resolved', () => {
+        this.catalogReady();
+        this.linksRead();
+      }),
+    );
     if (!this.settings.deviceName) {
       this.settings.deviceName = `${Platform.isMobile ? 'mobile' : 'desktop'}-${Math.random().toString(16).slice(2, 6)}`;
       await this.saveData(this.settings);
@@ -493,6 +501,7 @@ export default class CofferPlugin extends Plugin {
           } else changed(this.changes.file(oldPath), this.changes.file(file.path), this.propertyOf(oldPath), this.propertyOf(file.path));
         }),
       );
+      this.registerEvent(this.app.workspace.on('file-open', (file) => void this.inUse.fileOpened(file)));
       // Phones suspend the app in the background; catch up the moment it is opened again.
       // Going to the background: send pending edits now, before the system suspends the app.
       // The main window's document, whichever window is in front: it is the one that says the app went to the background.
@@ -651,6 +660,7 @@ export default class CofferPlugin extends Plugin {
       e = makeEngine(this.host(), share, {
         onProgress: (p) => this.showProgress(placeOfRun(share), `${p.phase === 'upload' ? 'Sending' : 'Receiving'} ${p.done.toLocaleString()} of ${p.total.toLocaleString()}`, p.total),
         ...(pending && { nextPassphrase: pending, onPassphrase: (p: string) => this.settlePassphrase(p) }),
+        keep: (key, entry, here) => this.inUse.wants(vaultPath(share, key), entry.mtime, here),
       });
       this.engines.set(keyOf(share), e);
     }
@@ -1031,6 +1041,11 @@ export default class CofferPlugin extends Plugin {
     if (receivedChanges(r)) this.noteActivity();
     t.failure = undefined;
     t.deferred = r.deferred;
+    // Large files no longer in use leave this device; storage keeps them.
+    if (this.inUse.on() && this.inUse.ready() && !share?.property && !r.errors.length) {
+      const out = await engine.evict();
+      if (out.evicted.length) t.deferred = [...new Set([...r.deferred, ...out.evicted])].sort();
+    }
     rec.lastSuccess = Date.now();
     rec.conflictCopies = [...new Set([...rec.conflictCopies, ...r.conflictCopies])];
     this.pruneConflictCopies(share);
@@ -1817,6 +1832,7 @@ export default class CofferPlugin extends Plugin {
   async fetchDeferred(paths: string[], share?: Share): Promise<SyncOutcome> {
     const clash = locationClash(this.settings, share);
     if (clash) return { problem: { id: 'location', severity: 'critical', title: 'Nothing was downloaded', detail: clash } };
+    this.inUse.opened(paths.map((p) => vaultPath(share, p)));
     return this.exclusive('Downloading…', async () => {
       try {
         return { result: await this.syncOne(share, false, 'manual', paths) };
@@ -2175,6 +2191,19 @@ export default class CofferPlugin extends Plugin {
   // Notes shared by a property (byproperty.ts): one per vault, sent only from this device.
 
   /** Obsidian has read the vault: new notes may join from now on, and screens waiting for that look again. */
+  /**
+   * Obsidian has read notes' links again. A file left in storage that a note changed lately now links to is no change to
+   * any file, so nothing else would start the sync that gets it.
+   */
+  private linksRead(): void {
+    if (!this.inUse.on() || !this.configured()) return;
+    this.inUse.stale();
+    if (!this.targets().some((share) => this.tracked(share).deferred?.some((p) => this.inUse.wants(vaultPath(share, p), 0)))) return;
+    this.dirty = true;
+    if (this.running) this.changedWhileRunning = true;
+    else this.schedule();
+  }
+
   private catalogReady(): void {
     if (this.catalog.ready()) return;
     this.catalog.markReady();

@@ -28,6 +28,8 @@ export class Device {
   /** A device of a shared folder with members: what it keeps in secret storage, and where it keeps its member list. */
   keys?: MemberKeys;
   position = new MemState();
+  /** `EngineOptions.keep`, read at every call, so a test can change it. */
+  keep?: (key: string, here: boolean) => boolean;
 
   constructor(name: string, store: RemoteStore, clock: { now: number }, config: Partial<SyncConfig> = {}, keys?: MemberKeys) {
     this.name = name;
@@ -47,6 +49,7 @@ export class Device {
       passphrase: 'test passphrase',
       config: this.config,
       now: () => this.clock.now,
+      keep: (key, _entry, here) => this.keep?.(key, here) ?? false,
       ...(this.keys && { member: { keys: this.keys, position: this.position } }),
     });
   }

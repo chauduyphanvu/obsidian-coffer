@@ -149,6 +149,8 @@ export interface LocalFS {
   /** Creates parent folders as needed and returns the resulting stat. */
   write(path: string, data: Uint8Array, mtime?: number): Promise<FileStat>;
   remove(path: string): Promise<void>;
+  /** Removes a file for good where `remove` would put it in a trash: for a copy that storage still holds (`SyncEngine.evict`). */
+  discard?(path: string): Promise<void>;
   stat(path: string): Promise<FileStat | null>;
   /** Moves a file, creating the folders `to` needs, and keeps its time. Without it the engine writes `to` and removes `from`. */
   rename?(from: string, to: string): Promise<FileStat>;

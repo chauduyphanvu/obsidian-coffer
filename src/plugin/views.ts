@@ -21,7 +21,7 @@ import { button, buttonRow, field, message, openLink, passphraseFields, statusLi
 
 type SecretKey = 'accessKeySecret' | 'secretKeySecret' | 'passphraseSecret' | 'webdavPasswordSecret';
 type TextKey = 'endpoint' | 'region' | 'bucket' | 'prefix' | 'deviceName' | 'webdavUrl' | 'webdavUser';
-type NumberKey = 'intervalMinutes' | 'changeDelaySeconds' | 'pollSeconds' | 'autoCleanDays' | 'retentionDays' | 'maxFileSizeMB' | 'deferAboveMB' | 'concurrency';
+type NumberKey = 'intervalMinutes' | 'changeDelaySeconds' | 'pollSeconds' | 'autoCleanDays' | 'retentionDays' | 'maxFileSizeMB' | 'deferAboveMB' | 'viewDays' | 'concurrency';
 type ToggleKey = 'pathStyle' | 'syncOnStart' | 'syncConfigDir' | 'compression' | 'readOnly';
 type SiteTextKey = 'endpoint' | 'region' | 'bucket' | 'prefix' | 'webdavUrl' | 'webdavUser' | 'title' | 'home' | 'url';
 type SiteSecretKey = 'accessKeySecret' | 'secretKeySecret' | 'webdavPasswordSecret';
@@ -282,6 +282,25 @@ export class SettingsTab extends PluginSettingTab {
                   draw();
                   return plugin.onChange(draw);
                 },
+              },
+              {
+                ...number(
+                  'Keep large files while in use (days)',
+                  'A file over the size above is downloaded by itself while it is in use, and removed from this device afterwards; it stays in storage and on your other devices. ' +
+                    'In use means: changed or opened in this many days, or linked from a note changed in this many days. Opening a note gets its files. ' +
+                    '0 turns this off: large files come only when you choose them, and stay.',
+                  'viewDays',
+                  0,
+                  ['attachments', 'large files', 'space', 'offload'],
+                ),
+                visible: () => s.deferAboveMB > 0,
+              },
+              {
+                name: 'Always keep on this device',
+                desc: 'Folders whose large files are never removed from this device, one per line.',
+                aliases: ['pin', 'attachments', 'large files'],
+                visible: () => s.deferAboveMB > 0 && s.viewDays > 0,
+                control: { type: 'textarea', key: 'viewPins', placeholder: 'Projects/Current\nReference' },
               },
               {
                 name: 'Leave out',

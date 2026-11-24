@@ -562,3 +562,4 @@ body.is-phone .coffer-share-actions { flex-basis: 100%; }
 .coffer-rewind-missing { color: var(--text-faint); font-style: italic; }
 .is-phone .coffer-rewind-body { flex-direction: column; }
 .is-phone .coffer-rewind-side { flex: 0 0 34%; max-width: none; border-inline-end: none; border-bottom: 1px solid var(--background-modifier-border); }
+.coffer-notice-button { margin-top: 8px; }

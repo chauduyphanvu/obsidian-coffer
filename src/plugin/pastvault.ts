@@ -305,15 +305,15 @@ export class PastVaultView extends ItemView {
         body.createEl('p', { cls: 'coffer-intro', text: 'What bringing this version back would change in the file as it is now: lines marked − go, lines marked + come back.' });
         showDiff(body, pv.lines);
       } else if (pv.kind === 'text') {
-        body.createEl('p', { cls: 'coffer-intro', text: pv.why === 'missing' ? 'This file is not in the vault now. Bringing it back puts it where it was.' : 'The file now is too different to compare line by line. This is the version from then:' });
+        body.createEl('p', { cls: 'coffer-intro', text: pv.why === 'missing' ? 'This file is not on this device now. Bringing it back puts it where it was.' : 'The file now is too different to compare line by line. This is the version from then:' });
         showWhole(body, pv.text);
       } else {
-        const text = missing ? 'This file is not in the vault now. Bringing it back puts it where it was.' : 'This is not text, so the two cannot be compared here. Bringing this version back replaces the file as it is now.';
+        const text = missing ? 'This file is not on this device now. Bringing it back puts it where it was.' : 'This is not text, so the two cannot be compared here. Bringing this version back replaces the file as it is now.';
         body.createEl('p', { cls: 'coffer-intro', text });
       }
       return;
     }
-    button(actions, missing ? 'Not in the vault now: bring it back…' : same ? 'The same as now' : 'Compare with now, or bring it back…', () => void this.show(path, true)).setDisabled(same);
+    button(actions, missing ? 'Not on this device now: bring it back…' : same ? 'The same as now' : 'Compare with now, or bring it back…', () => void this.show(path, true)).setDisabled(same);
     const text = picture ? undefined : asText(data);
     if (picture) body.createEl('img', { cls: 'coffer-rewind-picture', attr: { src: this.pictureUrl(path, data), alt: fileName(path) } });
     else if (text === undefined) body.createEl('p', { cls: 'coffer-intro', text: 'This is not text, so it cannot be shown here.' });

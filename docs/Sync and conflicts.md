@@ -27,6 +27,20 @@ To resolve a conflict, run **Resolve a file changed on two devices**. For each c
 
 Under **Settings → Coffer → What to sync**, turn on **Download only when asked** to keep large files only in storage. Run **Download a file left in storage** to download and open one.
 
+### Keep large files only while in use
+
+With a size set above, set **Keep large files while in use** to a number of days. A file over that size is then on this device only while it is in use:
+
+- it was changed or opened in that many days, or
+- a note changed in that many days links to it or embeds it, or
+- it is in a folder listed under **Always keep on this device**.
+
+A file in use is downloaded by itself. A file no longer in use is removed from this device at the next sync. It stays in storage and on your other devices, it is not put in the trash, and no other device deletes it. A file you changed here is sent before it is removed.
+
+When you open a note, Coffer gets the files it shows that are in storage: files up to 20 MB at once, larger ones when you choose **Get**. Notes, canvases and files under the size are always on every device. Files linked only from a canvas are not counted as in use: pin their folder.
+
+Set the days to 0 to turn this off. Large files then come only when you choose them, and stay.
+
 ## Read-only devices
 
 Turn on **Only receive changes** at setup, or under **Settings → Coffer → Storage and passphrase**. Changes on that device stay there. If you delete a file on it, Coffer downloads it again.

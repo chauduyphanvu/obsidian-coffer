@@ -100,6 +100,10 @@ export class ScopedFS implements LocalFS {
     return this.inner.remove(this.pathOf(path));
   }
 
+  async discard(path: string): Promise<void> {
+    return this.inner.discard ? this.inner.discard(this.pathOf(path)) : this.inner.remove(this.pathOf(path));
+  }
+
   async stat(path: string): Promise<FileStat | null> {
     return this.inner.stat(this.pathOf(path));
   }

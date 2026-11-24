@@ -64,6 +64,12 @@ export interface EngineOptions {
    * storage has stays there; a file deleted here that storage changed since is deleted there.
    */
   sendOnly?: boolean;
+  /**
+   * Which of the files over `deferAboveMB` this device wants anyway, asked anew at every plan: one it accepts is
+   * downloaded as any file is, and `evict` leaves it here. Without it, such a file comes only when asked for. `here`
+   * says the question is about a file this device has (`evict`), where a host may want more than it would download.
+   */
+  keep?: (key: string, entry: Entry, here: boolean) => boolean;
   now?: () => number;
   log?: (message: string) => void;
   onProgress?: (progress: { phase: 'upload' | 'download'; done: number; total: number }) => void;
@@ -117,6 +123,18 @@ export interface SyncOptions {
    * copy: what it held reached the owner. A file changed since is kept as any change here is.
    */
   suggested?: ReadonlyMap<string, string>;
+}
+
+/** What `SyncEngine.evict` did: the files it removed from this device, and those it left with the reason. */
+export interface Evicted {
+  evicted: string[];
+  left: { path: string; why: 'not-here' | 'changed' | 'kept' | 'failed'; message?: string }[];
+}
+
+function sorted(e: Evicted): Evicted {
+  e.evicted.sort();
+  e.left.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return e;
 }
 
 export interface SyncResult {
@@ -909,16 +927,17 @@ export class SyncEngine {
   }
 
   /**
-   * Whether a remote file is left in storage: over the deferral limit, not asked for, and not content this device
-   * already holds under another path, which a move or copy reuses. Undefined when nothing is deferred. The
+   * Whether a remote file is left in storage: over the deferral limit, not asked for, not wanted by `keep`, and not content
+   * this device already holds under another path, which a move or copy reuses. Undefined when nothing is deferred. The
    * contents held are listed on first use, once for as long as the predicate lives.
    */
-  private deferral(st: LocalState, run?: Run): ((key: string, r: Entry) => boolean) | undefined {
+  private deferral(st: LocalState, run?: Run, here = false): ((key: string, r: Entry) => boolean) | undefined {
     const limit = this.deferLimit();
     if (limit === Infinity) return undefined;
+    const keep = this.o.keep;
     let held: Set<string> | undefined;
     return (key, r) => {
-      if (r.size <= limit || run?.fetch.has(key)) return false;
+      if (r.size <= limit || run?.fetch.has(key) || keep?.(key, r, here)) return false;
       if (!held) {
         held = new Set();
         for (const s of st.synced.values()) if (s.entry.size > limit) held.add(contentKey(s.entry));
@@ -1047,6 +1066,18 @@ export class SyncEngine {
     return keys;
   }
 
+  /** Files over the deferral limit that this device has no agreed version of and `keep` wants. */
+  private wantedKeys(st: LocalState): string[] {
+    const keep = this.o.keep;
+    const limit = this.deferLimit();
+    const maxSize = this.maxSize();
+    const out: string[] = [];
+    if (keep && limit < Infinity) {
+      for (const [key, r] of st.remote) if (r.size > limit && r.size <= maxSize && !st.synced.has(key) && !this.excluded(key) && keep(key, r, false)) out.push(key);
+    }
+    return out;
+  }
+
   /** Files in storage that this device leaves there until asked for: see `deferral`, within the size limit, and not here. */
   private deferredKeys(st: LocalState, v: LocalView, defer?: (key: string, r: Entry) => boolean): string[] {
     const maxSize = this.maxSize();
@@ -1122,6 +1153,8 @@ export class SyncEngine {
     if (this.book?.removed(st.members)) throw new RemovedError();
     const maxSize = this.maxSize();
     const defer = this.deferral(st, run);
+    // A file left in storage that `keep` has come to want is no change anyone made: a sync told what changed looks at it too.
+    if (run.hint && this.o.keep) for (const key of this.wantedKeys(st)) if (!run.hint.has(key)) run.hint.set(key, run.known.paths.get(key) ?? key);
     let v = await this.look(run, st);
     let p = planChanges(v.local, st, this.excluded, maxSize, v.tooLarge, v.keys, defer);
     // A small local edit is committed without first asking whether the remote moved: the commit
@@ -1895,6 +1928,62 @@ export class SyncEngine {
         if (!(await this.o.fs.stat(this.known?.paths.get(key) ?? key))) out.push({ path: key, size: r.size });
       });
       return out.sort((a, b) => (a.path < b.path ? -1 : 1));
+    });
+  }
+
+  /**
+   * Removes from this device files that storage holds and this device would leave there (`deferred`): those of `paths`,
+   * or without it every such file here. A file stays when it is not here in the version storage holds (`changed`), or
+   * is one this device keeps: within `deferAboveMB`, wanted by `keep`, or the same content as a file that stays (`kept`).
+   * The file is forgotten, and that saved, before it is removed: stopped in between, the next sync finds a file equal to
+   * storage's and takes it back, where a file removed first would read as deleted here, and be deleted everywhere.
+   */
+  evict(paths?: Iterable<string>): Promise<Evicted> {
+    return this.exclusive(async () => {
+      const { st } = await this.open();
+      const fs = this.o.fs;
+      const out: Evicted = { evicted: [], left: [] };
+      const limit = this.deferLimit();
+      const keys = paths ? [...new Set([...paths].map(vaultKey))] : [...st.synced].filter(([, s]) => s.entry.size > limit).map(([key]) => key);
+      const going: { key: string; path: string; s: Synced }[] = [];
+      await pool(keys, this.cfg.concurrency, async (key) => {
+        const s = st.synced.get(key);
+        const r = st.remote.get(key);
+        const path = this.known?.paths.get(key) ?? key;
+        const stat = s && r && !this.excluded(key) ? await fs.stat(path) : null;
+        if (!s || !r || !stat) out.left.push({ path: key, why: 'not-here' });
+        else if (!sameContent(s.entry, r) || stat.size !== s.lsize || stat.mtime !== s.lmtime) out.left.push({ path: key, why: 'changed' });
+        else going.push({ key, path, s });
+      });
+      for (const g of going) st.synced.delete(g.key);
+      const defer = this.deferral(st, undefined, true);
+      const drop = going.filter((g) => {
+        if (defer?.(g.key, g.s.entry)) return true;
+        st.synced.set(g.key, g.s);
+        out.left.push({ path: g.key, why: 'kept' });
+        return false;
+      });
+      if (!drop.length) return sorted(out);
+      this.unsaved = true;
+      await this.save();
+      let failed = false;
+      for (const g of drop) {
+        try {
+          await (fs.discard ? fs.discard(g.path) : fs.remove(g.path));
+          this.known?.paths.delete(g.key);
+          out.evicted.push(g.key);
+        } catch (e) {
+          // Still here, so known again as it was.
+          st.synced.set(g.key, g.s);
+          failed = true;
+          out.left.push({ path: g.key, why: 'failed', message: errorText(e) });
+        }
+      }
+      if (failed) {
+        this.unsaved = true;
+        await this.save();
+      }
+      return sorted(out);
     });
   }
 

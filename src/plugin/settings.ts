@@ -139,6 +139,15 @@ export interface Settings extends Storage {
   maxFileSizeMB: number;
   /** Files larger than this stay in storage until asked for, here and in every shared folder. 0 downloads everything. */
   deferAboveMB: number;
+  /**
+   * A file over `deferAboveMB` is on this device only while in use: for this many days after it was changed or opened,
+   * or after a note that links to it was changed. 0: such a file comes when asked for, and stays.
+   */
+  viewDays: number;
+  /** Folders whose files over `deferAboveMB` always stay on this device, one per line. */
+  viewPins: string;
+  /** When each file over `deferAboveMB` was last opened or asked for here, by vault path. */
+  viewOpened: Record<string, number>;
   concurrency: number;
   compression: boolean;
   /** When a sync last finished without failing; 0 before the first one. */
@@ -207,6 +216,9 @@ export function defaultSettings(isMobile: boolean): Settings {
     retentionDays: DEFAULT_CONFIG.retentionDays,
     maxFileSizeMB: isMobile ? 200 : DEFAULT_CONFIG.maxFileSizeMB,
     deferAboveMB: DEFAULT_CONFIG.deferAboveMB,
+    viewDays: 0,
+    viewPins: '',
+    viewOpened: {},
     concurrency: DEFAULT_CONFIG.concurrency,
     compression: DEFAULT_CONFIG.compression,
     lastSuccess: 0,

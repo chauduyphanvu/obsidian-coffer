@@ -12,6 +12,7 @@ import { Repo } from '../core/repo.ts';
 import { listVersions } from '../core/retention.ts';
 import { errorText, plural } from '../core/text.ts';
 import { TooOldError, listActivity, listCommits, listDeleted, operationAt, planRestore, planUndo, tableAt, type Activity, type PastVault } from '../core/timeline.ts';
+import { inUse, linksIn } from '../core/view.ts';
 import type { Entry, RemoteStore } from '../core/types.ts';
 import { changesOf, preparePublish, publishPrepared, summaryLines, type Prepared } from '../publish/publish.ts';
 import { activityRows, whoLabel, type Self } from '../plugin/activity.ts';
@@ -62,10 +63,16 @@ const USAGE = `Usage: node coffer.js <command> [--config=coffer.json]
                          the link suggests, here. The other commands then work on it: a writing member sends
                          changes once the owner's device has confirmed it, a reading one and a follower only
                          receive
-  sync [--force]         sync the vault once
+  sync [--force] [--keep-days=N]
+                         sync the vault once. --keep-days, with sync.deferAboveMB set: a file over that size is
+                         kept on this device only while in use, which is changed in the last N days or linked
+                         from a note changed in the last N days. Such a file is downloaded without fetch, and
+                         the others over that size are removed from this device; storage keeps them all
   fetch <path>...        download files that sync.deferAboveMB leaves in storage: set it under "sync" in
                          coffer.json to a size in MB above which files are not downloaded (0, the default,
                          downloads everything); sync lists the ones left, and one fetched syncs like any other
+  evict <path>...        remove from this device files over sync.deferAboveMB; storage and other devices keep
+                         them, and fetch brings one back. A file changed here since its last sync stays
   watch [--publish]      sync, then keep syncing until stopped; --poll=30 seconds between checks for
                          remote changes, --interval=300 seconds between full syncs. --publish also publishes
                          the website, as publish does, after the first sync and after each one that sends or
@@ -140,13 +147,14 @@ its own, never the vault's: COFFER_SITE_ACCESS_KEY and COFFER_SITE_SECRET_KEY fo
 WebDAV; a folder needs none.`;
 
 /** The options that take a value, as `--name=value` or `--name value`; every other option takes none. */
-const VALUED = ['config', 'poll', 'interval', 'limit', 'vault', 'at'];
+const VALUED = ['config', 'poll', 'interval', 'limit', 'vault', 'at', 'keep-days'];
 
 /** Each command's options besides --config (and --help and --version, which stop any command). */
 const OPTIONS: Record<string, string[]> = {
   join: ['vault'],
-  sync: ['force'],
+  sync: ['force', 'keep-days'],
   fetch: [],
+  evict: [],
   watch: ['poll', 'interval', 'publish'],
   check: [],
   status: ['json'],
@@ -851,9 +859,20 @@ async function main(): Promise<number> {
     throw new Error(`a new vault needs a passphrase of at least ${MIN_PASSPHRASE} characters, and COFFER_PASSPHRASE has ${passphrase.length}`);
   }
   const fs = new NodeFS(vault);
+  let used: ((path: string, mtime: number) => boolean) | undefined;
+  if (flags.has('keep-days')) {
+    const days = Number(flags.get('keep-days'));
+    if (!(days > 0)) throw new Error('--keep-days must be a number of days above 0');
+    if (!cli.sync?.deferAboveMB) throw new Error('--keep-days needs "sync.deferAboveMB" set in the config file: it is about the files over that size');
+    const since = Date.now() - days * 86_400_000;
+    const notes = (await fs.list()).filter((f) => /\.md$/i.test(f.path) && f.mtime >= since);
+    const read = await Promise.all(notes.map(async (f) => ({ path: f.path, mtime: f.mtime, links: linksIn(new TextDecoder().decode(await fs.read(f.path))) })));
+    used = inUse(read, { now: Date.now(), days, pins: [], opened: [] });
+  }
   const build = (remote: RemoteStore) =>
     new SyncEngine({
       fs,
+      ...(used && { keep: (key, entry) => used(key, entry.mtime) }),
       store: remote,
       stateStore: new FileState(stateFile),
       passphrase,
@@ -947,6 +966,11 @@ async function main(): Promise<number> {
 
   if (command === 'sync') {
     const r = await syncNow({ force: flags.has('force') });
+    if (used && !r.errors.length) {
+      const out = await engine.evict();
+      for (const path of out.evicted) say(`removed from this device, kept in storage: ${path}`);
+      r.deferred = [...new Set([...r.deferred, ...out.evicted])].sort();
+    }
     report(r);
     await heartbeat();
     return r.errors.length ? 1 : 0;
@@ -1054,6 +1078,18 @@ async function main(): Promise<number> {
     const r = await syncNow({ fetch: rest });
     report(r);
     return r.errors.length ? 1 : 0;
+  }
+  if (command === 'evict' && rest.length) {
+    const out = await engine.evict(rest);
+    for (const path of out.evicted) say(`removed from this device, kept in storage: ${path}`);
+    const why = {
+      'not-here': 'not a file this device has from storage',
+      changed: 'changed here since its last sync, or storage holds a newer version: sync first',
+      kept: 'not over sync.deferAboveMB, or the same as a file that stays: sync would only bring it back',
+      failed: 'could not be removed',
+    };
+    for (const f of out.left) warn(`left as it is: ${f.path}: ${why[f.why]}${f.message ? ` (${f.message})` : ''}`);
+    return out.left.length ? 1 : 0;
   }
   if (command === 'status') {
     const noDevices =

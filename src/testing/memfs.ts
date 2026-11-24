@@ -4,6 +4,8 @@ import type { FileStat, LocalFS, LocalFile, StateStore } from '../core/types.ts'
 export class MemFS implements LocalFS {
   files = new Map<string, { data: Uint8Array; mtime: number }>();
   clock = 1_700_000_000_000;
+  /** Set by a test that needs `LocalFS.discard` to differ from `remove`. */
+  discard?: (path: string) => Promise<void>;
 
   async list(): Promise<LocalFile[]> {
     return [...this.files].map(([path, f]) => ({ path, size: f.data.length, mtime: f.mtime }));

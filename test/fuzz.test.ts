@@ -30,3 +30,13 @@ test('the same holds with failing requests, lost replies and crashes', async () 
   assert.ok(combined > 100, `cleanups compacted ${combined} packs`);
   assert.ok(unlisted > 200, `${unlisted} hinted syncs did not list`);
 });
+
+test('devices that keep large files only while they want them delete none of them, with and without failures and crashes', async () => {
+  let evicted = 0;
+  for (let seed = 1; seed <= 40; seed++) {
+    const r = await fuzz(seed, { devices: 3, steps: 200, evictRate: 0.1, ...(seed % 2 ? { faultRate: 0, crashRate: 0 } : { faultRate: 0.08, crashRate: 0.15 }) });
+    assert.deepEqual(r.problems, [], `seed ${seed}`);
+    evicted += r.evicted;
+  }
+  assert.ok(evicted > 100, `${evicted} files were evicted`);
+});

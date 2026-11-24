@@ -1256,6 +1256,47 @@ test('cli: restore-at leaves alone the files deferAboveMB keeps in storage: it n
   }
 });
 
+test('cli: evict removes a fetched file from this device only, and sync --keep-days fetches what recent notes link to and removes the rest', () => {
+  const a = setup({ deviceName: 'laptop' });
+  const b = setup({ deviceName: 'phone', deferAboveMB: 1 }, a);
+  try {
+    put(a.vault, 'Trip.md', 'The film: ![[clip.bin]] and [the map](Files/map%20one.bin)\n');
+    put(a.vault, 'small.md', 'small\n');
+    big(a.vault, 'clip.bin', 1);
+    mkdirSync(join(a.vault, 'Files'));
+    big(a.vault, 'Files/map one.bin', 2);
+    big(a.vault, 'unused.bin', 3);
+    const longAgo = new Date(Date.now() - 400 * 86_400_000);
+    for (const name of ['clip.bin', 'Files/map one.bin', 'unused.bin']) utimesSync(join(a.vault, name), longAgo, longAgo);
+    a.cli('sync');
+    b.cli('sync');
+    b.cli('fetch', 'unused.bin');
+
+    const out = b.run('evict', 'unused.bin', 'small.md', 'nothing.bin');
+    assert.equal(out.status, 1);
+    assert.equal(out.stdout, 'removed from this device, kept in storage: unused.bin\n');
+    assert.match(out.stderr, /^left as it is: nothing\.bin: not a file this device has from storage\nleft as it is: small\.md: not over sync\.deferAboveMB/);
+    assert.deepEqual(Object.keys(files(b.vault)), ['Trip.md', 'small.md']);
+    assert.match(b.run('sync').stdout, /^sent 0, received 0, deleted 0 here and 0 remotely/, 'the removal is no deletion');
+    assert.match(a.run('sync').stdout, /^sent 0, received 0, deleted 0 here and 0 remotely/);
+    assert.ok(existsSync(join(a.vault, 'unused.bin')));
+
+    b.cli('fetch', 'unused.bin');
+    const kept = b.run('sync', '--keep-days=30');
+    assert.equal(kept.status, 0, kept.stderr);
+    assert.match(kept.stdout, /^removed from this device, kept in storage: unused\.bin\nsent 0, received 2,/);
+    assert.match(kept.stderr, /^not downloaded, over sync\.deferAboveMB \(run fetch to download\): unused\.bin\n$/);
+    assert.deepEqual(Object.keys(files(b.vault)), ['Files/map one.bin', 'Trip.md', 'clip.bin', 'small.md']);
+    assert.match(b.run('sync', '--keep-days=30').stdout, /^sent 0, received 0,/, 'and again changes nothing');
+
+    assert.match(b.run('sync', '--keep-days=0').stderr, /--keep-days must be a number of days above 0/);
+    assert.match(a.run('sync', '--keep-days=3').stderr, /--keep-days needs "sync\.deferAboveMB" set/);
+    assert.equal(b.run('evict').status, 2);
+  } finally {
+    a.done();
+  }
+});
+
 test('cli: sync lists the files deferAboveMB leaves in storage, and fetch downloads the ones named and refuses any that are not left there', () => {
   const a = setup({ deviceName: 'laptop' });
   const b = setup({ deviceName: 'phone', deferAboveMB: 1 }, a);

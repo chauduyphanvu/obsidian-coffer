@@ -11,6 +11,11 @@ export interface FuzzOptions {
   faultRate: number;
   /** Fraction of local state saves that fail, as if the app died before writing. */
   crashRate: number;
+  /**
+   * Chance per step that a device changes which large files it wants and evicts the rest. With it, files of 2 KB and
+   * more stay in storage unless wanted, and the quiet period wants them all.
+   */
+  evictRate?: number;
 }
 
 export interface FuzzReport {
@@ -29,6 +34,8 @@ export interface FuzzReport {
   /** Syncs told exactly which paths the device changed, and of those, the ones that did not list the vault. */
   hinted: number;
   unlisted: number;
+  /** Files removed from a device that storage kept (`evictRate`). */
+  evicted: number;
 }
 
 /**
@@ -70,8 +77,15 @@ export async function fuzz(seed: number, o: FuzzOptions): Promise<FuzzReport> {
       /** Paths changed on this device since its last sync was called. */
       touched: new Set<string>(),
       lists: 0,
+      /** The large files this device wants, by name; all of them once `wantAll`. */
+      wanted: new Set<string>(),
+      wantAll: false,
       restart() {
-        d.engine = new SyncEngine({ fs, store, stateStore: state, passphrase: 'pw', config: config(d.name), now: () => clock.now });
+        d.engine = new SyncEngine({
+          fs, store, stateStore: state, passphrase: 'pw', now: () => clock.now,
+          config: o.evictRate ? { ...config(d.name), deferAboveMB: 2048 / (1 << 20) } : config(d.name),
+          ...(o.evictRate && { keep: (key: string) => d.wantAll || d.wanted.has(key) }),
+        });
       },
     };
     const list = fs.list.bind(fs);
@@ -91,8 +105,9 @@ export async function fuzz(seed: number, o: FuzzOptions): Promise<FuzzReport> {
   const allowedLost = new Set<string>();
   const report: FuzzReport = {
     seed, ok: true, problems: [], syncs: 0, failedSyncs: 0, merges: 0, conflictCopies: 0, files: 0, tokens: 0, cleanups: 0, packsCombined: 0,
-    hinted: 0, unlisted: 0,
+    hinted: 0, unlisted: 0, evicted: 0,
   };
+  const bins = new Set<string>();
   /** A sync, told what changed or not. A log the device itself saw out of order is damage, never a fault. */
   const sync = async (x: (typeof devices)[number], hinted: boolean) => {
     const changed = x.touched;
@@ -185,6 +200,18 @@ export async function fuzz(seed: number, o: FuzzOptions): Promise<FuzzReport> {
       const bin = `bin${pick(3)}.dat`;
       d.fs.put(bin, Uint8Array.from({ length: 500 + pick(20_000) }, () => pick(256)));
       d.touched.add(bin);
+      bins.add(bin);
+    }
+    if (o.evictRate && rand() < o.evictRate) {
+      const bin = `bin${pick(3)}.dat`;
+      if (!d.wanted.delete(bin)) d.wanted.add(bin);
+      try {
+        const out = await d.engine.evict();
+        report.evicted += out.evicted.length;
+        for (const p of out.evicted) if (pick(2)) d.touched.add(p);
+      } catch {
+        d.restart();
+      }
     }
   }
 
@@ -192,6 +219,7 @@ export async function fuzz(seed: number, o: FuzzOptions): Promise<FuzzReport> {
   for (const d of devices) {
     d.store.rate = 0;
     d.crash = 0;
+    d.wantAll = true;
     d.restart();
   }
   clock.now += 3 * 86_400_000;
@@ -220,6 +248,9 @@ export async function fuzz(seed: number, o: FuzzOptions): Promise<FuzzReport> {
   const fresh = new MemFS();
   await new SyncEngine({ fs: fresh, store: mem, stateStore: new MemState(), passphrase: 'pw', config: config('fresh'), now: () => clock.now }).sync();
   if (view(fresh) !== reference) report.problems.push('a new device does not get the same vault');
+
+  // Nothing in the run deletes these, so one that is gone was deleted by a device that only stopped keeping it.
+  for (const bin of bins) if (!devices[0].fs.files.has(bin)) report.problems.push(`lost ${bin}`);
 
   const everything = [...devices[0].fs.files.values()].map((f) => new TextDecoder().decode(f.data)).join('\n');
   const present = new Set(tokensIn(everything));
