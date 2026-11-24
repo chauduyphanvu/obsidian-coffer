@@ -74,8 +74,18 @@ async function setup(names = ['Mac', 'iPhone']) {
   const net = new SimStore(new MemoryStore(() => clock.now));
   const wires = new Wires();
   const timers: { at: number; fn: () => void }[] = [];
+  // Every request to storage and every step of a connection the links start is counted while it runs, so that
+  // "everything has finished" does not depend on how fast the machine seals a document.
+  let busy = 0;
+  const counted = <T>(p: Promise<T>): Promise<T> => {
+    busy++;
+    return p.finally(() => busy--);
+  };
   const settle = async () => {
-    for (let i = 0; i < 40; i++) await new Promise((ok) => setImmediate(ok));
+    for (let quiet = 0; quiet < 5; ) {
+      await new Promise((ok) => setImmediate(ok));
+      quiet = busy ? 0 : quiet + 1;
+    }
   };
   /** Lets `ms` pass, running what falls due in order, with everything each one starts finished before the next. */
   const pass = async (ms: number) => {
@@ -109,7 +119,10 @@ async function setup(names = ['Mac', 'iPhone']) {
     };
     const live = new LiveLinks({
       me: name,
-      docs: async () => liveDocs(await d.engine.documents()),
+      docs: async () => {
+        const docs = liveDocs(await counted(d.engine.documents()));
+        return { id: (n) => counted(docs.id(n)), list: (x) => counted(docs.list(x)), read: (k) => counted(docs.read(k)), write: (k, v) => counted(docs.write(k, v)), delete: (k) => counted(docs.delete(k)) };
+      },
       wire: wires.make,
       now: () => clock.now,
       later: (ms, fn) => {
