@@ -3,6 +3,7 @@ import { pool, utf8 } from '../core/bytes.ts';
 import { encodeCaptureKey, numbered } from '../core/capture.ts';
 import { DEFAULT_CONFIG, compileExcludes, type SyncConfig } from '../core/config.ts';
 import { forgetDevice, heartbeatDue, writeHeartbeat, type Beat } from '../core/devices.ts';
+import { LiveLinks, liveDocs } from '../core/live.ts';
 import {
   PassphraseUnknownError,
   RemovedError,
@@ -35,6 +36,7 @@ import { preparePublish, publishPrepared, type Prepared } from '../publish/publi
 import { PUBLISH, type VaultReader } from '../publish/site.ts';
 import { arrivalLine, type Self } from './activity.ts';
 import { ChangeLog, fromEvents, type Why } from './changes.ts';
+import { liveSupported, rtcWire, stunUrl } from './live.ts';
 import { chooseDeferred } from './deferred.ts';
 import { InUse } from './inuse.ts';
 import { checkFollowAddress, expiresIn, followRekey, isUsedError, joinWithInvite, keysOf, mustNotWrite, rekey, rekeySkip, rekeyTest, sharePolicy, standingHere, testKeys, testSendOnlyKeys, withKeys, type KeySet, type RekeyFailure } from './members.ts';
@@ -203,6 +205,29 @@ const keyOf = (share?: Share) => share?.id ?? '';
 const ARRIVALS_SHOWN = 15_000;
 /** How often a sync of a shared folder looks for suggestions on the owner's devices; a sync asked for always looks. */
 const INBOX_EVERY = 60_000;
+/** The wait after an edit while a live link is open, when the setting is longer. */
+const LINKED_DELAY_SECONDS = 2;
+/** A device whose change is no older than this is offered a live link: it listens for two minutes after sending one, and clocks differ. */
+const AWAKE_MS = 5 * 60_000;
+
+/**
+ * A timer that runs `run` `slow` seconds after the last call, or `fast` seconds after it while `linked` says so. Which
+ * one a call takes is decided at the call, so a link that opens or closes restarts nothing.
+ */
+function editTimer(linked: () => boolean, slow: number, fast: number, run: () => void) {
+  const slowly = debounce(run, slow * 1000, true);
+  const quickly = debounce(run, fast * 1000, true);
+  return Object.assign(
+    () => {
+      if (linked() && fast < slow) {
+        // The sooner one stands in for the later.
+        slowly.cancel();
+        quickly();
+      } else slowly();
+    },
+    { cancel: () => (slowly.cancel(), quickly.cancel()) },
+  );
+}
 const placeOfRun = (share?: Share): RunPlace => share ?? { id: '' };
 
 export default class CofferPlugin extends Plugin {
@@ -258,7 +283,14 @@ export default class CofferPlugin extends Plugin {
   private surveys = new Map<string, Survey>();
   /** The vault's notes and attachments as Obsidian's index has them, without the settings folder. */
   private notes?: ObsidianFS;
-  private schedule = debounce(() => void this.auto('edit'), 10_000, true);
+  /** Starts a sync a while after the last edit: sooner while a live link is open (`editTimer`). */
+  private schedule = editTimer(() => false, 10, 10, () => undefined);
+  /** The direct links to this vault's other devices, while the setting is on (core/live.ts). */
+  private live?: LiveLinks;
+  /** What the links were made with: a change to it makes them again. */
+  private liveWith = '';
+  /** The newest commit the vault's files here are at, as of its last sync that finished: what linked devices are told. */
+  private liveAt = 0;
   private lookup = (name: string) => this.secret(name);
 
   async onload(): Promise<void> {
@@ -447,6 +479,7 @@ export default class CofferPlugin extends Plugin {
     );
 
     this.register(() => this.stopPoll());
+    this.register(() => void this.live?.close());
     this.register(() => window.clearTimeout(this.retryTimer));
     // A sync an edit scheduled must not run once the plugin is disabled, or beside the next copy of it after an update.
     this.register(() => this.schedule.cancel());
@@ -546,7 +579,10 @@ export default class CofferPlugin extends Plugin {
     this.stopPoll();
     this.timer = undefined;
     this.schedule.cancel();
-    this.schedule = debounce(() => void this.auto('edit'), Math.max(2, this.settings.changeDelaySeconds) * 1000, true);
+    this.applyLive();
+    // A linked device takes a change the moment it is sent, so it is sent sooner: the wait after an edit is the delay left.
+    const wait = Math.max(2, this.settings.changeDelaySeconds);
+    this.schedule = editTimer(() => this.linkedDevices().length > 0, wait, Math.min(LINKED_DELAY_SECONDS, wait), () => void this.auto('edit'));
     if (this.settings.intervalMinutes > 0) {
       this.timer = window.setInterval(() => void this.auto('timer'), this.settings.intervalMinutes * 60_000);
       this.registerInterval(this.timer);
@@ -554,6 +590,53 @@ export default class CofferPlugin extends Plugin {
     this.armPoll();
     // The timer just replaced may have held the sync an edit is owed, as when resolving a conflict saves settings.
     if (this.dirty && !this.running) this.schedule();
+  }
+
+  /** Makes the live links when the setting is on and this device can have them, ends them when not, and makes them again when what they were made with changed. */
+  private applyLive(): void {
+    const s = this.settings;
+    // A device that only receives never writes to storage, so it can leave no offer and no answer.
+    const want = s.liveLink && !s.readOnly && this.configured() && liveSupported();
+    const made = want ? JSON.stringify([s.deviceName, stunUrl(s.liveStun), s.storageType, s.endpoint, s.bucket, s.prefix, s.webdavUrl]) : '';
+    if (made === this.liveWith) return;
+    this.liveWith = made;
+    const old = this.live;
+    this.live = undefined;
+    void old?.close();
+    if (!want) return;
+    const stun = stunUrl(s.liveStun);
+    this.live = new LiveLinks({
+      me: s.deviceName,
+      docs: async () => liveDocs(await this.getEngine().documents()),
+      wire: () => rtcWire(stun),
+      now: () => Date.now(),
+      later: (ms, fn) => {
+        const t = window.setTimeout(fn, ms);
+        return () => window.clearTimeout(t);
+      },
+      position: () => this.liveAt,
+      onBehind: () => void this.auto('poll'),
+      onChange: () => this.updateStatus(),
+    });
+  }
+
+  /** The vault's other devices this one is linked to now. */
+  linkedDevices(): string[] {
+    return this.live?.peers() ?? [];
+  }
+
+  /** After the vault's sync: linked devices hear of what it sent, and devices whose changes it brought are offered a link. */
+  private liveAfter(r: SyncResult, at: number): void {
+    this.liveAt = at;
+    // The keys may have arrived since the settings were last saved, as when a setup link is opened.
+    this.applyLive();
+    const live = this.live;
+    if (!live) return;
+    if (r.commits > 0) live.committed(at);
+    // Only a device whose change is minutes old is likely awake and looking: not one whose changes of last night just came in.
+    const since = Date.now() - AWAKE_MS;
+    const others = r.arrived.filter((a) => a.time > since).map((a) => a.device);
+    if (others.length) void live.saw(others);
   }
 
   private stopPoll(): void {
@@ -1028,9 +1111,12 @@ export default class CofferPlugin extends Plugin {
     // What the sharer removed goes for everyone as a deletion they confirmed, whatever else changed.
     const allowDeletes = share?.property ? [...rec.restored, ...share.removed] : rec.restored;
     let r: SyncResult;
+    let at = 0;
     let shared: Problem[] = [];
     try {
       r = await engine.sync({ force, changed, allowDeletes, fetch, ...(share && canSuggest(share) && { suggested: sentBefore(share) }) });
+      // Before anything after the sync reads the log further: commits read then are not in the files yet.
+      at = engine.position();
       if (share?.property) shared = await this.afterProperty(share, engine, r);
     } catch (e) {
       // These come after the member list was read, so what it says of this device is known.
@@ -1068,6 +1154,7 @@ export default class CofferPlugin extends Plugin {
       if (cleaned.missing) rec.lost = { current: cleaned.missing, earlier: cleaned.missingEarlier };
     }
     if (!share) await this.vaultChores();
+    if (!share) this.liveAfter(r, at);
     // A followed folder has no storage keys to change.
     if (hasMembers(share) && !share.followUrl) await this.takeRekey(share, engine);
     if (share && canSuggest(share)) forgetSent(share, r.unsent);

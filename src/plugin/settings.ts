@@ -129,6 +129,10 @@ export interface Settings extends Storage {
   changeDelaySeconds: number;
   /** How often to ask the storage whether another device has synced. 0 turns it off. */
   pollSeconds: number;
+  /** Connect this vault's devices to each other directly, so one syncs the moment another has (core/live.ts). */
+  liveLink: boolean;
+  /** A server a link asks for this device's public address, to connect across networks; '' connects on the same network only. */
+  liveStun: string;
   /** Expired versions are removed this often. 0 leaves it to the manual command. */
   autoCleanDays: number;
   lastCleanup: number;
@@ -212,6 +216,8 @@ export function defaultSettings(isMobile: boolean): Settings {
     intervalMinutes: 5,
     changeDelaySeconds: 5,
     pollSeconds: 30,
+    liveLink: false,
+    liveStun: '',
     autoCleanDays: 7,
     lastCleanup: 0,
     lost: { current: [], earlier: [] },

@@ -10,6 +10,20 @@ Coffer syncs at startup, a few seconds after a change, on a regular schedule, an
 
 Coffer is not real time. Two people who type in the same note at the same time see each other's changes after the next sync.
 
+### Live link between your devices
+
+Storage cannot tell a device that another one has synced, so each device looks every so often. With **Live link between your devices** turned on, under **Settings → Coffer → When to sync**, your devices connect to each other directly, and one syncs the moment another has. A change then shows on the other device a few seconds after you stop typing.
+
+- **Turn it on on each device.** It is off by default. A device that only receives changes can not take part.
+- **When a link forms.** After one device receives a change from the other, while Obsidian is open on both. This takes up to a minute or so. The first change still arrives at the next look; the ones after it arrive at once. **Settings → Coffer → Devices** shows "Linked now" beside a linked device.
+- **Same network, unless you say otherwise.** Devices find each other on the same network with no outside server. To link across networks, enter the address of a STUN server under **Link across networks through**. That server tells each device its public address; it sees the devices' network addresses and nothing else. Some networks block direct connections even then.
+- **What goes over the link.** Only "I have synced up to this change". Your files still go through your storage, encrypted as always.
+- **How devices find each other.** Each leaves the other a small encrypted document in your storage, which is deleted once read. Only a device with your vault's key can read or write one.
+- **If no link forms,** or it ends, as when a phone puts Obsidian in the background, sync carries on as before.
+- **While linked,** an edit is sent 2 seconds after the last one, if your setting is longer.
+
+It is for the devices of one vault. Shared folders are not linked. Typing in the same note on two devices at once still merges at each sync, not letter by letter.
+
 ## Changes from two devices
 
 Coffer does a three-way merge: it compares each device's version with the last version both devices agreed on.

@@ -2030,6 +2030,11 @@ export class SyncEngine {
     return this.st ? heldIn(this.st, this.repo) : heldIn(LocalState.parse(await this.o.stateStore.load()));
   }
 
+  /** The vault's opened storage, for its documents outside the log: asks storage nothing once it is open. */
+  async documents(): Promise<Repo> {
+    return (await this.open()).repo;
+  }
+
   /** Opens the repo and brings the remote file table up to date, for features that only read. Waits for a sync in progress. */
   view(): Promise<RepoView> {
     return this.exclusive(() => this.refresh());

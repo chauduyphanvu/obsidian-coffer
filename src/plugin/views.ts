@@ -17,19 +17,21 @@ import { SendSuggestionModal } from './inbox.ts';
 import { sentNote } from './suggestions.ts';
 import { isConflictProblem, isUnsentProblem, leftInStorage, passphraseFailure, quietText, type Problem } from './status.ts';
 import { RepairModal } from './timemachine.ts';
+import { stunProblem } from './live.ts';
 import { button, buttonRow, field, message, openLink, passphraseFields, statusLine } from './ui.ts';
 
 type SecretKey = 'accessKeySecret' | 'secretKeySecret' | 'passphraseSecret' | 'webdavPasswordSecret';
-type TextKey = 'endpoint' | 'region' | 'bucket' | 'prefix' | 'deviceName' | 'webdavUrl' | 'webdavUser';
+type TextKey = 'endpoint' | 'region' | 'bucket' | 'prefix' | 'deviceName' | 'webdavUrl' | 'webdavUser' | 'liveStun';
 type NumberKey = 'intervalMinutes' | 'changeDelaySeconds' | 'pollSeconds' | 'autoCleanDays' | 'retentionDays' | 'maxFileSizeMB' | 'deferAboveMB' | 'viewDays' | 'concurrency';
-type ToggleKey = 'pathStyle' | 'syncOnStart' | 'syncConfigDir' | 'compression' | 'readOnly';
+type ToggleKey = 'pathStyle' | 'syncOnStart' | 'syncConfigDir' | 'compression' | 'readOnly' | 'liveLink';
 type SiteTextKey = 'endpoint' | 'region' | 'bucket' | 'prefix' | 'webdavUrl' | 'webdavUser' | 'title' | 'home' | 'url';
 type SiteSecretKey = 'accessKeySecret' | 'secretKeySecret' | 'webdavPasswordSecret';
 
-const TRIMMED = new Set<string>(['endpoint', 'region', 'bucket', 'prefix', 'deviceName', 'webdavUrl', 'webdavUser']);
+const TRIMMED = new Set<string>(['endpoint', 'region', 'bucket', 'prefix', 'deviceName', 'webdavUrl', 'webdavUser', 'liveStun']);
 
 export class SettingsTab extends PluginSettingTab {
   private plugin: CofferPlugin;
+  private stunCheck?: number;
 
   constructor(app: App, plugin: CofferPlugin) {
     super(app, plugin);
@@ -40,6 +42,14 @@ export class SettingsTab extends PluginSettingTab {
     Object.assign(this.plugin.settings, { [key]: typeof value === 'string' && TRIMMED.has(key) ? value.trim() : value });
     await this.plugin.saveSettings();
     if (key === 'storageType') this.refreshDomState();
+    if (key === 'liveStun') {
+      // Said once typing has stopped: half an address is not a wrong one.
+      window.clearTimeout(this.stunCheck);
+      this.stunCheck = window.setTimeout(() => {
+        const problem = stunProblem(this.plugin.settings.liveStun);
+        if (problem) new Notice(`${problem} Until it is one, links form on the same network only.`, 10_000);
+      }, 2500);
+    }
   }
 
   getSettingDefinitions(): SettingDefinitionItem[] {
@@ -250,6 +260,18 @@ export class SettingsTab extends PluginSettingTab {
                 'pollSeconds',
                 0,
                 ['poll'],
+              ),
+              toggle(
+                'Live link between your devices',
+                'Your devices connect to each other directly, and one syncs the moment another has, instead of at its next look. A link forms after one device receives a change from the other, while Obsidian is open on both and they are on the same network. Files still go through your storage, encrypted. While linked, an edit is sent 2 seconds after the last one. Turn it on on each device.',
+                'liveLink',
+              ),
+              text(
+                'Link across networks through (optional)',
+                'The address of a STUN server, such as stun.example.com:3478. It tells each device its public address, so two devices on different networks can connect; it sees their network addresses and nothing else. Empty: links form on the same network only, and no one else is asked anything.',
+                'liveStun',
+                '',
+                () => s.liveLink,
               ),
             ],
           },
