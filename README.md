@@ -4,7 +4,9 @@
 
 Coffer works with S3-compatible buckets (Cloudflare R2, Backblaze B2, Amazon S3, MinIO, Wasabi, and others) and WebDAV servers (Nextcloud or a NAS). Cloudflare R2 and Backblaze B2 each give 10 GB of free storage. Coffer is free, open source (MIT), and needs no account.
 
-> Coffer is at version 0.7. It passes 831 tests and runs on macOS and iOS, but keep a backup of important vaults.
+> Coffer is at version 0.12. It passes 915 tests and runs on macOS and iOS, but keep a backup of important vaults.
+
+**New here?** Read the [guides](https://chauduyphanvu.github.io/obsidian-coffer/), or go to the [recipes](https://chauduyphanvu.github.io/obsidian-coffer/Recipes.html) for short answers to "how do I…".
 
 <p align="center"><img src="docs/images/conflict-resolver.png" width="720" alt="Coffer's conflict resolver in Obsidian. Kitchen.md changed on two devices. Change 1 of 3 shows 'Countertops: $3,900, quartz' from this device and 'Countertops: $2,800, laminate' from the other device, with buttons to keep this device, the other device, or both."></p>
 
